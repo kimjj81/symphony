@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.{Config, Linear.Client}
 
   @linear_graphql_tool "linear_graphql"
   @linear_graphql_description """
@@ -44,13 +44,19 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   @spec tool_specs() :: [map()]
   def tool_specs do
-    [
-      %{
-        "name" => @linear_graphql_tool,
-        "description" => @linear_graphql_description,
-        "inputSchema" => @linear_graphql_input_schema
-      }
-    ]
+    case Config.settings!().tracker.kind do
+      "linear" ->
+        [
+          %{
+            "name" => @linear_graphql_tool,
+            "description" => @linear_graphql_description,
+            "inputSchema" => @linear_graphql_input_schema
+          }
+        ]
+
+      _ ->
+        []
+    end
   end
 
   defp execute_linear_graphql(arguments, opts) do

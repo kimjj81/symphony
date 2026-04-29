@@ -49,9 +49,12 @@ defmodule SymphonyElixir.Config.Schema do
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:api_key, :string)
       field(:project_slug, :string)
+      field(:owner, :string)
+      field(:repo, :string)
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
+      field(:state_labels, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -59,7 +62,18 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :owner,
+          :repo,
+          :assignee,
+          :active_states,
+          :terminal_states,
+          :state_labels
+        ],
         empty_values: []
       )
     end
@@ -91,12 +105,16 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:strategy, :string, default: "directory")
+      field(:source, :string)
+      field(:base_ref, :string, default: "HEAD")
+      field(:local_files, {:array, :map}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root], empty_values: [])
+      |> cast(attrs, [:root, :strategy, :source, :base_ref, :local_files], empty_values: [])
     end
   end
 
@@ -366,15 +384,19 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp finalize_settings(settings) do
+    tracker_kind = settings.tracker.kind
+
     tracker = %{
       settings.tracker
-      | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
+      | endpoint: resolve_tracker_endpoint(tracker_kind, settings.tracker.endpoint),
+        api_key: resolve_tracker_api_key(tracker_kind, settings.tracker.api_key),
         assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
     }
 
     workspace = %{
       settings.workspace
-      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces")),
+        source: resolve_path_value(settings.workspace.source, nil)
     }
 
     codex = %{
@@ -384,6 +406,26 @@ defmodule SymphonyElixir.Config.Schema do
     }
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex}
+  end
+
+  defp resolve_tracker_endpoint("github", endpoint) do
+    case resolve_secret_setting(endpoint, nil) do
+      nil -> "https://api.github.com"
+      "https://api.linear.app/graphql" -> "https://api.github.com"
+      value -> value
+    end
+  end
+
+  defp resolve_tracker_endpoint(_kind, endpoint) do
+    resolve_secret_setting(endpoint, nil)
+  end
+
+  defp resolve_tracker_api_key("github", configured) do
+    resolve_secret_setting(configured, System.get_env("GITHUB_TOKEN") || System.get_env("GH_TOKEN"))
+  end
+
+  defp resolve_tracker_api_key(_kind, configured) do
+    resolve_secret_setting(configured, System.get_env("LINEAR_API_KEY"))
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -484,10 +526,17 @@ defmodule SymphonyElixir.Config.Schema do
       "type" => "workspaceWrite",
       "writableRoots" => [workspace],
       "readOnlyAccess" => %{"type" => "fullAccess"},
-      "networkAccess" => false,
+      "networkAccess" => env_truthy?("SYMPHONY_CODEX_NETWORK_ACCESS"),
       "excludeTmpdirEnvVar" => false,
       "excludeSlashTmp" => false
     }
+  end
+
+  defp env_truthy?(name) do
+    case System.get_env(name) do
+      value when value in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] -> true
+      _ -> false
+    end
   end
 
   defp default_runtime_turn_sandbox_policy(workspace_root, opts) when is_binary(workspace_root) do

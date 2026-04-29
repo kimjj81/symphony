@@ -20,7 +20,8 @@ defmodule SymphonyElixir.Workspace do
 
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
+           {:ok, workspace, created?} <- ensure_workspace(workspace, issue_context, worker_host),
+           :ok <- sync_local_files(workspace, worker_host),
            :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
         {:ok, workspace}
       end
@@ -31,7 +32,21 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, nil) do
+  defp ensure_workspace(workspace, issue_context, nil) do
+    case Config.settings!().workspace.strategy do
+      "git_worktree" -> ensure_git_worktree(workspace, issue_context)
+      _ -> ensure_directory_workspace(workspace)
+    end
+  end
+
+  defp ensure_workspace(workspace, _issue_context, worker_host) when is_binary(worker_host) do
+    case Config.settings!().workspace.strategy do
+      "git_worktree" -> {:error, {:unsupported_remote_workspace_strategy, "git_worktree"}}
+      _ -> ensure_remote_directory_workspace(workspace, worker_host)
+    end
+  end
+
+  defp ensure_directory_workspace(workspace) do
     cond do
       File.dir?(workspace) ->
         {:ok, workspace, false}
@@ -45,7 +60,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, worker_host) when is_binary(worker_host) do
+  defp ensure_remote_directory_workspace(workspace, worker_host) when is_binary(worker_host) do
     script =
       [
         "set -eu",
@@ -84,6 +99,30 @@ defmodule SymphonyElixir.Workspace do
     {:ok, workspace, true}
   end
 
+  defp ensure_git_worktree(workspace, issue_context) do
+    settings = Config.settings!().workspace
+
+    cond do
+      not is_binary(settings.source) or String.trim(settings.source) == "" ->
+        {:error, :missing_workspace_source}
+
+      File.dir?(workspace) ->
+        {:ok, workspace, false}
+
+      true ->
+        File.rm_rf!(workspace)
+        branch = worktree_branch(issue_context)
+        base_ref = normalize_base_ref(settings.base_ref)
+
+        case System.cmd("git", ["-C", settings.source, "worktree", "add", "-B", branch, workspace, base_ref],
+               stderr_to_stdout: true
+             ) do
+          {_output, 0} -> {:ok, workspace, true}
+          {output, status} -> {:error, {:git_worktree_add_failed, status, output}}
+        end
+    end
+  end
+
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace), do: remove(workspace, nil)
 
@@ -94,14 +133,14 @@ defmodule SymphonyElixir.Workspace do
         case validate_workspace_path(workspace, nil) do
           :ok ->
             maybe_run_before_remove_hook(workspace, nil)
-            File.rm_rf(workspace)
+            remove_local_workspace(workspace)
 
           {:error, reason} ->
             {:error, reason, ""}
         end
 
       false ->
-        File.rm_rf(workspace)
+        remove_local_workspace(workspace)
     end
   end
 
@@ -291,6 +330,95 @@ defmodule SymphonyElixir.Workspace do
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
+  defp remove_local_workspace(workspace) do
+    settings = Config.settings!().workspace
+
+    if settings.strategy == "git_worktree" and is_binary(settings.source) and String.trim(settings.source) != "" do
+      case System.cmd("git", ["-C", settings.source, "worktree", "remove", "--force", workspace],
+             stderr_to_stdout: true
+           ) do
+        {_output, 0} -> {:ok, []}
+        {_output, _status} -> File.rm_rf(workspace)
+      end
+    else
+      File.rm_rf(workspace)
+    end
+  end
+
+  defp sync_local_files(_workspace, worker_host) when is_binary(worker_host), do: :ok
+
+  defp sync_local_files(workspace, nil) do
+    settings = Config.settings!().workspace
+    source = settings.source
+
+    cond do
+      not is_binary(source) or String.trim(source) == "" ->
+        :ok
+
+      not is_list(settings.local_files) ->
+        :ok
+
+      true ->
+        Enum.reduce_while(settings.local_files, :ok, fn spec, :ok ->
+          case sync_local_file(workspace, source, spec) do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
+    end
+  end
+
+  defp sync_local_file(workspace, source, %{"path" => path} = spec) when is_binary(path) do
+    mode = Map.get(spec, "mode", "copy")
+    required? = Map.get(spec, "required", false)
+    source_path = Path.join(source, path)
+    target_path = Path.join(workspace, path)
+
+    cond do
+      not File.exists?(source_path) and required? ->
+        {:error, {:local_file_missing, source_path}}
+
+      not File.exists?(source_path) ->
+        :ok
+
+      mode == "symlink" ->
+        File.rm_rf!(target_path)
+        File.mkdir_p!(Path.dirname(target_path))
+        File.ln_s(source_path, target_path)
+
+      mode == "copy" ->
+        File.rm_rf!(target_path)
+        File.mkdir_p!(Path.dirname(target_path))
+        copy_path(source_path, target_path)
+
+      true ->
+        {:error, {:unsupported_local_file_mode, mode}}
+    end
+  end
+
+  defp sync_local_file(_workspace, _source, _spec), do: :ok
+
+  defp copy_path(source_path, target_path) do
+    if File.dir?(source_path) do
+      File.cp_r(source_path, target_path)
+    else
+      File.cp(source_path, target_path)
+    end
+    |> case do
+      {:ok, _} -> :ok
+      :ok -> :ok
+      {:error, reason, path} -> {:error, {:local_file_copy_failed, path, reason}}
+      {:error, reason} -> {:error, {:local_file_copy_failed, source_path, reason}}
+    end
+  end
+
+  defp worktree_branch(%{issue_identifier: identifier}) do
+    "symphony/" <> safe_identifier(identifier)
+  end
+
+  defp normalize_base_ref(base_ref) when is_binary(base_ref) and base_ref != "", do: base_ref
+  defp normalize_base_ref(_base_ref), do: "HEAD"
+
   defp run_hook(command, workspace, issue_context, hook_name, nil) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
@@ -298,7 +426,11 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command],
+          cd: workspace,
+          stderr_to_stdout: true,
+          env: hook_env(issue_context, workspace)
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -319,7 +451,15 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    script =
+      [
+        hook_env_exports(issue_context, workspace),
+        "cd #{shell_escape(workspace)}",
+        command
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -453,13 +593,30 @@ defmodule SymphonyElixir.Workspace do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
+  defp hook_env(issue_context, workspace) do
+    [
+      {"SYMPHONY_ISSUE_ID", to_string(issue_context.issue_id || "")},
+      {"SYMPHONY_ISSUE_IDENTIFIER", to_string(issue_context.issue_identifier || "")},
+      {"SYMPHONY_ISSUE_KIND", to_string(Map.get(issue_context, :issue_kind) || "")},
+      {"SYMPHONY_WORKSPACE", workspace},
+      {"SYMPHONY_WORKTREE_BRANCH", worktree_branch(issue_context)}
+    ]
+  end
+
+  defp hook_env_exports(issue_context, workspace) do
+    hook_env(issue_context, workspace)
+    |> Enum.map(fn {key, value} -> "export #{key}=#{shell_escape(value)}" end)
+    |> Enum.join("\n")
+  end
+
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
     %{
       issue_id: issue_id,
-      issue_identifier: identifier || "issue"
+      issue_identifier: identifier || "issue",
+      issue_kind: Map.get(issue, :kind)
     }
   end
 

@@ -1,43 +1,14 @@
 defmodule SymphonyElixir.Linear.Issue do
   @moduledoc """
-  Normalized Linear issue representation used by the orchestrator.
+  Compatibility helpers for the former Linear-specific issue module.
   """
 
-  defstruct [
-    :id,
-    :identifier,
-    :title,
-    :description,
-    :priority,
-    :state,
-    :branch_name,
-    :url,
-    :assignee_id,
-    blocked_by: [],
-    labels: [],
-    assigned_to_worker: true,
-    created_at: nil,
-    updated_at: nil
-  ]
+  alias SymphonyElixir.Tracker.Issue
 
-  @type t :: %__MODULE__{
-          id: String.t() | nil,
-          identifier: String.t() | nil,
-          title: String.t() | nil,
-          description: String.t() | nil,
-          priority: integer() | nil,
-          state: String.t() | nil,
-          branch_name: String.t() | nil,
-          url: String.t() | nil,
-          assignee_id: String.t() | nil,
-          labels: [String.t()],
-          assigned_to_worker: boolean(),
-          created_at: DateTime.t() | nil,
-          updated_at: DateTime.t() | nil
-        }
+  @type t :: Issue.t()
 
   @spec label_names(t()) :: [String.t()]
-  def label_names(%__MODULE__{labels: labels}) do
+  def label_names(%Issue{labels: labels}) do
     labels
   end
 end
