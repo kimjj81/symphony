@@ -350,6 +350,225 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "reconcile sends Discord notification once when issue moves to human review" do
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :discord_request_fun, fn opts ->
+      send(parent, {:discord_request, opts})
+      {:ok, %Req.Response{status: 204, body: ""}}
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      discord_notifications_enabled: true,
+      discord_webhook_url: "https://discord.example/webhook",
+      tracker_active_states: ["Todo", "In Progress", "Human Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    )
+
+    issue_id = "issue-review"
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: self(),
+          ref: nil,
+          identifier: "MT-REVIEW",
+          issue: %Issue{id: issue_id, state: "In Progress", identifier: "MT-REVIEW"},
+          started_at: DateTime.utc_now(),
+          notified_state_transitions: MapSet.new()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-REVIEW",
+      title: "Needs review",
+      state: "Human Review",
+      url: "https://tracker.example/MT-REVIEW",
+      metadata: %{tracker: "linear"}
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    assert_receive {:discord_request, [method: :post, url: "https://discord.example/webhook", json: %{content: content}]}
+    assert content =~ "In Progress -> Human Review"
+    assert Map.has_key?(updated_state.running, issue_id)
+
+    _updated_state = Orchestrator.reconcile_issue_states_for_test([issue], updated_state)
+    refute_receive {:discord_request, _opts}, 50
+  end
+
+  test "reconcile sends Discord notification when issue moves to terminal state before cleanup" do
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :discord_request_fun, fn opts ->
+      send(parent, {:discord_request, opts})
+      {:ok, %Req.Response{status: 204, body: ""}}
+    end)
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-terminal-notification-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-terminal-notify"
+    issue_identifier = "MT-DONE"
+    workspace = Path.join(test_root, issue_identifier)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        discord_notifications_enabled: true,
+        discord_webhook_url: "https://discord.example/webhook",
+        tracker_active_states: ["Todo", "In Progress"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      )
+
+      File.mkdir_p!(workspace)
+
+      agent_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            started_at: DateTime.utc_now(),
+            notified_state_transitions: MapSet.new()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        title: "Done",
+        state: "Done",
+        metadata: %{tracker: "linear"}
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      assert_receive {:discord_request, [method: :post, url: "https://discord.example/webhook", json: %{content: content}]}
+      assert content =~ "In Progress -> Done"
+      refute Map.has_key?(updated_state.running, issue_id)
+      refute File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "reconcile does not send Discord notification for non-notify states" do
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :discord_request_fun, fn opts ->
+      send(parent, {:discord_request, opts})
+      {:ok, %Req.Response{status: 204, body: ""}}
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      discord_notifications_enabled: true,
+      discord_webhook_url: "https://discord.example/webhook",
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    )
+
+    issue_id = "issue-backlog"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-BACKLOG",
+          issue: %Issue{id: issue_id, state: "In Progress", identifier: "MT-BACKLOG"},
+          started_at: DateTime.utc_now(),
+          notified_state_transitions: MapSet.new()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-BACKLOG",
+      title: "Not routed",
+      state: "Backlog"
+    }
+
+    _updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    refute_receive {:discord_request, _opts}, 50
+  end
+
+  test "agent normal completion sends Discord notification after refreshing latest issue state" do
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :discord_request_fun, fn opts ->
+      send(parent, {:discord_request, opts})
+      {:ok, %Req.Response{status: 204, body: ""}}
+    end)
+
+    issue_id = "issue-completion-review"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      discord_notifications_enabled: true,
+      discord_webhook_url: "https://discord.example/webhook",
+      poll_interval_ms: 30_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: issue_id,
+        identifier: "MT-COMPLETE",
+        title: "Ready for review",
+        state: "Human Review",
+        url: "https://tracker.example/MT-COMPLETE",
+        metadata: %{tracker: "memory"}
+      }
+    ])
+
+    running_entry = %{
+      identifier: "MT-COMPLETE",
+      issue: %Issue{id: issue_id, identifier: "MT-COMPLETE", state: "In Progress"},
+      started_at: DateTime.utc_now(),
+      notified_state_transitions: MapSet.new()
+    }
+
+    assert :ok = Orchestrator.notify_latest_issue_state_after_agent_completion_for_test(issue_id, running_entry)
+
+    assert_receive {:discord_request, [method: :post, url: "https://discord.example/webhook", json: %{content: content}]},
+                   1_000
+
+    assert content =~ "In Progress -> Human Review"
+  end
+
   test "missing running issues stop active agents without cleaning the workspace" do
     test_root =
       Path.join(

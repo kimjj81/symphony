@@ -100,6 +100,17 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
+notifications:
+  discord:
+    enabled: false
+    webhook_url: $DISCORD_WEBHOOK_URL
+    notify_states:
+      - Human Review
+      - Done
+      - Canceled
+      - Cancelled
+      - Closed
+      - Duplicate
 ---
 
 You are working on a Linear issue {{ issue.identifier }}.
@@ -148,6 +159,9 @@ codex:
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
+- `notifications.discord` can send state-transition alerts to a Discord channel through a webhook.
+  Keep the webhook secret in an environment variable such as `DISCORD_WEBHOOK_URL`; by default
+  Discord notifications are disabled and notify on `Human Review` plus terminal states.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 

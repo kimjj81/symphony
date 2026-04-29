@@ -845,6 +845,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       observability_enabled: "maybe",
       observability_refresh_ms: %{bad: true},
       observability_render_interval_ms: %{bad: true},
+      discord_notifications_enabled: "maybe",
+      discord_notify_states: %{done: true},
       server_port: -1,
       server_host: 123
     )
@@ -885,6 +887,31 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_command: "codex app-server")
     assert Config.settings!().codex.command == "codex app-server"
+  end
+
+  test "config supports Discord notification defaults and env-backed webhook URL" do
+    env_var = "SYMPHONY_TEST_DISCORD_WEBHOOK_URL"
+    previous = System.get_env(env_var)
+    System.put_env(env_var, "https://discord.example/webhook")
+
+    on_exit(fn -> restore_env(env_var, previous) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      discord_notifications_enabled: true,
+      discord_webhook_url: "$#{env_var}"
+    )
+
+    discord = Config.settings!().notifications.discord
+
+    assert discord.enabled == true
+    assert discord.webhook_url == "https://discord.example/webhook"
+    assert discord.notify_states == ["Human Review", "Done", "Canceled", "Cancelled", "Closed", "Duplicate"]
+
+    write_workflow_file!(Workflow.workflow_file_path())
+
+    default_discord = Config.settings!().notifications.discord
+    assert default_discord.enabled == false
+    assert default_discord.webhook_url == nil
   end
 
   test "config resolves $VAR references for env-backed secret and path values" do

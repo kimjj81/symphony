@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Notifications.Discord
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -133,6 +134,8 @@ defmodule SymphonyElixir.Orchestrator do
           case reason do
             :normal ->
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+              notify_latest_issue_state_after_agent_completion(issue_id, running_entry)
 
               state
               |> complete_issue(issue_id)
@@ -345,6 +348,13 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host)
   end
 
+  @doc false
+  @spec notify_latest_issue_state_after_agent_completion_for_test(String.t(), map()) :: :ok
+  def notify_latest_issue_state_after_agent_completion_for_test(issue_id, running_entry)
+      when is_binary(issue_id) and is_map(running_entry) do
+    notify_latest_issue_state_after_agent_completion(issue_id, running_entry)
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -361,7 +371,9 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        state
+        |> notify_issue_state_transition(issue)
+        |> terminate_running_issue(issue.id, true)
 
       !issue_routable_to_worker?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
@@ -369,12 +381,16 @@ defmodule SymphonyElixir.Orchestrator do
         terminate_running_issue(state, issue.id, false)
 
       active_issue_state?(issue.state, active_states) ->
-        refresh_running_issue_state(state, issue)
+        state
+        |> notify_issue_state_transition(issue)
+        |> refresh_running_issue_state(issue)
 
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        state
+        |> notify_issue_state_transition(issue)
+        |> terminate_running_issue(issue.id, false)
     end
   end
 
@@ -422,6 +438,86 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         state
     end
+  end
+
+  defp notify_issue_state_transition(%State{} = state, %Issue{id: issue_id} = issue)
+       when is_binary(issue_id) do
+    case Map.get(state.running, issue_id) do
+      %{issue: %Issue{state: previous_state}} = running_entry ->
+        maybe_notify_issue_state_transition(state, issue, previous_state, running_entry)
+
+      _ ->
+        state
+    end
+  end
+
+  defp notify_issue_state_transition(%State{} = state, _issue), do: state
+
+  defp maybe_notify_issue_state_transition(%State{} = state, %Issue{} = issue, previous_state, running_entry) do
+    transition_key = state_transition_key(previous_state, issue.state)
+
+    if notify_state_transition?(previous_state, issue.state, transition_key, running_entry) do
+      issue
+      |> Discord.send_issue_state_transition(previous_state, issue.state)
+      |> Discord.log_result(issue, issue.state)
+
+      running_entry =
+        Map.update(
+          running_entry,
+          :notified_state_transitions,
+          MapSet.new([transition_key]),
+          &MapSet.put(&1, transition_key)
+        )
+
+      %{state | running: Map.put(state.running, issue.id, running_entry)}
+    else
+      state
+    end
+  end
+
+  defp notify_latest_issue_state_after_agent_completion(issue_id, running_entry) when is_binary(issue_id) do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{} = latest_issue | _]} ->
+        previous_state =
+          running_entry
+          |> Map.get(:issue)
+          |> case do
+            %Issue{state: state_name} -> state_name
+            _ -> nil
+          end
+
+        transition_key = state_transition_key(previous_state, latest_issue.state)
+
+        if notify_state_transition?(previous_state, latest_issue.state, transition_key, running_entry) do
+          latest_issue
+          |> Discord.send_issue_state_transition(previous_state, latest_issue.state)
+          |> Discord.log_result(latest_issue, latest_issue.state)
+        end
+
+        :ok
+
+      {:ok, []} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.debug("Skipping Discord completion notification for issue_id=#{issue_id}; state refresh failed: #{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp notify_latest_issue_state_after_agent_completion(_issue_id, _running_entry), do: :ok
+
+  defp notify_state_transition?(previous_state, new_state, transition_key, running_entry) do
+    normalize_issue_state(previous_state) != normalize_issue_state(new_state) and
+      Discord.notify_state?(new_state) and
+      !MapSet.member?(
+        Map.get(running_entry, :notified_state_transitions, MapSet.new()),
+        transition_key
+      )
+  end
+
+  defp state_transition_key(previous_state, new_state) do
+    {normalize_issue_state(previous_state), normalize_issue_state(new_state)}
   end
 
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
@@ -655,6 +751,8 @@ defmodule SymphonyElixir.Orchestrator do
     String.downcase(String.trim(state_name))
   end
 
+  defp normalize_issue_state(_state_name), do: ""
+
   defp terminal_state_set do
     Config.settings!().tracker.terminal_states
     |> Enum.map(&normalize_issue_state/1)
@@ -730,6 +828,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            notified_state_transitions: MapSet.new(),
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()

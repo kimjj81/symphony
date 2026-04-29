@@ -114,9 +114,7 @@ defmodule SymphonyElixir.Workspace do
         branch = worktree_branch(issue_context)
         base_ref = normalize_base_ref(settings.base_ref)
 
-        case System.cmd("git", ["-C", settings.source, "worktree", "add", "-B", branch, workspace, base_ref],
-               stderr_to_stdout: true
-             ) do
+        case System.cmd("git", ["-C", settings.source, "worktree", "add", "-B", branch, workspace, base_ref], stderr_to_stdout: true) do
           {_output, 0} -> {:ok, workspace, true}
           {output, status} -> {:error, {:git_worktree_add_failed, status, output}}
         end
@@ -334,9 +332,7 @@ defmodule SymphonyElixir.Workspace do
     settings = Config.settings!().workspace
 
     if settings.strategy == "git_worktree" and is_binary(settings.source) and String.trim(settings.source) != "" do
-      case System.cmd("git", ["-C", settings.source, "worktree", "remove", "--force", workspace],
-             stderr_to_stdout: true
-           ) do
+      case System.cmd("git", ["-C", settings.source, "worktree", "remove", "--force", workspace], stderr_to_stdout: true) do
         {_output, 0} -> {:ok, []}
         {_output, _status} -> File.rm_rf(workspace)
       end
@@ -351,21 +347,24 @@ defmodule SymphonyElixir.Workspace do
     settings = Config.settings!().workspace
     source = settings.source
 
-    cond do
-      not is_binary(source) or String.trim(source) == "" ->
-        :ok
-
-      not is_list(settings.local_files) ->
-        :ok
-
-      true ->
-        Enum.reduce_while(settings.local_files, :ok, fn spec, :ok ->
-          case sync_local_file(workspace, source, spec) do
-            :ok -> {:cont, :ok}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
+    if sync_local_files_enabled?(source, settings.local_files) do
+      sync_local_file_specs(workspace, source, settings.local_files)
+    else
+      :ok
     end
+  end
+
+  defp sync_local_files_enabled?(source, local_files) do
+    is_binary(source) and String.trim(source) != "" and is_list(local_files)
+  end
+
+  defp sync_local_file_specs(workspace, source, local_files) do
+    Enum.reduce_while(local_files, :ok, fn spec, :ok ->
+      case sync_local_file(workspace, source, spec) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp sync_local_file(workspace, source, %{"path" => path} = spec) when is_binary(path) do
@@ -605,8 +604,7 @@ defmodule SymphonyElixir.Workspace do
 
   defp hook_env_exports(issue_context, workspace) do
     hook_env(issue_context, workspace)
-    |> Enum.map(fn {key, value} -> "export #{key}=#{shell_escape(value)}" end)
-    |> Enum.join("\n")
+    |> Enum.map_join("\n", fn {key, value} -> "export #{key}=#{shell_escape(value)}" end)
   end
 
   defp worker_host_for_log(nil), do: "local"

@@ -109,29 +109,37 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp fetch_issues_by_labels(labels) do
     labels
-    |> Enum.reduce_while({:ok, []}, fn label, {:ok, acc} ->
-      case list_issues_for_label(label) do
-        {:ok, issues} -> {:cont, {:ok, issues ++ acc}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, issues} ->
-        issues
-        |> Enum.reduce_while({:ok, []}, fn raw_issue, {:ok, acc} ->
-          case normalize_issue(raw_issue) do
-            {:ok, issue} -> {:cont, {:ok, [issue | acc]}}
-            :skip -> {:cont, {:ok, acc}}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
-        |> case do
-          {:ok, normalized} -> {:ok, normalized |> Enum.reverse() |> unique_issues()}
-          error -> error
-        end
+    |> collect_issues_for_labels()
+    |> normalize_issues_for_labels()
+  end
 
-      error ->
-        error
+  defp collect_issues_for_labels(labels) do
+    Enum.reduce_while(labels, {:ok, []}, fn label, {:ok, acc} ->
+      label
+      |> list_issues_for_label()
+      |> append_label_issues(acc)
+    end)
+  end
+
+  defp append_label_issues({:ok, issues}, acc), do: {:cont, {:ok, issues ++ acc}}
+  defp append_label_issues({:error, reason}, _acc), do: {:halt, {:error, reason}}
+
+  defp normalize_issues_for_labels({:ok, issues}) do
+    issues
+    |> Enum.reduce_while({:ok, []}, &normalize_issue_for_labels/2)
+    |> case do
+      {:ok, normalized} -> {:ok, normalized |> Enum.reverse() |> unique_issues()}
+      error -> error
+    end
+  end
+
+  defp normalize_issues_for_labels(error), do: error
+
+  defp normalize_issue_for_labels(raw_issue, {:ok, acc}) do
+    case normalize_issue(raw_issue) do
+      {:ok, issue} -> {:cont, {:ok, [issue | acc]}}
+      :skip -> {:cont, {:ok, acc}}
+      {:error, reason} -> {:halt, {:error, reason}}
     end
   end
 
@@ -159,15 +167,22 @@ defmodule SymphonyElixir.GitHub.Client do
   defp fetch_issue_by_id(issue_id) do
     with {:ok, number, expected_kind} <- parse_issue_id(issue_id),
          {:ok, raw_issue} <- request(:get, "/issues/#{number}") do
-      pull_data =
-        if expected_kind == :pull_request or Map.has_key?(raw_issue, "pull_request") do
-          case request(:get, "/pulls/#{number}") do
-            {:ok, pull} -> pull
-            {:error, _reason} -> nil
-          end
-        end
+      normalize_issue(raw_issue, fetch_pull_data(number, expected_kind, raw_issue))
+    end
+  end
 
-      normalize_issue(raw_issue, pull_data)
+  defp fetch_pull_data(number, expected_kind, raw_issue) do
+    if pull_data_required?(expected_kind, raw_issue), do: fetch_pull(number), else: nil
+  end
+
+  defp pull_data_required?(expected_kind, raw_issue) do
+    expected_kind == :pull_request or Map.has_key?(raw_issue, "pull_request")
+  end
+
+  defp fetch_pull(number) do
+    case request(:get, "/pulls/#{number}") do
+      {:ok, pull} -> pull
+      {:error, _reason} -> nil
     end
   end
 

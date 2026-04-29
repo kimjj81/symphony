@@ -115,32 +115,35 @@ defmodule SymphonyElixir.Config do
   end
 
   defp validate_semantics(settings) do
-    cond do
-      is_nil(settings.tracker.kind) ->
-        {:error, :missing_tracker_kind}
-
-      settings.tracker.kind not in ["linear", "github", "memory"] ->
-        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_linear_project_slug}
-
-      settings.tracker.kind == "github" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_tracker_api_token}
-
-      settings.tracker.kind == "github" and not is_binary(settings.tracker.owner) ->
-        {:error, :missing_github_owner}
-
-      settings.tracker.kind == "github" and not is_binary(settings.tracker.repo) ->
-        {:error, :missing_github_repo}
-
-      true ->
-        :ok
-    end
+    settings.tracker
+    |> validate_tracker_kind()
+    |> validate_tracker_semantics(settings.tracker)
   end
+
+  defp validate_tracker_kind(%{kind: nil}), do: {:error, :missing_tracker_kind}
+
+  defp validate_tracker_kind(%{kind: kind}) when kind not in ["linear", "github", "memory"] do
+    {:error, {:unsupported_tracker_kind, kind}}
+  end
+
+  defp validate_tracker_kind(_tracker), do: :ok
+
+  defp validate_tracker_semantics(:ok, %{kind: "linear"} = tracker), do: validate_linear_tracker(tracker)
+  defp validate_tracker_semantics(:ok, %{kind: "github"} = tracker), do: validate_github_tracker(tracker)
+  defp validate_tracker_semantics(:ok, _tracker), do: :ok
+  defp validate_tracker_semantics(error, _tracker), do: error
+
+  defp validate_linear_tracker(%{api_key: api_key}) when not is_binary(api_key), do: {:error, :missing_linear_api_token}
+
+  defp validate_linear_tracker(%{project_slug: project_slug}) when not is_binary(project_slug),
+    do: {:error, :missing_linear_project_slug}
+
+  defp validate_linear_tracker(_tracker), do: :ok
+
+  defp validate_github_tracker(%{api_key: api_key}) when not is_binary(api_key), do: {:error, :missing_tracker_api_token}
+  defp validate_github_tracker(%{owner: owner}) when not is_binary(owner), do: {:error, :missing_github_owner}
+  defp validate_github_tracker(%{repo: repo}) when not is_binary(repo), do: {:error, :missing_github_repo}
+  defp validate_github_tracker(_tracker), do: :ok
 
   defp format_config_error(reason) do
     case reason do

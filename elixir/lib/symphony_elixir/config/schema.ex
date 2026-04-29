@@ -260,6 +260,44 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Notifications do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+
+    defmodule Discord do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+      embedded_schema do
+        field(:enabled, :boolean, default: false)
+        field(:webhook_url, :string)
+        field(:notify_states, {:array, :string}, default: ["Human Review", "Done", "Canceled", "Cancelled", "Closed", "Duplicate"])
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(attrs, [:enabled, :webhook_url, :notify_states], empty_values: [])
+      end
+    end
+
+    embedded_schema do
+      embeds_one(:discord, Discord, on_replace: :update, defaults_to_struct: true)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [], empty_values: [])
+      |> cast_embed(:discord, with: &Discord.changeset/2)
+    end
+  end
+
   defmodule Server do
     @moduledoc false
     use Ecto.Schema
@@ -288,6 +326,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:notifications, Notifications, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
   end
 
@@ -380,6 +419,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
+    |> cast_embed(:notifications, with: &Notifications.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
   end
 
@@ -405,7 +445,18 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    notifications = resolve_notifications(settings.notifications)
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, notifications: notifications}
+  end
+
+  defp resolve_notifications(%Notifications{} = notifications) do
+    discord = %{
+      notifications.discord
+      | webhook_url: resolve_secret_setting(notifications.discord.webhook_url, nil)
+    }
+
+    %{notifications | discord: discord}
   end
 
   defp resolve_tracker_endpoint("github", endpoint) do
@@ -463,6 +514,8 @@ defmodule SymphonyElixir.Config.Schema do
       resolved -> resolved
     end
   end
+
+  defp resolve_path_value(nil, default), do: default
 
   defp resolve_path_value(value, default) when is_binary(value) do
     case normalize_path_token(value) do

@@ -75,6 +75,17 @@ codex:
   #   codex-ws
   #   codex-ws app
   # Symphony's codex.command path still uses stdio unless the runner is changed.
+notifications:
+  discord:
+    enabled: true
+    webhook_url: $DISCORD_WEBHOOK_URL
+    notify_states:
+      - Human Review
+      - Done
+      - Canceled
+      - Cancelled
+      - Closed
+      - Duplicate
 ---
 
 You are working on a GitHub tracker item `{{ issue.identifier }}`.

@@ -34,6 +34,17 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+notifications:
+  discord:
+    enabled: true
+    webhook_url: $DISCORD_WEBHOOK_URL
+    notify_states:
+      - Human Review
+      - Done
+      - Canceled
+      - Cancelled
+      - Closed
+      - Duplicate
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`

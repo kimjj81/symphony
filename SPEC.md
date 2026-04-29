@@ -333,6 +333,7 @@ Top-level keys:
 - `hooks`
 - `agent`
 - `codex`
+- `notifications`
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
@@ -405,7 +406,22 @@ Fields:
   - Invalid values fail configuration validation.
   - Changes SHOULD be re-applied at runtime for future hook executions.
 
-#### 5.3.5 `agent` (object)
+#### 5.3.5 `notifications` (object)
+
+Optional operator notification sinks.
+
+Fields:
+
+- `discord` (object)
+  - `enabled` (boolean), default `false`.
+  - `webhook_url` (string), MAY be a literal URL or `$VAR_NAME`.
+  - `notify_states` (list of strings), default `Human Review`, `Done`, `Canceled`, `Cancelled`,
+    `Closed`, `Duplicate`.
+  - Implementations SHOULD send Discord notifications when a running issue transitions into one of
+    the configured states.
+  - Notification delivery failures SHOULD be logged and MUST NOT fail orchestration.
+
+#### 5.3.6 `agent` (object)
 
 Fields:
 
@@ -424,7 +440,7 @@ Fields:
   - State keys are normalized (`lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
 
-#### 5.3.6 `codex` (object)
+#### 5.3.7 `codex` (object)
 
 Fields:
 
