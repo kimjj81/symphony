@@ -159,12 +159,13 @@ Instructions:
 5. Do not spawn sub-agents, supervisor agents, reviewer agents, or specialist agents in this unattended Symphony run.
 6. If repository instructions require supervisor/reviewer agents, treat Symphony as the supervisor and perform a concise self-review instead.
 7. Do not call tools that require interactive MCP elicitation or human input; record the blocker and stop if no non-interactive path exists.
-8. If this item is a GitHub issue in Todo, do not implement code. Analyze the issue, propose PR-sized work items in a GitHub comment, then move the item to Human Review.
-9. If this item is a GitHub issue in Planned, treat Planned as explicit human approval to execute. Move it to In Progress, implement the approved scope, open or update one PR, comment with validation results, then move it to Human Review.
-10. Symphony must not move a GitHub issue from Todo or Human Review to Planned by itself. Only a human-applied sym:planned label is an approval gate.
-11. If a Planned issue is explicitly a planning/splitting issue, create the requested PR-sized follow-up issues instead of changing product code. Label follow-up implementation issues sym:planned only when the parent issue explicitly asks for immediate execution; otherwise label them sym:todo for human review.
-12. If this item is a GitHub issue in In Progress, create or update PR-sized implementation work and keep the issue comment trail current.
-13. If this item is a pull request in Todo, improve the PR description, implementation plan, and validation plan, then move it to Human Review.
-14. If this item is a pull request in Planned, move it to In Progress, implement the approved change, run the narrowest useful validation, comment with results, then move it to Human Review.
-15. If this item is in Rework, read the latest GitHub review comments and issue/PR comments first, address only the requested follow-up changes, comment with results, then move it to Human Review.
-16. Do not continue working after moving the item to Human Review.
+8. Write GitHub issue comments, issue bodies, pull request titles, pull request descriptions, and pull request comments in Korean unless quoting source text or preserving an existing external title.
+9. If this item is a GitHub issue in Todo, do not implement code. Analyze the issue, propose PR-sized work items in a GitHub comment, then move the item to Human Review.
+10. If this item is a GitHub issue in Planned, treat Planned as explicit human approval to execute. Move it to In Progress, implement the approved scope, open or update one PR, comment with validation results, then move it to Human Review.
+11. Symphony must not move a GitHub issue from Todo or Human Review to Planned by itself. Only a human-applied sym:planned label is an approval gate.
+12. If a Planned issue is explicitly a planning/splitting issue, create the requested PR-sized follow-up issues instead of changing product code. Label follow-up implementation issues sym:planned only when the parent issue explicitly asks for immediate execution; otherwise label them sym:todo for human review.
+13. If this item is a GitHub issue in In Progress, create or update PR-sized implementation work and keep the issue comment trail current.
+14. If this item is a pull request in Todo, improve the PR description, implementation plan, and validation plan, then move it to Human Review.
+15. If this item is a pull request in Planned, move it to In Progress, implement the approved change, run the narrowest useful validation, comment with results, then move it to Human Review.
+16. If this item is in Rework, read the latest GitHub review comments and issue/PR comments first, address only the requested follow-up changes, comment with results, then move it to Human Review.
+17. Do not continue working after moving the item to Human Review.
