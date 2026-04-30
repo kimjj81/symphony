@@ -15,15 +15,15 @@ export SYMPHONY_CODEX_NETWORK_ACCESS="${SYMPHONY_CODEX_NETWORK_ACCESS:-true}"
 export SYMPHONY_PORT="${SYMPHONY_PORT:-4000}"
 
 ngrok_pid=""
-symphony_pid=""
+webhook_registration_pid=""
 
 cleanup() {
   status=$?
   set +e
 
-  if [ -n "$symphony_pid" ]; then
-    kill "$symphony_pid" 2>/dev/null
-    wait "$symphony_pid" 2>/dev/null
+  if [ -n "$webhook_registration_pid" ]; then
+    kill "$webhook_registration_pid" 2>/dev/null
+    wait "$webhook_registration_pid" 2>/dev/null
   fi
 
   if [ -n "$ngrok_pid" ]; then
@@ -143,6 +143,11 @@ register_github_webhook() {
   printf 'Created GitHub webhook %s -> %s\n' "$hook_id" "$webhook_url"
 }
 
+register_github_webhook_after_symphony_starts() {
+  wait_for_symphony_api
+  register_github_webhook "${NGROK_URL}/api/v1/github/webhook"
+}
+
 mise trust
 mise install
 mise exec -- mix build
@@ -156,10 +161,11 @@ trap cleanup INT TERM EXIT
 ensure_github_webhook_secret
 start_ngrok
 
-mise exec -- ./bin/symphony ./WORKFLOW.myven.md --port "$SYMPHONY_PORT" --i-understand-that-this-will-be-running-without-the-usual-guardrails &
-symphony_pid=$!
+webhook_registration_log="${SYMPHONY_GITHUB_WEBHOOK_REGISTRATION_LOG:-$HOME/.cache/symphony/myven-github-webhook-registration.log}"
+mkdir -p "$(dirname "$webhook_registration_log")"
+printf 'GitHub webhook registration log: %s\n' "$webhook_registration_log"
 
-wait_for_symphony_api
-register_github_webhook "${NGROK_URL}/api/v1/github/webhook"
+register_github_webhook_after_symphony_starts > "$webhook_registration_log" 2>&1 &
+webhook_registration_pid=$!
 
-wait "$symphony_pid"
+mise exec -- ./bin/symphony ./WORKFLOW.myven.md --port "$SYMPHONY_PORT" --i-understand-that-this-will-be-running-without-the-usual-guardrails
