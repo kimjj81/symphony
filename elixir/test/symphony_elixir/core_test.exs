@@ -115,6 +115,18 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.workflow_prompt() == prompt
   end
 
+  test "current WORKFLOW.myven.md keeps responsive webhook fallback settings" do
+    workflow_path = Path.expand("../../WORKFLOW.myven.md", __DIR__)
+
+    assert {:ok, %{config: config, prompt: prompt}} = Workflow.load(workflow_path)
+    assert {:ok, settings} = SymphonyElixir.Config.Schema.parse(config)
+
+    assert settings.polling.interval_ms == 5_000
+    assert settings.codex.read_timeout_ms == 10_000
+    assert settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
+    assert String.trim(prompt) != ""
+  end
+
   test "linear api token resolves from LINEAR_API_KEY env var" do
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
     env_api_key = "test-linear-api-key"

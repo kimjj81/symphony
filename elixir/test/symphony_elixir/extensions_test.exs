@@ -3,6 +3,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
+  import Plug.Conn, only: [put_req_header: 3]
 
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Tracker.Memory
@@ -427,6 +428,116 @@ defmodule SymphonyElixir.ExtensionsTest do
              json_response(conn, 202)
   end
 
+  test "github webhook queues refresh for valid signed events" do
+    secret = "github-webhook-secret"
+    body = Jason.encode!(%{action: "labeled"})
+    orchestrator_name = Module.concat(__MODULE__, :GithubWebhookOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll", "reconcile"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      github_webhook_secret: secret
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("x-github-event", "issues")
+      |> put_req_header("x-hub-signature-256", github_signature(body, secret))
+      |> post("/api/v1/github/webhook", body)
+
+    assert %{
+             "queued" => true,
+             "coalesced" => false,
+             "operations" => ["poll", "reconcile"],
+             "event" => "issues",
+             "action" => "labeled"
+           } = json_response(conn, 202)
+  end
+
+  test "github webhook rejects invalid signatures" do
+    secret = "github-webhook-secret"
+    body = Jason.encode!(%{action: "labeled"})
+
+    start_test_endpoint(
+      orchestrator: Module.concat(__MODULE__, :GithubWebhookInvalidSignatureOrchestrator),
+      snapshot_timeout_ms: 5,
+      github_webhook_secret: secret
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("x-github-event", "issues")
+      |> put_req_header("x-hub-signature-256", "sha256=bad")
+      |> post("/api/v1/github/webhook", body)
+
+    assert json_response(conn, 401) == %{
+             "error" => %{"code" => "invalid_signature", "message" => "GitHub webhook signature is invalid"}
+           }
+  end
+
+  test "github webhook requires a configured secret" do
+    secret = "github-webhook-secret"
+    body = Jason.encode!(%{action: "labeled"})
+
+    start_test_endpoint(
+      orchestrator: Module.concat(__MODULE__, :GithubWebhookMissingSecretOrchestrator),
+      snapshot_timeout_ms: 5,
+      github_webhook_secret: ""
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("x-github-event", "issues")
+      |> put_req_header("x-hub-signature-256", github_signature(body, secret))
+      |> post("/api/v1/github/webhook", body)
+
+    assert json_response(conn, 503) == %{
+             "error" => %{
+               "code" => "github_webhook_secret_missing",
+               "message" => "GitHub webhook secret is not configured"
+             }
+           }
+  end
+
+  test "github webhook ignores unrelated signed events without refreshing" do
+    secret = "github-webhook-secret"
+    body = Jason.encode!(%{action: "opened"})
+
+    start_test_endpoint(
+      orchestrator: Module.concat(__MODULE__, :GithubWebhookIgnoredOrchestrator),
+      snapshot_timeout_ms: 5,
+      github_webhook_secret: secret
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("x-github-event", "pull_request")
+      |> put_req_header("x-hub-signature-256", github_signature(body, secret))
+      |> post("/api/v1/github/webhook", body)
+
+    assert json_response(conn, 202) == %{
+             "ignored" => true,
+             "event" => "pull_request",
+             "action" => "opened"
+           }
+  end
+
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
     unavailable_orchestrator = Module.concat(__MODULE__, :UnavailableOrchestrator)
     start_test_endpoint(orchestrator: unavailable_orchestrator, snapshot_timeout_ms: 5)
@@ -681,6 +792,14 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
     start_supervised!({SymphonyElixirWeb.Endpoint, []})
+  end
+
+  defp github_signature(body, secret) do
+    signature =
+      :crypto.mac(:hmac, :sha256, secret, body)
+      |> Base.encode16(case: :lower)
+
+    "sha256=" <> signature
   end
 
   defp static_snapshot do

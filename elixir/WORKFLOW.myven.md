@@ -25,7 +25,7 @@ tracker:
     Canceled: sym:canceled
     Duplicate: sym:duplicate
 polling:
-  interval_ms: 8000
+  interval_ms: 5000
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
   strategy: git_worktree
@@ -107,6 +107,12 @@ hooks:
     append_port_var MYVEN_OTEL_HTTP_PORT 9
     append_port_var MYVEN_OTEL_HEALTH_PORT 10
     append_port_var MYVEN_OTEL_METRICS_PORT 11
+
+    if [ -f package.json ] && command -v pnpm >/dev/null 2>&1; then
+      pnpm run worktree:bootstrap
+    else
+      printf "WARN: skipped worktree bootstrap; package.json or pnpm not found\n" >&2
+    fi
   before_remove: |
     :
 agent:
@@ -116,6 +122,7 @@ codex:
   command: codex app-server
   approval_policy: never
   thread_sandbox: workspace-write
+  read_timeout_ms: 10000
 
   # To keep a shared WS daemon, run Codex through codex-ws.sh.
   # The wrapper reads ~/.config/codex/appserver.env, ~/.codex/appserver.env, and .env.

@@ -163,7 +163,11 @@ codex:
   Keep the webhook secret in an environment variable such as `DISCORD_WEBHOOK_URL`; by default
   Discord notifications are disabled and notify on `Human Review` plus terminal states.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, `/api/v1/refresh`, and
+  `/api/v1/github/webhook`.
+- `POST /api/v1/github/webhook` accepts GitHub `issues`, `pull_request`,
+  `pull_request_review`, and `issue_comment` events. Set `SYMPHONY_GITHUB_WEBHOOK_SECRET` so
+  Symphony can verify `X-Hub-Signature-256` before queueing an immediate refresh.
 
 ## Web dashboard
 
@@ -173,6 +177,18 @@ The observability UI now runs on a minimal Phoenix stack:
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
+
+For the Myven workflow, `scripts/run_myven.sh` can optionally expose the local Phoenix API through
+ngrok and register the GitHub webhook:
+
+```bash
+SYMPHONY_GITHUB_WEBHOOK_MODE=ngrok ./scripts/run_myven.sh
+```
+
+The script stores the reusable webhook secret under
+`$HOME/.config/symphony/myven-github-webhook-secret` and the GitHub hook id under
+`$HOME/.cache/symphony/myven-github-webhook-id`. Without `SYMPHONY_GITHUB_WEBHOOK_MODE=ngrok`, it
+keeps the normal local polling path.
 
 ## Project Layout
 
