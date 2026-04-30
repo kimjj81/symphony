@@ -57,7 +57,7 @@ defmodule SymphonyElixir.GitHub.Client do
     |> Enum.uniq()
     |> Enum.reduce_while({:ok, []}, fn issue_id, {:ok, acc} ->
       case fetch_issue_by_id(issue_id) do
-        {:ok, nil} -> {:cont, {:ok, acc}}
+        :skip -> {:cont, {:ok, acc}}
         {:ok, issue} -> {:cont, {:ok, [issue | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end

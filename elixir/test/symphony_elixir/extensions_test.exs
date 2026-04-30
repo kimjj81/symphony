@@ -76,6 +76,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
+
+    def handle_info(:tick, state) do
+      send(Keyword.get(state, :recipient, self()), :webhook_follow_up_refresh)
+      {:noreply, state}
+    end
   end
 
   setup do
@@ -437,6 +442,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       StaticOrchestrator.start_link(
         name: orchestrator_name,
         snapshot: static_snapshot(),
+        recipient: self(),
         refresh: %{
           queued: true,
           coalesced: false,
@@ -448,7 +454,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(
       orchestrator: orchestrator_name,
       snapshot_timeout_ms: 50,
-      github_webhook_secret: secret
+      github_webhook_secret: secret,
+      github_webhook_follow_up_refresh_ms: 10
     )
 
     conn =
@@ -463,8 +470,11 @@ defmodule SymphonyElixir.ExtensionsTest do
              "coalesced" => false,
              "operations" => ["poll", "reconcile"],
              "event" => "issues",
-             "action" => "labeled"
+             "action" => "labeled",
+             "follow_up_refresh_in_ms" => 10
            } = json_response(conn, 202)
+
+    assert_receive :webhook_follow_up_refresh, 200
   end
 
   test "github webhook rejects invalid signatures" do

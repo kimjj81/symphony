@@ -119,12 +119,60 @@ defmodule SymphonyElixir.CoreTest do
     workflow_path = Path.expand("../../WORKFLOW.myven.md", __DIR__)
 
     assert {:ok, %{config: config, prompt: prompt}} = Workflow.load(workflow_path)
-    assert {:ok, settings} = SymphonyElixir.Config.Schema.parse(config)
+    assert {:ok, settings} = Config.Schema.parse(config)
 
     assert settings.polling.interval_ms == 30_000
     assert settings.codex.read_timeout_ms == 10_000
     assert settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
     assert String.trim(prompt) != ""
+  end
+
+  test "planned issue is marked in progress before dispatch without Discord notification" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      discord_notifications_enabled: true,
+      discord_webhook_url: "https://discord.example/webhook",
+      discord_notify_states: ["In Progress", "Human Review", "Done"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    Application.put_env(:symphony_elixir, :discord_request_fun, fn opts ->
+      send(self(), {:discord_request, opts})
+      {:ok, %Req.Response{status: 204, body: ""}}
+    end)
+
+    issue = %Issue{id: "issue-planned", identifier: "MT-PLANNED", state: "Planned"}
+
+    assert {:ok, %Issue{state: "In Progress"}} =
+             Orchestrator.mark_issue_in_progress_for_dispatch_for_test(issue)
+
+    assert_receive {:memory_tracker_state_update, "issue-planned", "In Progress"}
+    refute_receive {:discord_request, _opts}, 50
+  end
+
+  test "rework issue is marked in progress before dispatch" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue = %Issue{id: "issue-rework", identifier: "MT-REWORK", state: "Rework"}
+
+    assert {:ok, %Issue{state: "In Progress"}} =
+             Orchestrator.mark_issue_in_progress_for_dispatch_for_test(issue)
+
+    assert_receive {:memory_tracker_state_update, "issue-rework", "In Progress"}
+  end
+
+  test "other issue states keep their state before dispatch" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue = %Issue{id: "issue-merging", identifier: "MT-MERGING", state: "Merging"}
+
+    assert {:ok, %Issue{state: "Merging"}} =
+             Orchestrator.mark_issue_in_progress_for_dispatch_for_test(issue)
+
+    refute_receive {:memory_tracker_state_update, _issue_id, _state_name}, 50
   end
 
   test "linear api token resolves from LINEAR_API_KEY env var" do

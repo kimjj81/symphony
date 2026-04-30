@@ -73,7 +73,7 @@ start_ngrok() {
   ngrok_log="${SYMPHONY_NGROK_LOG:-$HOME/.cache/symphony/myven-ngrok.log}"
   mkdir -p "$(dirname "$ngrok_log")"
 
-  ngrok http "$SYMPHONY_PORT" > "$ngrok_log" 2>&1 &
+  ngrok http "http://127.0.0.1:${SYMPHONY_PORT}" > "$ngrok_log" 2>&1 &
   ngrok_pid=$!
 
   for _ in $(seq 1 30); do
@@ -121,7 +121,7 @@ register_github_webhook() {
 
   common_args=(
     -f name=web
-    -f active=true
+    -F active=true
     -F events[]=issues
     -F events[]=pull_request
     -F events[]=pull_request_review

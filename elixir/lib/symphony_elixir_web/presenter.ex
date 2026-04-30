@@ -60,6 +60,18 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
+  @spec webhook_refresh_payload(GenServer.name(), non_neg_integer()) :: {:ok, map()} | {:error, :unavailable}
+  def webhook_refresh_payload(orchestrator, follow_up_delay_ms) do
+    case refresh_payload(orchestrator) do
+      {:ok, payload} ->
+        _ = Orchestrator.request_refresh_after(orchestrator, follow_up_delay_ms)
+        {:ok, Map.put(payload, :follow_up_refresh_in_ms, follow_up_delay_ms)}
+
+      error ->
+        error
+    end
+  end
+
   defp issue_payload_body(issue_identifier, running, retry) do
     %{
       issue_identifier: issue_identifier,

@@ -343,6 +343,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec mark_issue_in_progress_for_dispatch_for_test(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
+  def mark_issue_in_progress_for_dispatch_for_test(%Issue{} = issue) do
+    mark_issue_in_progress_for_dispatch(issue)
+  end
+
+  @doc false
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
@@ -770,7 +776,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        case mark_issue_in_progress_for_dispatch(refreshed_issue) do
+          {:ok, dispatch_issue} ->
+            do_dispatch_issue(state, dispatch_issue, attempt, preferred_worker_host)
+
+          {:error, reason} ->
+            Logger.warning("Skipping dispatch; failed to mark issue In Progress for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+            state
+        end
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -872,6 +885,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
+
+  defp mark_issue_in_progress_for_dispatch(%Issue{state: state_name} = issue) do
+    if normalize_issue_state(state_name) in ["planned", "rework"] do
+      case Tracker.update_issue_state(issue.id, "In Progress") do
+        :ok ->
+          Logger.info("Marked issue In Progress before dispatch: #{issue_context(issue)} previous_state=#{inspect(state_name)}")
+          {:ok, %{issue | state: "In Progress"}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:ok, issue}
+    end
+  end
 
   defp complete_issue(%State{} = state, issue_id) do
     %{
@@ -1188,6 +1216,18 @@ defmodule SymphonyElixir.Orchestrator do
       GenServer.call(server, :request_refresh)
     else
       :unavailable
+    end
+  end
+
+  @spec request_refresh_after(GenServer.server(), non_neg_integer()) :: :ok | :unavailable
+  def request_refresh_after(server, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
+    case Process.whereis(server) do
+      pid when is_pid(pid) ->
+        Process.send_after(pid, :tick, delay_ms)
+        :ok
+
+      _ ->
+        :unavailable
     end
   end
 

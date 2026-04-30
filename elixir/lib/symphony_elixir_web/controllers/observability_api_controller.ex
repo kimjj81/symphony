@@ -11,6 +11,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   @github_webhook_events ~w(issues pull_request pull_request_review issue_comment)
   @github_webhook_actions ~w(labeled unlabeled closed reopened synchronize submitted created)
   @github_webhook_secret_env "SYMPHONY_GITHUB_WEBHOOK_SECRET"
+  @github_webhook_follow_up_refresh_ms 2_000
 
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
@@ -49,15 +50,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       action = params |> Map.get("action") |> to_string()
 
       if github_webhook_refresh_event?(event, action) do
-        case Presenter.refresh_payload(orchestrator()) do
-          {:ok, payload} ->
-            conn
-            |> put_status(202)
-            |> json(Map.merge(payload, %{event: event, action: action}))
-
-          {:error, :unavailable} ->
-            error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
-        end
+        github_webhook_refresh_response(conn, event, action)
       else
         conn
         |> put_status(202)
@@ -88,12 +81,28 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     |> json(%{error: %{code: code, message: message}})
   end
 
+  defp github_webhook_refresh_response(conn, event, action) do
+    case Presenter.webhook_refresh_payload(orchestrator(), github_webhook_follow_up_refresh_ms()) do
+      {:ok, payload} ->
+        conn
+        |> put_status(202)
+        |> json(Map.merge(payload, %{event: event, action: action}))
+
+      {:error, :unavailable} ->
+        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+    end
+  end
+
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
   end
 
   defp snapshot_timeout_ms do
     Endpoint.config(:snapshot_timeout_ms) || 15_000
+  end
+
+  defp github_webhook_follow_up_refresh_ms do
+    Endpoint.config(:github_webhook_follow_up_refresh_ms) || @github_webhook_follow_up_refresh_ms
   end
 
   defp github_webhook_secret do
