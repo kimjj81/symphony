@@ -103,6 +103,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
+- Treat review states as workspace-retention states, not cleanup states. In particular, `Human Review` must not be configured as a terminal cleanup state because reviewers and later rework need the same generated workspace to remain available.
 
 ## Related skills
 
@@ -251,7 +252,7 @@ Use this only when completion is blocked by missing required tools or missing au
 
 ## Step 3: Human Review and merge handling
 
-1. When the issue is in `Human Review`, do not code or change ticket content.
+1. When the issue is in `Human Review`, do not code or change ticket content, and keep the generated workspace intact for manual re-review or later rework.
 2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
 3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
 4. If approved, human moves the issue to `Merging`.

@@ -9,9 +9,8 @@ tracker:
     - Planned
     - In Progress
     - Rework
-  terminal_states:
-    - Human Review
     - Merging
+  terminal_states:
     - Done
     - Canceled
     - Duplicate
@@ -168,4 +167,7 @@ Instructions:
 14. If this item is a pull request in Todo, improve the PR description, implementation plan, and validation plan, then move it to Human Review.
 15. If this item is a pull request in Planned, move it to In Progress, implement the approved change, run the narrowest useful validation, comment with results, then move it to Human Review.
 16. If this item is in Rework, read the latest GitHub review comments and issue/PR comments first, address only the requested follow-up changes, comment with results, then move it to Human Review.
-17. Do not continue working after moving the item to Human Review.
+17. Human Review is a review-retention state, not a cleanup state. Do not delete or recreate the generated workspace while an issue or PR is in Human Review; the same directory must remain available for manual re-review and later Rework.
+18. If this item is in Merging, treat it as approved merge work. Use the existing generated workspace and current PR branch, verify the PR is mergeable, follow repository merge instructions, and move the item to Done only after the merge succeeds.
+19. Cleanup is allowed only after a true final state: Done, Canceled, or Duplicate.
+20. Do not continue working after moving the item to Human Review.
