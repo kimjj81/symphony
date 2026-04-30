@@ -25,7 +25,7 @@ tracker:
     Canceled: sym:canceled
     Duplicate: sym:duplicate
 polling:
-  interval_ms: 5000
+  interval_ms: 30000
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
   strategy: git_worktree

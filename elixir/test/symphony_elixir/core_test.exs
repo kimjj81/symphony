@@ -121,7 +121,7 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, %{config: config, prompt: prompt}} = Workflow.load(workflow_path)
     assert {:ok, settings} = SymphonyElixir.Config.Schema.parse(config)
 
-    assert settings.polling.interval_ms == 5_000
+    assert settings.polling.interval_ms == 30_000
     assert settings.codex.read_timeout_ms == 10_000
     assert settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
     assert String.trim(prompt) != ""
