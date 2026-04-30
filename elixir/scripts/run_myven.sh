@@ -80,7 +80,8 @@ start_ngrok() {
     public_url="$(
       curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null \
         | sed -n 's/.*"public_url":"\(https:[^"]*\)".*/\1/p' \
-        | head -n 1
+        | head -n 1 \
+        || true
     )"
 
     if [ -n "$public_url" ]; then
