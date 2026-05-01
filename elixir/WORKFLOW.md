@@ -93,6 +93,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Keep ticket metadata current (state, checklist, acceptance criteria, links).
 - Treat a single persistent Linear comment as the source of truth for progress.
 - Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.
+- Non-interactive headless Playwright MCP is allowed for local UI verification, console inspection, screenshots, and deterministic browser checks. Do not use headed browsers, browser extensions, login prompts, captchas, or any MCP flow that requires human input in unattended runs.
 - Do not create repository files only to store issue analysis, planning notes, or scratch work. Record issue-level planning in the issue body or the single workpad comment. If durable documentation is needed, create it later as part of an approved implementation/change PR and commit it on that PR branch.
 - Before handing off a planning-only issue, run `git status --short --untracked-files=all` and confirm there are no task-authored repository changes.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
