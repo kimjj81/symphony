@@ -58,59 +58,48 @@ hooks:
       printf "WARN: codex app-server daemon not found: %s\n" "$CODEX_APPSERVER_DAEMON" >&2
     fi
 
-    if [ -f infra/local/docker-compose.yml ]; then
-      perl -0pi -e 's/"8080:80"/"\${MYVEN_GATEWAY_PORT:-8080}:80"/g;
-        s/"4317:4317"/"\${MYVEN_OTEL_GRPC_PORT:-4317}:4317"/g;
-        s/"4318:4318"/"\${MYVEN_OTEL_HTTP_PORT:-4318}:4318"/g;
-        s/"13133:13133"/"\${MYVEN_OTEL_HEALTH_PORT:-13133}:13133"/g;
-        s/"8888:8888"/"\${MYVEN_OTEL_METRICS_PORT:-8888}:8888"/g;
-        s/"4999:4321"/"\${MYVEN_WEB_PORT:-4999}:4321"/g;
-        s/"8000:8000"/"\${MYVEN_API_PORT:-8000}:8000"/g;
-        s/"8100:8100"/"\${MYVEN_WEBHOOKS_PORT:-8100}:8100"/g;
-        s/"5433:5432"/"\${MYVEN_POSTGRES_PORT:-5433}:5432"/g;
-        s/"4566:4566"/"\${MYVEN_LOCALSTACK_PORT:-4566}:4566"/g;
-        s/"1025:1025"/"\${MYVEN_MAILPIT_SMTP_PORT:-1025}:1025"/g;
-        s/"8025:8025"/"\${MYVEN_MAILPIT_UI_PORT:-8025}:8025"/g;
-        s#http://app\.myven\.localhost:8080#http://app.myven.localhost:\${MYVEN_GATEWAY_PORT:-8080}#g;
-        s#http://myven\.localhost:8080#http://myven.localhost:\${MYVEN_GATEWAY_PORT:-8080}#g;
-        s#http://127\.0\.0\.1:4999#http://127.0.0.1:\${MYVEN_WEB_PORT:-4999}#g;
-        s#http://localhost:4999#http://localhost:\${MYVEN_WEB_PORT:-4999}#g;
-        s#http://127\.0\.0\.1:4566#http://127.0.0.1:\${MYVEN_LOCALSTACK_PORT:-4566}#g;' \
-        infra/local/docker-compose.yml
-    fi
-
     [ -f .env.local ] || : > .env.local
+
+    upsert_env_var() {
+      name="$1"
+      value="$2"
+      awk -v name="$name" -v value="$value" '
+        BEGIN { prefix = name "="; found = 0 }
+        index($0, prefix) == 1 {
+          if (!found) print prefix value
+          found = 1
+          next
+        }
+        { print }
+        END { if (!found) print prefix value }
+      ' .env.local > .env.local.tmp && mv .env.local.tmp .env.local
+    }
 
     compose_project_suffix="$(printf '%s' "$SYMPHONY_ISSUE_IDENTIFIER" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '_')"
     compose_project_name="myven_${compose_project_suffix}"
-    awk -v value="$compose_project_name" '
-      BEGIN { found = 0 }
-      /^COMPOSE_PROJECT_NAME=/ { print "COMPOSE_PROJECT_NAME=" value; found = 1; next }
-      { print }
-      END { if (!found) print "COMPOSE_PROJECT_NAME=" value }
-    ' .env.local > .env.local.tmp && mv .env.local.tmp .env.local
+    upsert_env_var COMPOSE_PROJECT_NAME "$compose_project_name"
 
     random_port_base="$(awk -v seed="$(date +%s)$$" 'BEGIN { srand(seed); print int(50000 + rand() * 9000) }')"
-    append_port_var() {
+    upsert_port_var() {
       name="$1"
       offset="$2"
-      if ! grep -q "^${name}=" .env.local; then
-        printf '%s=%s\n' "$name" "$((random_port_base + offset))" >> .env.local
-      fi
+      upsert_env_var "$name" "$((random_port_base + offset))"
     }
 
-    append_port_var MYVEN_GATEWAY_PORT 0
-    append_port_var MYVEN_WEB_PORT 1
-    append_port_var MYVEN_API_PORT 2
-    append_port_var MYVEN_WEBHOOKS_PORT 3
-    append_port_var MYVEN_POSTGRES_PORT 4
-    append_port_var MYVEN_LOCALSTACK_PORT 5
-    append_port_var MYVEN_MAILPIT_SMTP_PORT 6
-    append_port_var MYVEN_MAILPIT_UI_PORT 7
-    append_port_var MYVEN_OTEL_GRPC_PORT 8
-    append_port_var MYVEN_OTEL_HTTP_PORT 9
-    append_port_var MYVEN_OTEL_HEALTH_PORT 10
-    append_port_var MYVEN_OTEL_METRICS_PORT 11
+    myven_web_port="$((random_port_base + 1))"
+    upsert_port_var MYVEN_GATEWAY_PORT 0
+    upsert_port_var MYVEN_WEB_PORT 1
+    upsert_port_var MYVEN_API_PORT 2
+    upsert_port_var MYVEN_WEBHOOKS_PORT 3
+    upsert_port_var MYVEN_POSTGRES_PORT 4
+    upsert_port_var MYVEN_LOCALSTACK_PORT 5
+    upsert_port_var MYVEN_MAILPIT_SMTP_PORT 6
+    upsert_port_var MYVEN_MAILPIT_UI_PORT 7
+    upsert_port_var MYVEN_OTEL_GRPC_PORT 8
+    upsert_port_var MYVEN_OTEL_HTTP_PORT 9
+    upsert_port_var MYVEN_OTEL_HEALTH_PORT 10
+    upsert_port_var MYVEN_OTEL_METRICS_PORT 11
+    upsert_env_var MYVEN_LOCAL_BASE_URL "http://127.0.0.1:${myven_web_port}"
 
     if [ -f package.json ] && command -v pnpm >/dev/null 2>&1; then
       pnpm run worktree:bootstrap
@@ -172,23 +161,24 @@ Instructions:
    - Non-interactive headless Playwright MCP is allowed for local UI verification, console inspection, screenshots, and deterministic browser checks.
    - Do not use headed browsers, browser extensions, login prompts, captchas, or any MCP flow that requires human input in unattended Symphony runs.
    - If headless browser automation is unavailable, record the blocker and continue with the narrowest non-browser validation.
-8. Write GitHub issue comments, issue bodies, pull request titles, pull request descriptions, and pull request comments in Korean unless quoting source text or preserving an existing external title.
-9. If this item is a GitHub issue in Todo, do not implement code and do not create, modify, commit, or push repository files, including `docs/draft/*`. Analyze the issue, record the plan only in the issue body or a GitHub comment, propose PR-sized work items in a GitHub comment, then move the item to Human Review.
-10. If this item is a GitHub issue in Planned, treat Planned as explicit human approval to execute only when the issue has `## 결정 사항` and `## 완료 기준` sections, required ADR coverage for schema/auth/secret/RLS/deploy changes, and 12 or fewer expected files. If any gate fails, do not implement; comment with the blocker and move it to Human Review.
-11. Symphony must not move a GitHub issue from Todo or Human Review to Planned by itself. Only a human-applied sym:planned label is an approval gate.
-12. If a Planned issue is explicitly a planning/splitting issue, create the requested PR-sized follow-up issues instead of changing product code. Label follow-up implementation issues sym:planned only when the parent issue explicitly asks for immediate execution; otherwise label them sym:todo for human review.
-13. If this item is a GitHub issue in In Progress, create or update PR-sized implementation work and keep the issue comment trail current. After implementation, open or update the implementation PR, complete the self-review checklist, then move both the PR and source issue to Review instead of Human Review.
-14. If implementation becomes too large, stop before committing and comment: "이 PR은 너무 커졌으므로 여기까지 commit하지 않고 분할 제안". Move the item to Human Review with the split proposal.
-15. If this item is a pull request in Todo, improve the PR description, implementation plan, and validation plan, then move it to Human Review.
-16. If this item is a pull request in Planned, move it to In Progress, implement the approved change, run the narrowest useful validation, complete the self-review checklist, comment with results, then move the PR and source issue to Review.
-17. If this item is a pull request in Review or Reviewing, perform automated code review and security review. If there are no required improvements, synchronize PR body/comment and relevant docs/workpad, then move the PR and source issue to Human Review. If improvements are required, leave a PR comment with findings and move the PR and source issue to Rework.
-18. If this item is in Rework, read the latest GitHub review comments and issue/PR comments first, address only the requested follow-up changes, comment with results, then move the PR and source issue to Review. Split new features or large design changes into a new issue instead of expanding Rework.
-19. Human Review is a review-retention state, not a cleanup state. Do not delete or recreate the generated workspace while an issue or PR is in Human Review; the same directory must remain available for manual re-review and later Rework.
-20. If this item is in Merging, treat it as approved merge work. Use the existing generated workspace and current PR branch, verify the PR is mergeable, follow repository merge instructions, and move the item to Done only after the merge succeeds.
-21. Cleanup is allowed only after a true final state: Done, Canceled, or Duplicate.
-22. For GitHub issues, terminal state labels must match the GitHub open/closed state: `sym:done` closes as completed, and `sym:canceled` or `sym:duplicate` close as not planned. Moving an issue back to a non-terminal Symphony label should reopen it.
-23. Do not continue working after moving the item to Human Review.
-24. If durable documentation is needed for a Todo issue, defer it to an approved Planned PR-sized work item and commit it on that PR branch. Do not reference local-only scratch file paths in issue comments.
-25. Before moving a Todo GitHub issue to Human Review, run `git status --short --untracked-files=all` and confirm there are no task-authored repository changes.
-26. Before moving an implementation PR to Review, record this self-review checklist in the PR body or comment: tenant/RLS, migration/backfill, idempotency/retry/replay, local/prod URL, secret/token exposure, browser-visible terminology, and fixture/local smoke preservation.
-27. Preserve `docs/draft` workpads through Human Review. Before Merging, either move durable content into `docs/architecture`, `docs/design-system`, or `docs/adr`, or remove the draft-only workpad.
+8. For local URLs and browser/smoke verification, read the current worktree's `.env.local` and use its `MYVEN_*_PORT` values. Do not assume the default ports such as 4999, 8080, 8000, 8100, 5433, or 4566 are free in a Symphony worktree.
+9. Write GitHub issue comments, issue bodies, pull request titles, pull request descriptions, and pull request comments in Korean unless quoting source text or preserving an existing external title.
+10. If this item is a GitHub issue in Todo, do not implement code and do not create, modify, commit, or push repository files, including `docs/draft/*`. Analyze the issue, record the plan only in the issue body or a GitHub comment, propose PR-sized work items in a GitHub comment, then move the item to Human Review.
+11. If this item is a GitHub issue in Planned, treat Planned as explicit human approval to execute only when the issue has `## 결정 사항` and `## 완료 기준` sections, required ADR coverage for schema/auth/secret/RLS/deploy changes, and 12 or fewer expected files. If any gate fails, do not implement; comment with the blocker and move it to Human Review.
+12. Symphony must not move a GitHub issue from Todo or Human Review to Planned by itself. Only a human-applied sym:planned label is an approval gate.
+13. If a Planned issue is explicitly a planning/splitting issue, create the requested PR-sized follow-up issues instead of changing product code. Label follow-up implementation issues sym:planned only when the parent issue explicitly asks for immediate execution; otherwise label them sym:todo for human review.
+14. If this item is a GitHub issue in In Progress, create or update PR-sized implementation work and keep the issue comment trail current. After implementation, open or update the implementation PR, complete the self-review checklist, then move both the PR and source issue to Review instead of Human Review.
+15. If implementation becomes too large, stop before committing and comment: "이 PR은 너무 커졌으므로 여기까지 commit하지 않고 분할 제안". Move the item to Human Review with the split proposal.
+16. If this item is a pull request in Todo, improve the PR description, implementation plan, and validation plan, then move it to Human Review.
+17. If this item is a pull request in Planned, move it to In Progress, implement the approved change, run the narrowest useful validation, complete the self-review checklist, comment with results, then move the PR and source issue to Review.
+18. If this item is a pull request in Review or Reviewing, perform automated code review and security review. If there are no required improvements, synchronize PR body/comment and relevant docs/workpad, then move the PR and source issue to Human Review. If improvements are required, leave a PR comment with findings and move the PR and source issue to Rework.
+19. If this item is in Rework, read the latest GitHub review comments and issue/PR comments first, address only the requested follow-up changes, comment with results, then move the PR and source issue to Review. Split new features or large design changes into a new issue instead of expanding Rework.
+20. Human Review is a review-retention state, not a cleanup state. Do not delete or recreate the generated workspace while an issue or PR is in Human Review; the same directory must remain available for manual re-review and later Rework.
+21. If this item is in Merging, treat it as approved merge work. Use the existing generated workspace and current PR branch, verify the PR is mergeable, follow repository merge instructions, and move the item to Done only after the merge succeeds.
+22. Cleanup is allowed only after a true final state: Done, Canceled, or Duplicate.
+23. For GitHub issues, terminal state labels must match the GitHub open/closed state: `sym:done` closes as completed, and `sym:canceled` or `sym:duplicate` close as not planned. Moving an issue back to a non-terminal Symphony label should reopen it.
+24. Do not continue working after moving the item to Human Review.
+25. If durable documentation is needed for a Todo issue, defer it to an approved Planned PR-sized work item and commit it on that PR branch. Do not reference local-only scratch file paths in issue comments.
+26. Before moving a Todo GitHub issue to Human Review, run `git status --short --untracked-files=all` and confirm there are no task-authored repository changes.
+27. Before moving an implementation PR to Review, record this self-review checklist in the PR body or comment: tenant/RLS, migration/backfill, idempotency/retry/replay, local/prod URL, secret/token exposure, browser-visible terminology, and fixture/local smoke preservation.
+28. Preserve `docs/draft` workpads through Human Review. Before Merging, either move durable content into `docs/architecture`, `docs/design-system`, or `docs/adr`, or remove the draft-only workpad.
