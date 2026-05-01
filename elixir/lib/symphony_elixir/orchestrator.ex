@@ -345,7 +345,7 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec mark_issue_in_progress_for_dispatch_for_test(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
   def mark_issue_in_progress_for_dispatch_for_test(%Issue{} = issue) do
-    mark_issue_in_progress_for_dispatch(issue)
+    mark_issue_for_dispatch(issue)
   end
 
   @doc false
@@ -707,18 +707,30 @@ defmodule SymphonyElixir.Orchestrator do
            id: id,
            identifier: identifier,
            title: title,
-           state: state_name
+           state: state_name,
+           kind: kind
          } = issue,
          active_states,
          terminal_states
        )
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     issue_routable_to_worker?(issue) and
+      review_state_routable?(state_name, kind) and
       active_issue_state?(state_name, active_states) and
       !terminal_issue_state?(state_name, terminal_states)
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
+
+  defp review_state_routable?(state_name, kind) when is_binary(state_name) do
+    case normalize_issue_state(state_name) do
+      "review" -> kind == :pull_request
+      "reviewing" -> kind == :pull_request
+      _ -> true
+    end
+  end
+
+  defp review_state_routable?(_state_name, _kind), do: true
 
   defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
        when is_boolean(assigned_to_worker),
@@ -776,12 +788,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        case mark_issue_in_progress_for_dispatch(refreshed_issue) do
+        case mark_issue_for_dispatch(refreshed_issue) do
           {:ok, dispatch_issue} ->
             do_dispatch_issue(state, dispatch_issue, attempt, preferred_worker_host)
 
           {:error, reason} ->
-            Logger.warning("Skipping dispatch; failed to mark issue In Progress for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+            Logger.warning("Skipping dispatch; failed to mark issue for dispatch for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
             state
         end
 
@@ -886,12 +898,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
-  defp mark_issue_in_progress_for_dispatch(%Issue{state: state_name} = issue) do
-    if normalize_issue_state(state_name) in ["planned", "rework"] do
-      case Tracker.update_issue_state(issue.id, "In Progress") do
+  defp mark_issue_for_dispatch(%Issue{state: state_name} = issue) do
+    target_state =
+      case normalize_issue_state(state_name) do
+        state when state in ["planned", "rework"] -> "In Progress"
+        "review" -> "Reviewing"
+        _ -> nil
+      end
+
+    if is_binary(target_state) do
+      case Tracker.update_issue_state(issue.id, target_state) do
         :ok ->
-          Logger.info("Marked issue In Progress before dispatch: #{issue_context(issue)} previous_state=#{inspect(state_name)}")
-          {:ok, %{issue | state: "In Progress"}}
+          Logger.info("Marked issue for dispatch: #{issue_context(issue)} previous_state=#{inspect(state_name)} state=#{target_state}")
+          {:ok, %{issue | state: target_state}}
 
         {:error, reason} ->
           {:error, reason}

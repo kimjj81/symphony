@@ -48,13 +48,53 @@ defmodule SymphonyElixir.GitHubClientTest do
                "state" => "open",
                "html_url" => "https://github.com/studiojin-dev/myven/pull/7",
                "pull_request" => %{"url" => "https://api.github.com/repos/studiojin-dev/myven/pulls/7"},
-               "labels" => [%{"name" => "sym:planned"}]
+               "labels" => [%{"name" => "sym:review"}]
              })
 
     assert issue.id == "github:pr:7"
     assert issue.identifier == "PR #7"
     assert issue.kind == :pull_request
-    assert issue.state == "Planned"
+    assert issue.state == "Review"
+  end
+
+  test "skips GitHub issues without Symphony state labels" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    assert :skip =
+             Client.normalize_issue_for_test(%{
+               "number" => 8,
+               "title" => "Parked idea",
+               "body" => "No Symphony label",
+               "state" => "open",
+               "html_url" => "https://github.com/studiojin-dev/myven/issues/8",
+               "labels" => [%{"name" => "enhancement"}]
+             })
+  end
+
+  test "skips GitHub issues with ambiguous Symphony state labels" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    assert :skip =
+             Client.normalize_issue_for_test(%{
+               "number" => 9,
+               "title" => "Conflicting state",
+               "body" => "Two state labels",
+               "state" => "open",
+               "html_url" => "https://github.com/studiojin-dev/myven/issues/9",
+               "labels" => [%{"name" => "sym:review"}, %{"name" => "sym:reviewing"}]
+             })
   end
 
   test "rejects ambiguous Symphony state labels" do

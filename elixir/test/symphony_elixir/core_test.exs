@@ -163,6 +163,18 @@ defmodule SymphonyElixir.CoreTest do
     assert_receive {:memory_tracker_state_update, "issue-rework", "In Progress"}
   end
 
+  test "review pull request is marked reviewing before dispatch" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue = %Issue{id: "github:pr:12", identifier: "PR #12", state: "Review", kind: :pull_request}
+
+    assert {:ok, %Issue{state: "Reviewing"}} =
+             Orchestrator.mark_issue_in_progress_for_dispatch_for_test(issue)
+
+    assert_receive {:memory_tracker_state_update, "github:pr:12", "Reviewing"}
+  end
+
   test "other issue states keep their state before dispatch" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
@@ -173,6 +185,37 @@ defmodule SymphonyElixir.CoreTest do
              Orchestrator.mark_issue_in_progress_for_dispatch_for_test(issue)
 
     refute_receive {:memory_tracker_state_update, _issue_id, _state_name}, 50
+  end
+
+  test "review state dispatches pull requests but not issues" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Review", "Reviewing"]
+    )
+
+    state = %Orchestrator.State{
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    review_issue = %Issue{
+      id: "github:issue:12",
+      identifier: "#12",
+      title: "Implementation issue",
+      state: "Review",
+      kind: :issue
+    }
+
+    review_pr = %Issue{
+      id: "github:pr:12",
+      identifier: "PR #12",
+      title: "Implementation PR",
+      state: "Review",
+      kind: :pull_request
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(review_issue, state)
+    assert Orchestrator.should_dispatch_issue_for_test(review_pr, state)
   end
 
   test "linear api token resolves from LINEAR_API_KEY env var" do

@@ -12,6 +12,8 @@ defmodule SymphonyElixir.GitHub.Client do
     "Todo" => "sym:todo",
     "Planned" => "sym:planned",
     "In Progress" => "sym:in-progress",
+    "Review" => "sym:review",
+    "Reviewing" => "sym:reviewing",
     "Human Review" => "sym:human-review",
     "Rework" => "sym:rework",
     "Merging" => "sym:merging",
@@ -23,6 +25,8 @@ defmodule SymphonyElixir.GitHub.Client do
     "sym:todo" => {"ededed", "Symphony should triage or prepare this item."},
     "sym:planned" => {"bfd4ff", "Human-approved work ready for Symphony implementation."},
     "sym:in-progress" => {"f9d66d", "Symphony or a human is actively working on this item."},
+    "sym:review" => {"0969da", "Ready for Symphony automated review."},
+    "sym:reviewing" => {"1f883d", "Symphony automated review is running."},
     "sym:human-review" => {"2da44e", "Waiting for human review or approval."},
     "sym:rework" => {"fb8f44", "Review requested changes for Symphony to address."},
     "sym:merging" => {"d4c5f9", "Approved work is being merged or finalized."},
@@ -189,40 +193,48 @@ defmodule SymphonyElixir.GitHub.Client do
   defp normalize_issue(raw_issue, pull_data \\ nil) when is_map(raw_issue) do
     labels = extract_labels(raw_issue)
 
-    with {:ok, state} <- state_from_labels(labels) do
-      state = state || fallback_closed_state(raw_issue, pull_data)
+    case state_from_labels(labels) do
+      {:ok, state} ->
+        state = state || fallback_closed_state(raw_issue, pull_data)
 
-      if is_nil(state) do
+        if is_nil(state) do
+          :skip
+        else
+          number = raw_issue["number"]
+          kind = issue_kind(raw_issue)
+
+          {:ok,
+           %Issue{
+             id: github_issue_id(kind, number),
+             identifier: github_identifier(kind, number),
+             title: raw_issue["title"],
+             description: raw_issue["body"],
+             priority: nil,
+             state: state,
+             branch_name: pull_branch_name(pull_data),
+             url: raw_issue["html_url"],
+             assignee_id: assignee_id(raw_issue["assignee"]),
+             kind: kind,
+             metadata: %{
+               tracker: "github",
+               number: number,
+               repository: github_repository(),
+               node_id: raw_issue["node_id"],
+               merged: pull_merged?(pull_data)
+             },
+             labels: labels,
+             assigned_to_worker: true,
+             created_at: parse_datetime(raw_issue["created_at"]),
+             updated_at: parse_datetime(raw_issue["updated_at"])
+           }}
+        end
+
+      {:error, {:ambiguous_state_labels, states}} ->
+        Logger.warning("Skipping GitHub issue with ambiguous Symphony state labels number=#{inspect(raw_issue["number"])} states=#{inspect(states)}")
         :skip
-      else
-        number = raw_issue["number"]
-        kind = issue_kind(raw_issue)
 
-        {:ok,
-         %Issue{
-           id: github_issue_id(kind, number),
-           identifier: github_identifier(kind, number),
-           title: raw_issue["title"],
-           description: raw_issue["body"],
-           priority: nil,
-           state: state,
-           branch_name: pull_branch_name(pull_data),
-           url: raw_issue["html_url"],
-           assignee_id: assignee_id(raw_issue["assignee"]),
-           kind: kind,
-           metadata: %{
-             tracker: "github",
-             number: number,
-             repository: github_repository(),
-             node_id: raw_issue["node_id"],
-             merged: pull_merged?(pull_data)
-           },
-           labels: labels,
-           assigned_to_worker: true,
-           created_at: parse_datetime(raw_issue["created_at"]),
-           updated_at: parse_datetime(raw_issue["updated_at"])
-         }}
-      end
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

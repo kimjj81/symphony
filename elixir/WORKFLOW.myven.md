@@ -8,6 +8,8 @@ tracker:
     - Todo
     - Planned
     - In Progress
+    - Review
+    - Reviewing
     - Rework
     - Merging
   terminal_states:
@@ -18,6 +20,8 @@ tracker:
     Todo: sym:todo
     Planned: sym:planned
     In Progress: sym:in-progress
+    Review: sym:review
+    Reviewing: sym:reviewing
     Human Review: sym:human-review
     Rework: sym:rework
     Merging: sym:merging
@@ -161,26 +165,30 @@ Instructions:
 1. Work only in the workspace generated for this ticket.
 2. Keep changes scoped and minimal.
 3. Prefer safe, deterministic changes and record blockers in the workpad.
-4. Use the GitHub labels as the state machine: sym:todo, sym:planned, sym:in-progress, sym:human-review, sym:rework, sym:merging, sym:done, sym:canceled, sym:duplicate.
-5. Do not spawn sub-agents, supervisor agents, reviewer agents, or specialist agents in this unattended Symphony run.
-6. If repository instructions require supervisor/reviewer agents, treat Symphony as the supervisor and perform a concise self-review instead.
+4. Use the GitHub labels as the state machine: sym:todo, sym:planned, sym:in-progress, sym:review, sym:reviewing, sym:human-review, sym:rework, sym:merging, sym:done, sym:canceled, sym:duplicate.
+5. Do not spawn supervisor agents in this unattended Symphony run. For implementation runs, do not spawn reviewer or specialist agents; perform the required self-review instead.
+6. For Review or Reviewing pull request runs, use code-review and security-review agents or equivalent reviewer roles when available. If repository instructions otherwise require supervisor agents, treat Symphony as the supervisor.
 7. Do not call tools that require interactive MCP elicitation or human input; record the blocker and stop if no non-interactive path exists.
    - Non-interactive headless Playwright MCP is allowed for local UI verification, console inspection, screenshots, and deterministic browser checks.
    - Do not use headed browsers, browser extensions, login prompts, captchas, or any MCP flow that requires human input in unattended Symphony runs.
    - If headless browser automation is unavailable, record the blocker and continue with the narrowest non-browser validation.
 8. Write GitHub issue comments, issue bodies, pull request titles, pull request descriptions, and pull request comments in Korean unless quoting source text or preserving an existing external title.
 9. If this item is a GitHub issue in Todo, do not implement code and do not create, modify, commit, or push repository files, including `docs/draft/*`. Analyze the issue, record the plan only in the issue body or a GitHub comment, propose PR-sized work items in a GitHub comment, then move the item to Human Review.
-10. If this item is a GitHub issue in Planned, treat Planned as explicit human approval to execute. Move it to In Progress, implement the approved scope, open or update one PR, comment with validation results, then move it to Human Review.
+10. If this item is a GitHub issue in Planned, treat Planned as explicit human approval to execute only when the issue has `## 결정 사항` and `## 완료 기준` sections, required ADR coverage for schema/auth/secret/RLS/deploy changes, and 12 or fewer expected files. If any gate fails, do not implement; comment with the blocker and move it to Human Review.
 11. Symphony must not move a GitHub issue from Todo or Human Review to Planned by itself. Only a human-applied sym:planned label is an approval gate.
 12. If a Planned issue is explicitly a planning/splitting issue, create the requested PR-sized follow-up issues instead of changing product code. Label follow-up implementation issues sym:planned only when the parent issue explicitly asks for immediate execution; otherwise label them sym:todo for human review.
-13. If this item is a GitHub issue in In Progress, create or update PR-sized implementation work and keep the issue comment trail current.
-14. If this item is a pull request in Todo, improve the PR description, implementation plan, and validation plan, then move it to Human Review.
-15. If this item is a pull request in Planned, move it to In Progress, implement the approved change, run the narrowest useful validation, comment with results, then move it to Human Review.
-16. If this item is in Rework, read the latest GitHub review comments and issue/PR comments first, address only the requested follow-up changes, comment with results, then move it to Human Review.
-17. Human Review is a review-retention state, not a cleanup state. Do not delete or recreate the generated workspace while an issue or PR is in Human Review; the same directory must remain available for manual re-review and later Rework.
-18. If this item is in Merging, treat it as approved merge work. Use the existing generated workspace and current PR branch, verify the PR is mergeable, follow repository merge instructions, and move the item to Done only after the merge succeeds.
-19. Cleanup is allowed only after a true final state: Done, Canceled, or Duplicate.
-20. For GitHub issues, terminal state labels must match the GitHub open/closed state: `sym:done` closes as completed, and `sym:canceled` or `sym:duplicate` close as not planned. Moving an issue back to a non-terminal Symphony label should reopen it.
-21. Do not continue working after moving the item to Human Review.
-22. If durable documentation is needed for a Todo issue, defer it to an approved Planned PR-sized work item and commit it on that PR branch. Do not reference local-only scratch file paths in issue comments.
-23. Before moving a Todo GitHub issue to Human Review, run `git status --short --untracked-files=all` and confirm there are no task-authored repository changes.
+13. If this item is a GitHub issue in In Progress, create or update PR-sized implementation work and keep the issue comment trail current. After implementation, open or update the implementation PR, complete the self-review checklist, then move both the PR and source issue to Review instead of Human Review.
+14. If implementation becomes too large, stop before committing and comment: "이 PR은 너무 커졌으므로 여기까지 commit하지 않고 분할 제안". Move the item to Human Review with the split proposal.
+15. If this item is a pull request in Todo, improve the PR description, implementation plan, and validation plan, then move it to Human Review.
+16. If this item is a pull request in Planned, move it to In Progress, implement the approved change, run the narrowest useful validation, complete the self-review checklist, comment with results, then move the PR and source issue to Review.
+17. If this item is a pull request in Review or Reviewing, perform automated code review and security review. If there are no required improvements, synchronize PR body/comment and relevant docs/workpad, then move the PR and source issue to Human Review. If improvements are required, leave a PR comment with findings and move the PR and source issue to Rework.
+18. If this item is in Rework, read the latest GitHub review comments and issue/PR comments first, address only the requested follow-up changes, comment with results, then move the PR and source issue to Review. Split new features or large design changes into a new issue instead of expanding Rework.
+19. Human Review is a review-retention state, not a cleanup state. Do not delete or recreate the generated workspace while an issue or PR is in Human Review; the same directory must remain available for manual re-review and later Rework.
+20. If this item is in Merging, treat it as approved merge work. Use the existing generated workspace and current PR branch, verify the PR is mergeable, follow repository merge instructions, and move the item to Done only after the merge succeeds.
+21. Cleanup is allowed only after a true final state: Done, Canceled, or Duplicate.
+22. For GitHub issues, terminal state labels must match the GitHub open/closed state: `sym:done` closes as completed, and `sym:canceled` or `sym:duplicate` close as not planned. Moving an issue back to a non-terminal Symphony label should reopen it.
+23. Do not continue working after moving the item to Human Review.
+24. If durable documentation is needed for a Todo issue, defer it to an approved Planned PR-sized work item and commit it on that PR branch. Do not reference local-only scratch file paths in issue comments.
+25. Before moving a Todo GitHub issue to Human Review, run `git status --short --untracked-files=all` and confirm there are no task-authored repository changes.
+26. Before moving an implementation PR to Review, record this self-review checklist in the PR body or comment: tenant/RLS, migration/backfill, idempotency/retry/replay, local/prod URL, secret/token exposure, browser-visible terminology, and fixture/local smoke preservation.
+27. Preserve `docs/draft` workpads through Human Review. Before Merging, either move durable content into `docs/architecture`, `docs/design-system`, or `docs/adr`, or remove the draft-only workpad.
