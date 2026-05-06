@@ -1092,6 +1092,40 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
   end
 
+  test "schema resolves GitHub endpoints and truthy sandbox network env" do
+    network_env = "SYMPHONY_CODEX_NETWORK_ACCESS"
+    endpoint_env = "SYMPHONY_TEST_MISSING_GITHUB_ENDPOINT"
+    previous_network_env = System.get_env(network_env)
+    previous_endpoint_env = System.get_env(endpoint_env)
+
+    System.put_env(network_env, "yes")
+    System.delete_env(endpoint_env)
+
+    on_exit(fn ->
+      restore_env(network_env, previous_network_env)
+      restore_env(endpoint_env, previous_endpoint_env)
+    end)
+
+    assert {:ok, default_github_settings} =
+             Schema.parse(%{
+               tracker: %{kind: "github", endpoint: "$#{endpoint_env}"}
+             })
+
+    assert default_github_settings.tracker.endpoint == "https://api.github.com"
+
+    assert {:ok, custom_github_settings} =
+             Schema.parse(%{
+               tracker: %{kind: "github", endpoint: "https://github.example/api/v3"}
+             })
+
+    assert custom_github_settings.tracker.endpoint == "https://github.example/api/v3"
+
+    assert Schema.resolve_turn_sandbox_policy(%Schema{
+             codex: %Codex{turn_sandbox_policy: nil},
+             workspace: %Schema.Workspace{root: "/tmp/symphony-net"}
+           })["networkAccess"] == true
+  end
+
   test "schema resolves sandbox policies from explicit and default workspaces" do
     explicit_policy = %{"type" => "workspaceWrite", "writableRoots" => ["/tmp/explicit"]}
 

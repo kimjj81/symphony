@@ -740,8 +740,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp review_state_routable?(_state_name, _kind), do: true
-
   defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
        when is_boolean(assigned_to_worker),
        do: assigned_to_worker

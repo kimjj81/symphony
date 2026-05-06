@@ -98,7 +98,7 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   @doc false
-  @spec normalize_issue_for_test(map()) :: {:ok, Issue.t()} | :skip | {:error, term()}
+  @spec normalize_issue_for_test(map()) :: {:ok, Issue.t()} | :skip
   def normalize_issue_for_test(raw_issue) when is_map(raw_issue) do
     normalize_issue(raw_issue)
   end
@@ -143,7 +143,6 @@ defmodule SymphonyElixir.GitHub.Client do
     case normalize_issue(raw_issue) do
       {:ok, issue} -> {:cont, {:ok, [issue | acc]}}
       :skip -> {:cont, {:ok, acc}}
-      {:error, reason} -> {:halt, {:error, reason}}
     end
   end
 
@@ -232,9 +231,6 @@ defmodule SymphonyElixir.GitHub.Client do
       {:error, {:ambiguous_state_labels, states}} ->
         Logger.warning("Skipping GitHub issue with ambiguous Symphony state labels number=#{inspect(raw_issue["number"])} states=#{inspect(states)}")
         :skip
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 
