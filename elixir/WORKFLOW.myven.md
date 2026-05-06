@@ -107,7 +107,112 @@ hooks:
       printf "WARN: skipped worktree bootstrap; package.json or pnpm not found\n" >&2
     fi
   before_remove: |
-    :
+    workspace_root="$(pwd)"
+    workspace_physical_root="$(pwd -P 2>/dev/null || pwd)"
+    workspace_hook_root="${SYMPHONY_WORKSPACE:-}"
+    compose_file="${workspace_root}/infra/local/docker-compose.yml"
+    env_file="${workspace_root}/.env.local"
+
+    if [ ! -f "$compose_file" ]; then
+      printf "WARN: skipped Myven compose cleanup; missing %s\n" "$compose_file" >&2
+      exit 0
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+      printf "WARN: skipped Myven compose cleanup; docker command not found\n" >&2
+      exit 0
+    fi
+
+    export DOCKER_CONFIG="${DOCKER_CONFIG:-/tmp/myven-docker-config}"
+    mkdir -p "$DOCKER_CONFIG" 2>/dev/null || true
+
+    projects_file="${TMPDIR:-/tmp}/myven-compose-cleanup-projects-$$"
+    : > "$projects_file"
+    trap 'rm -f "$projects_file"' EXIT
+
+    add_compose_project() {
+      project="$1"
+      case "$project" in
+        myven_*)
+          if ! grep -qxF "$project" "$projects_file" 2>/dev/null; then
+            printf "%s\n" "$project" >> "$projects_file"
+          fi
+          ;;
+      esac
+    }
+
+    working_dir_belongs_to_workspace() {
+      working_dir="$1"
+
+      case "$working_dir" in
+        "$workspace_root"|"$workspace_root"/*)
+          return 0
+          ;;
+      esac
+
+      if [ "$workspace_physical_root" != "$workspace_root" ]; then
+        case "$working_dir" in
+          "$workspace_physical_root"|"$workspace_physical_root"/*)
+            return 0
+            ;;
+        esac
+      fi
+
+      if [ -n "$workspace_hook_root" ]; then
+        case "$working_dir" in
+          "$workspace_hook_root"|"$workspace_hook_root"/*)
+            return 0
+            ;;
+        esac
+      fi
+
+      return 1
+    }
+
+    if [ -f "$env_file" ]; then
+      env_project="$(
+        awk -F= '
+          $1 == "COMPOSE_PROJECT_NAME" {
+            value = $2
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            gsub(/^["'"'"']|["'"'"']$/, "", value)
+            print value
+          }
+        ' "$env_file" | tail -n 1
+      )"
+      [ -n "$env_project" ] && add_compose_project "$env_project"
+    fi
+
+    docker ps -a \
+      --filter label=com.docker.compose.project \
+      --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' \
+      2>/dev/null |
+      while IFS='|' read -r project working_dir; do
+        if working_dir_belongs_to_workspace "$working_dir"; then
+          add_compose_project "$project"
+        fi
+      done
+
+    if [ ! -s "$projects_file" ]; then
+      printf "INFO: no Myven compose projects found for %s\n" "$workspace_root"
+      exit 0
+    fi
+
+    cleanup_failed=0
+    while IFS= read -r project; do
+      [ -n "$project" ] || continue
+      printf "INFO: removing Myven compose project %s\n" "$project"
+
+      if [ -f "$env_file" ]; then
+        docker compose --profile tools --env-file "$env_file" -p "$project" -f "$compose_file" down -v --remove-orphans ||
+          cleanup_failed=1
+      else
+        docker compose --profile tools -p "$project" -f "$compose_file" down -v --remove-orphans ||
+          cleanup_failed=1
+      fi
+    done < "$projects_file"
+
+    exit "$cleanup_failed"
 agent:
   max_concurrent_agents: 2
   max_turns: 3

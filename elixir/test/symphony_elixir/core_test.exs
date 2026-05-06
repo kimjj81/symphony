@@ -127,6 +127,85 @@ defmodule SymphonyElixir.CoreTest do
     assert String.trim(prompt) != ""
   end
 
+  test "current WORKFLOW.myven.md before_remove cleans env and label compose projects" do
+    workflow_path = Path.expand("../../WORKFLOW.myven.md", __DIR__)
+
+    assert {:ok, %{config: config}} = Workflow.load(workflow_path)
+    assert {:ok, settings} = Config.Schema.parse(config)
+
+    test_root = Path.join(System.tmp_dir!(), "myven-before-remove-hook-#{System.unique_integer([:positive])}")
+    workspace = Path.join(test_root, "workspace")
+    bin_dir = Path.join(test_root, "bin")
+    docker_log = Path.join(test_root, "docker.log")
+    compose_dir = Path.join(workspace, "infra/local")
+    compose_file = Path.join(compose_dir, "docker-compose.yml")
+    env_file = Path.join(workspace, ".env.local")
+
+    try do
+      File.rm_rf!(test_root)
+      File.mkdir_p!(bin_dir)
+      File.mkdir_p!(compose_dir)
+      File.write!(compose_file, "services: {}\n")
+      File.write!(env_file, "COMPOSE_PROJECT_NAME=myven_from_env\n")
+      File.write!(docker_log, "")
+
+      docker_path = Path.join(bin_dir, "docker")
+
+      File.write!(docker_path, """
+      #!/bin/sh
+      printf '%s\\n' "$*" >> "$DOCKER_LOG"
+
+      if [ "$1" = "ps" ]; then
+        printf 'myven_from_label|#{compose_dir}\\n'
+        printf 'myven_other|/tmp/other/infra/local\\n'
+        exit 0
+      fi
+
+      if [ "$1" = "compose" ]; then
+        exit 0
+      fi
+
+      exit 99
+      """)
+
+      File.chmod!(docker_path, 0o755)
+
+      original_path = System.get_env("PATH") || ""
+
+      {output, status} =
+        System.cmd("sh", ["-c", settings.hooks.before_remove],
+          cd: workspace,
+          stderr_to_stdout: true,
+          env: [
+            {"DOCKER_LOG", docker_log},
+            {"PATH", Enum.join([bin_dir, original_path], ":")},
+            {"SYMPHONY_WORKSPACE", workspace},
+            {"TMPDIR", test_root}
+          ]
+        )
+
+      assert status == 0, output
+      assert output =~ "INFO: removing Myven compose project myven_from_env"
+      assert output =~ "INFO: removing Myven compose project myven_from_label"
+
+      log = File.read!(docker_log)
+      {physical_workspace_output, 0} = System.cmd("pwd", ["-P"], cd: workspace)
+      physical_workspace = String.trim(physical_workspace_output)
+      physical_env_file = Path.join(physical_workspace, ".env.local")
+      physical_compose_file = Path.join(physical_workspace, "infra/local/docker-compose.yml")
+
+      assert log =~
+               "compose --profile tools --env-file #{physical_env_file} -p myven_from_env -f #{physical_compose_file} down -v --remove-orphans"
+
+      assert log =~
+               "compose --profile tools --env-file #{physical_env_file} -p myven_from_label -f #{physical_compose_file} down -v --remove-orphans"
+
+      refute log =~ "myven_other"
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
   test "planned issue is marked in progress before dispatch without Discord notification" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
