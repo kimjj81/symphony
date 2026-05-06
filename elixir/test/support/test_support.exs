@@ -44,6 +44,7 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
           Application.delete_env(:symphony_elixir, :discord_request_fun)
+          Application.delete_env(:symphony_elixir, :cmux_notify_fun)
           File.rm_rf(workflow_root)
         end)
 
@@ -180,6 +181,9 @@ defmodule SymphonyElixir.TestSupport do
     discord_notifications_enabled = Keyword.get(config, :discord_notifications_enabled)
     discord_webhook_url = Keyword.get(config, :discord_webhook_url)
     discord_notify_states = Keyword.get(config, :discord_notify_states)
+    cmux_notifications_enabled = Keyword.get(config, :cmux_notifications_enabled)
+    cmux_command = Keyword.get(config, :cmux_command)
+    cmux_notify_states = Keyword.get(config, :cmux_notify_states)
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
     prompt = Keyword.get(config, :prompt)
@@ -222,7 +226,14 @@ defmodule SymphonyElixir.TestSupport do
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
-        notifications_yaml(discord_notifications_enabled, discord_webhook_url, discord_notify_states),
+        notifications_yaml(
+          discord_notifications_enabled,
+          discord_webhook_url,
+          discord_notify_states,
+          cmux_notifications_enabled,
+          cmux_command,
+          cmux_notify_states
+        ),
         server_yaml(server_port, server_host),
         "---",
         prompt
@@ -294,13 +305,17 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
-  defp notifications_yaml(discord_enabled, discord_webhook_url, discord_notify_states) do
+  defp notifications_yaml(discord_enabled, discord_webhook_url, discord_notify_states, cmux_enabled, cmux_command, cmux_notify_states) do
     [
       "notifications:",
       "  discord:",
       "    enabled: #{yaml_value(discord_enabled)}",
       "    webhook_url: #{yaml_value(discord_webhook_url)}",
-      "    notify_states: #{yaml_value(discord_notify_states)}"
+      "    notify_states: #{yaml_value(discord_notify_states)}",
+      "  cmux:",
+      "    enabled: #{yaml_value(cmux_enabled)}",
+      "    command: #{yaml_value(cmux_command)}",
+      "    notify_states: #{yaml_value(cmux_notify_states)}"
     ]
     |> Enum.join("\n")
   end

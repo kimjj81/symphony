@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.Notifications.Discord
+  alias SymphonyElixir.Notifications.{Cmux, Discord}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -463,9 +463,7 @@ defmodule SymphonyElixir.Orchestrator do
     transition_key = state_transition_key(previous_state, issue.state)
 
     if notify_state_transition?(previous_state, issue.state, transition_key, running_entry) do
-      issue
-      |> Discord.send_issue_state_transition(previous_state, issue.state)
-      |> Discord.log_result(issue, issue.state)
+      send_state_transition_notifications(issue, previous_state, issue.state)
 
       running_entry =
         Map.update(
@@ -495,9 +493,7 @@ defmodule SymphonyElixir.Orchestrator do
         transition_key = state_transition_key(previous_state, latest_issue.state)
 
         if notify_state_transition?(previous_state, latest_issue.state, transition_key, running_entry) do
-          latest_issue
-          |> Discord.send_issue_state_transition(previous_state, latest_issue.state)
-          |> Discord.log_result(latest_issue, latest_issue.state)
+          send_state_transition_notifications(latest_issue, previous_state, latest_issue.state)
         end
 
         :ok
@@ -506,7 +502,7 @@ defmodule SymphonyElixir.Orchestrator do
         :ok
 
       {:error, reason} ->
-        Logger.debug("Skipping Discord completion notification for issue_id=#{issue_id}; state refresh failed: #{inspect(reason)}")
+        Logger.debug("Skipping completion notification for issue_id=#{issue_id}; state refresh failed: #{inspect(reason)}")
         :ok
     end
   end
@@ -515,11 +511,25 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp notify_state_transition?(previous_state, new_state, transition_key, running_entry) do
     normalize_issue_state(previous_state) != normalize_issue_state(new_state) and
-      Discord.notify_state?(new_state) and
+      notifiable_state?(new_state) and
       !MapSet.member?(
         Map.get(running_entry, :notified_state_transitions, MapSet.new()),
         transition_key
       )
+  end
+
+  defp notifiable_state?(state_name) do
+    Discord.notify_state?(state_name) or Cmux.notify_state?(state_name)
+  end
+
+  defp send_state_transition_notifications(%Issue{} = issue, previous_state, new_state) do
+    issue
+    |> Discord.send_issue_state_transition(previous_state, new_state)
+    |> Discord.log_result(issue, new_state)
+
+    issue
+    |> Cmux.send_issue_state_transition(previous_state, new_state)
+    |> Cmux.log_result(issue, new_state)
   end
 
   defp state_transition_key(previous_state, new_state) do

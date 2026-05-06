@@ -45,6 +45,16 @@ notifications:
       - Cancelled
       - Closed
       - Duplicate
+  cmux:
+    enabled: false
+    command: cmux
+    notify_states:
+      - Human Review
+      - Done
+      - Canceled
+      - Cancelled
+      - Closed
+      - Duplicate
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`

@@ -505,6 +505,62 @@ defmodule SymphonyElixir.CoreTest do
     refute_receive {:discord_request, _opts}, 50
   end
 
+  test "reconcile sends cmux notification when enabled" do
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :cmux_notify_fun, fn command, args, opts ->
+      send(parent, {:cmux_notify, command, args, opts})
+      {"OK", 0}
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      cmux_notifications_enabled: true,
+      tracker_active_states: ["Todo", "In Progress", "Human Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    )
+
+    issue_id = "issue-cmux-review"
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: self(),
+          ref: nil,
+          identifier: "MT-CMUX",
+          issue: %Issue{id: issue_id, state: "In Progress", identifier: "MT-CMUX"},
+          started_at: DateTime.utc_now(),
+          notified_state_transitions: MapSet.new()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-CMUX",
+      title: "Needs cmux review",
+      state: "Human Review",
+      url: "https://tracker.example/MT-CMUX",
+      metadata: %{tracker: "memory"}
+    }
+
+    _updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    assert_receive {:cmux_notify, "cmux", args, [stderr_to_stdout: true]}
+
+    assert args == [
+             "notify",
+             "--title",
+             "Symphony MT-CMUX",
+             "--subtitle",
+             "In Progress -> Human Review",
+             "--body",
+             "Needs cmux review\ntracker: memory\nhttps://tracker.example/MT-CMUX"
+           ]
+  end
+
   test "reconcile sends Discord notification when issue moves to terminal state before cleanup" do
     parent = self()
 

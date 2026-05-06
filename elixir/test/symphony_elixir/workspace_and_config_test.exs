@@ -889,29 +889,44 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.settings!().codex.command == "codex app-server"
   end
 
-  test "config supports Discord notification defaults and env-backed webhook URL" do
+  test "config supports notification defaults and env-backed command values" do
     env_var = "SYMPHONY_TEST_DISCORD_WEBHOOK_URL"
+    cmux_env_var = "SYMPHONY_TEST_CMUX_BIN"
     previous = System.get_env(env_var)
+    previous_cmux = System.get_env(cmux_env_var)
     System.put_env(env_var, "https://discord.example/webhook")
+    System.put_env(cmux_env_var, "/usr/local/bin/cmux")
 
-    on_exit(fn -> restore_env(env_var, previous) end)
+    on_exit(fn ->
+      restore_env(env_var, previous)
+      restore_env(cmux_env_var, previous_cmux)
+    end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       discord_notifications_enabled: true,
-      discord_webhook_url: "$#{env_var}"
+      discord_webhook_url: "$#{env_var}",
+      cmux_notifications_enabled: true,
+      cmux_command: "$#{cmux_env_var}"
     )
 
     discord = Config.settings!().notifications.discord
+    cmux = Config.settings!().notifications.cmux
 
     assert discord.enabled == true
     assert discord.webhook_url == "https://discord.example/webhook"
     assert discord.notify_states == ["Human Review", "Done", "Canceled", "Cancelled", "Closed", "Duplicate"]
+    assert cmux.enabled == true
+    assert cmux.command == "/usr/local/bin/cmux"
+    assert cmux.notify_states == ["Human Review", "Done", "Canceled", "Cancelled", "Closed", "Duplicate"]
 
     write_workflow_file!(Workflow.workflow_file_path())
 
     default_discord = Config.settings!().notifications.discord
+    default_cmux = Config.settings!().notifications.cmux
     assert default_discord.enabled == false
     assert default_discord.webhook_url == nil
+    assert default_cmux.enabled == false
+    assert default_cmux.command == "cmux"
   end
 
   test "config resolves $VAR references for env-backed secret and path values" do

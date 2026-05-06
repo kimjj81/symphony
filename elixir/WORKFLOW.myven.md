@@ -135,6 +135,16 @@ notifications:
       - Cancelled
       - Closed
       - Duplicate
+  cmux:
+    enabled: true
+    command: cmux
+    notify_states:
+      - Human Review
+      - Done
+      - Canceled
+      - Cancelled
+      - Closed
+      - Duplicate
 ---
 
 You are working on a GitHub tracker item `{{ issue.identifier }}`.

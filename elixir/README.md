@@ -111,6 +111,16 @@ notifications:
       - Cancelled
       - Closed
       - Duplicate
+  cmux:
+    enabled: false
+    command: cmux
+    notify_states:
+      - Human Review
+      - Done
+      - Canceled
+      - Cancelled
+      - Closed
+      - Duplicate
 ---
 
 You are working on a Linear issue {{ issue.identifier }}.
@@ -162,6 +172,10 @@ codex:
 - `notifications.discord` can send state-transition alerts to a Discord channel through a webhook.
   Keep the webhook secret in an environment variable such as `DISCORD_WEBHOOK_URL`; by default
   Discord notifications are disabled and notify on `Human Review` plus terminal states.
+- `notifications.cmux` can send the same state-transition alerts to cmux with `cmux notify`.
+  Run Symphony from a cmux terminal so `CMUX_SOCKET_PATH`, `CMUX_WORKSPACE_ID`, and
+  `CMUX_SURFACE_ID` are inherited, or set `command` to the cmux CLI path. By default cmux
+  notifications are disabled and notify on `Human Review` plus terminal states when enabled.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, `/api/v1/refresh`, and
   `/api/v1/github/webhook`.

@@ -286,8 +286,29 @@ defmodule SymphonyElixir.Config.Schema do
       end
     end
 
+    defmodule Cmux do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+      embedded_schema do
+        field(:enabled, :boolean, default: false)
+        field(:command, :string, default: "cmux")
+        field(:notify_states, {:array, :string}, default: ["Human Review", "Done", "Canceled", "Cancelled", "Closed", "Duplicate"])
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(attrs, [:enabled, :command, :notify_states], empty_values: [])
+        |> validate_required([:command])
+      end
+    end
+
     embedded_schema do
       embeds_one(:discord, Discord, on_replace: :update, defaults_to_struct: true)
+      embeds_one(:cmux, Cmux, on_replace: :update, defaults_to_struct: true)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -295,6 +316,7 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(attrs, [], empty_values: [])
       |> cast_embed(:discord, with: &Discord.changeset/2)
+      |> cast_embed(:cmux, with: &Cmux.changeset/2)
     end
   end
 
@@ -456,7 +478,12 @@ defmodule SymphonyElixir.Config.Schema do
       | webhook_url: resolve_secret_setting(notifications.discord.webhook_url, nil)
     }
 
-    %{notifications | discord: discord}
+    cmux = %{
+      notifications.cmux
+      | command: resolve_secret_setting(notifications.cmux.command, "cmux")
+    }
+
+    %{notifications | discord: discord, cmux: cmux}
   end
 
   defp resolve_tracker_endpoint("github", endpoint) do
