@@ -137,6 +137,15 @@ Notes:
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
+- `codex.auto_approve_requests: true` makes Symphony approve app-server approval requests without
+  operator input. Use this only when the workflow is externally sandboxed enough for broad
+  auto-approval.
+- `codex.auto_approve_command_patterns` is a narrower non-interactive path for unattended runs.
+  When `codex.approval_policy` is `on-request`, Symphony approves command-execution approval
+  requests whose command text contains one of these patterns and leaves other approval requests
+  blocked. This is useful for browser E2E commands that must run outside the Codex sandbox on
+  macOS, such as Playwright smoke tests that otherwise fail before page load with Mach service
+  permission errors.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
   unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
   Symphony validation.

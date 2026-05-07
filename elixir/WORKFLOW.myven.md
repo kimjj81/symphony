@@ -218,7 +218,12 @@ agent:
   max_turns: 3
 codex:
   command: codex app-server
-  approval_policy: never
+  approval_policy: on-request
+  auto_approve_command_patterns:
+    - pnpm e2e
+    - pnpm exec playwright
+    - bash ./scripts/playwright-local.sh
+    - ./scripts/playwright-local.sh
   thread_sandbox: workspace-write
   read_timeout_ms: 10000
 
@@ -276,6 +281,8 @@ Instructions:
    - Non-interactive headless Playwright MCP is allowed for local UI verification, console inspection, screenshots, and deterministic browser checks.
    - Do not use headed browsers, browser extensions, login prompts, captchas, or any MCP flow that requires human input in unattended Symphony runs.
    - If headless browser automation is unavailable, record the blocker and continue with the narrowest non-browser validation.
+   - Repo-local Playwright/E2E commands may need to run outside the Codex sandbox on macOS. For `pnpm e2e*`, `pnpm exec playwright`, or `bash ./scripts/playwright-local.sh ...`, use `sandbox_permissions=require_escalated` with a concise justification from the start. Symphony is configured to auto-approve only these command patterns.
+   - If Chromium fails with `MachPortRendezvousServer`, `bootstrap_check_in`, Crashpad, or `Permission denied (1100)`, retry the same Playwright/E2E command once with `sandbox_permissions=require_escalated` before treating it as an application failure.
 8. For local URLs and browser/smoke verification, read the current worktree's `.env.local` and use its `MYVEN_*_PORT` values. Do not assume the default ports such as 4999, 8080, 8000, 8100, 5433, or 4566 are free in a Symphony worktree.
 9. Write GitHub issue comments, issue bodies, pull request titles, pull request descriptions, and pull request comments in Korean unless quoting source text or preserving an existing external title.
 10. If this item is a GitHub issue in Todo, do not implement code and do not create, modify, commit, or push repository files, including `docs/draft/*`. Analyze the issue, record the plan only in the issue body or a GitHub comment, propose PR-sized work items in a GitHub comment, then move the item to Human Review.

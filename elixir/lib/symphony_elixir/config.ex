@@ -22,6 +22,8 @@ defmodule SymphonyElixir.Config do
 
   @type codex_runtime_settings :: %{
           approval_policy: String.t() | map(),
+          auto_approve_requests: boolean() | nil,
+          auto_approve_command_patterns: [String.t()],
           thread_sandbox: String.t(),
           turn_sandbox_policy: map()
         }
@@ -107,6 +109,8 @@ defmodule SymphonyElixir.Config do
         {:ok,
          %{
            approval_policy: settings.codex.approval_policy,
+           auto_approve_requests: settings.codex.auto_approve_requests,
+           auto_approve_command_patterns: settings.codex.auto_approve_command_patterns,
            thread_sandbox: settings.codex.thread_sandbox,
            turn_sandbox_policy: turn_sandbox_policy
          }}

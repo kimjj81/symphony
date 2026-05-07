@@ -189,6 +189,8 @@ defmodule SymphonyElixir.Config.Schema do
 
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
+      field(:auto_approve_requests, :boolean)
+      field(:auto_approve_command_patterns, {:array, :string}, default: [])
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
@@ -204,6 +206,8 @@ defmodule SymphonyElixir.Config.Schema do
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
+          :auto_approve_requests,
+          :auto_approve_command_patterns,
           :turn_timeout_ms,
           :read_timeout_ms,
           :stall_timeout_ms
@@ -211,9 +215,20 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_required([:command])
+      |> validate_string_list(:auto_approve_command_patterns)
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+
+    defp validate_string_list(changeset, field) do
+      validate_change(changeset, field, fn ^field, values ->
+        if is_list(values) and Enum.all?(values, &is_binary/1) do
+          []
+        else
+          [{field, "must be a list of strings"}]
+        end
+      end)
     end
   end
 

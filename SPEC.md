@@ -462,6 +462,17 @@ fields locally if they want stricter startup checks.
   - Default: implementation-defined.
 - `turn_sandbox_policy` (Codex `SandboxPolicy` value)
   - Default: implementation-defined.
+- `auto_approve_requests` (boolean or null)
+  - Default: implementation-defined.
+  - When true, the runtime MAY approve app-server approval requests without
+    operator input. Use only for workflows whose external execution boundary is
+    already trusted enough for broad approval.
+- `auto_approve_command_patterns` (list of strings)
+  - Default: `[]`.
+  - When non-empty, the runtime MAY approve command-execution approval requests
+    whose command text contains one of the configured strings. This is intended
+    for narrow unattended approvals, such as browser E2E commands that need to
+    run outside a local sandbox.
 - `turn_timeout_ms` (integer)
   - Default: `3600000` (1 hour)
 - `read_timeout_ms` (integer)
@@ -607,6 +618,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
+- `codex.auto_approve_requests`: boolean or null, default implementation-defined
+- `codex.auto_approve_command_patterns`: list of strings, default `[]`
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`

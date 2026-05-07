@@ -17,6 +17,8 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.codex.auto_approve_requests == nil
+    assert config.codex.auto_approve_command_patterns == []
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -84,6 +86,10 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.thread_sandbox"
 
+    write_workflow_file!(Workflow.workflow_file_path(), codex_auto_approve_command_patterns: [123])
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.auto_approve_command_patterns"
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "123")
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
   end
@@ -122,9 +128,13 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, settings} = Config.Schema.parse(config)
 
     assert settings.polling.interval_ms == 30_000
+    assert settings.codex.approval_policy == "on-request"
+    assert "pnpm e2e" in settings.codex.auto_approve_command_patterns
+    assert "bash ./scripts/playwright-local.sh" in settings.codex.auto_approve_command_patterns
     assert settings.codex.read_timeout_ms == 10_000
     assert settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
     assert String.trim(prompt) != ""
+    assert prompt =~ "sandbox_permissions=require_escalated"
   end
 
   test "current WORKFLOW.myven.md before_remove cleans env and label compose projects" do
@@ -2272,6 +2282,93 @@ defmodule SymphonyElixir.CoreTest do
                  false
                end
              end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server auto-approves matching command approval patterns" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-command-approval-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-100")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-command-approval.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODex_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODex_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODex_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-command-approval.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-100"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-100"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"item/commandExecution/requestApproval","id":"approval-100","params":{"command":"pnpm e2e:smoke"}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "on-request",
+        codex_auto_approve_command_patterns: ["pnpm e2e", "bash ./scripts/playwright-local.sh"]
+      )
+
+      issue = %Issue{
+        id: "issue-command-approval",
+        identifier: "MT-100",
+        title: "Validate command approval",
+        description: "Check e2e approval automation",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-100",
+        labels: ["browser"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Run e2e outside sandbox", issue)
+
+      trace = File.read!(trace_file)
+      assert trace =~ ~s("id":"approval-100")
+      assert trace =~ ~s("decision":"acceptForSession")
     after
       File.rm_rf(test_root)
     end

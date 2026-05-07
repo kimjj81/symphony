@@ -17,7 +17,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           port: port(),
           metadata: map(),
           approval_policy: String.t() | map(),
-          auto_approve_requests: boolean(),
+          auto_approve_policy: map(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
@@ -51,7 +51,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            port: port,
            metadata: metadata,
            approval_policy: session_policies.approval_policy,
-           auto_approve_requests: session_policies.approval_policy == "never",
+           auto_approve_policy: auto_approve_policy(session_policies),
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
@@ -72,7 +72,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           port: port,
           metadata: metadata,
           approval_policy: approval_policy,
-          auto_approve_requests: auto_approve_requests,
+          auto_approve_policy: auto_approve_policy,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           workspace: workspace
@@ -104,7 +104,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, on_message, tool_executor, auto_approve_policy) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -268,6 +268,21 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp session_policies(workspace, worker_host) when is_binary(worker_host) do
     Config.codex_runtime_settings(workspace, remote: true)
+  end
+
+  defp auto_approve_policy(%{approval_policy: approval_policy} = session_policies) do
+    auto_approve_all =
+      case Map.get(session_policies, :auto_approve_requests) do
+        value when is_boolean(value) -> value
+        _ -> approval_policy == "never"
+      end
+
+    command_patterns =
+      session_policies
+      |> Map.get(:auto_approve_command_patterns, [])
+      |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+
+    %{all: auto_approve_all, command_patterns: command_patterns}
   end
 
   defp do_start_session(port, workspace, session_policies) do
@@ -531,9 +546,9 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_policy
        ) do
-    approve_or_require(
+    approve_command_or_require(
       port,
       id,
       "acceptForSession",
@@ -541,7 +556,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_policy
     )
   end
 
@@ -588,9 +603,9 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_policy
        ) do
-    approve_or_require(
+    approve_command_or_require(
       port,
       id,
       "approved_for_session",
@@ -598,7 +613,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_policy
     )
   end
 
@@ -610,7 +625,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_policy
        ) do
     approve_or_require(
       port,
@@ -620,7 +635,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_all?(auto_approve_policy)
     )
   end
 
@@ -632,7 +647,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_policy
        ) do
     approve_or_require(
       port,
@@ -642,7 +657,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_all?(auto_approve_policy)
     )
   end
 
@@ -654,7 +669,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         auto_approve_requests
+         auto_approve_policy
        ) do
     maybe_auto_answer_tool_request_user_input(
       port,
@@ -664,7 +679,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       payload_string,
       on_message,
       metadata,
-      auto_approve_requests
+      auto_approve_all?(auto_approve_policy)
     )
   end
 
@@ -718,6 +733,93 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
     ]
   end
+
+  defp approve_command_or_require(
+         port,
+         id,
+         decision,
+         payload,
+         payload_string,
+         on_message,
+         metadata,
+         auto_approve_policy
+       ) do
+    if auto_approve_all?(auto_approve_policy) or auto_approve_command?(payload, auto_approve_policy) do
+      approve_or_require(port, id, decision, payload, payload_string, on_message, metadata, true)
+    else
+      approve_or_require(port, id, decision, payload, payload_string, on_message, metadata, false)
+    end
+  end
+
+  defp auto_approve_all?(%{all: true}), do: true
+  defp auto_approve_all?(_auto_approve_policy), do: false
+
+  defp auto_approve_command?(payload, %{command_patterns: patterns}) when is_list(patterns) do
+    case approval_command(payload) do
+      command when is_binary(command) ->
+        Enum.any?(patterns, fn pattern ->
+          is_binary(pattern) and pattern != "" and String.contains?(command, pattern)
+        end)
+
+      _ ->
+        false
+    end
+  end
+
+  defp auto_approve_command?(_payload, _auto_approve_policy), do: false
+
+  defp approval_command(payload) do
+    payload
+    |> map_path(["params", "parsedCmd"])
+    |> fallback_command(payload)
+    |> normalize_command()
+  end
+
+  defp fallback_command(nil, payload) do
+    map_path(payload, ["params", "command"]) ||
+      map_path(payload, ["params", "cmd"]) ||
+      map_path(payload, ["params", "argv"]) ||
+      map_path(payload, ["params", "args"])
+  end
+
+  defp fallback_command(command, _payload), do: command
+
+  defp normalize_command(%{} = command) do
+    binary_command = map_value(command, ["parsedCmd", :parsedCmd, "command", :command, "cmd", :cmd])
+    args = map_value(command, ["args", :args, "argv", :argv])
+
+    if is_binary(binary_command) and is_list(args) do
+      normalize_command([binary_command | args])
+    else
+      normalize_command(binary_command || args)
+    end
+  end
+
+  defp normalize_command(command) when is_binary(command), do: command
+
+  defp normalize_command(command) when is_list(command) do
+    if Enum.all?(command, &is_binary/1), do: Enum.join(command, " "), else: nil
+  end
+
+  defp normalize_command(_command), do: nil
+
+  defp map_path(map, path) when is_map(map) and is_list(path) do
+    Enum.reduce_while(path, map, fn key, acc ->
+      if is_map(acc) and Map.has_key?(acc, key) do
+        {:cont, Map.get(acc, key)}
+      else
+        {:halt, nil}
+      end
+    end)
+  end
+
+  defp map_path(_map, _path), do: nil
+
+  defp map_value(map, keys) when is_map(map) and is_list(keys) do
+    Enum.find_value(keys, fn key -> Map.get(map, key) end)
+  end
+
+  defp map_value(_map, _keys), do: nil
 
   defp approve_or_require(
          port,
