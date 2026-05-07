@@ -1173,6 +1173,26 @@ defmodule SymphonyElixir.CoreTest do
     assert {:noreply, ^coalesced_state} = Orchestrator.handle_info({:tick, stale_tick_token}, coalesced_state)
   end
 
+  test "targeted refresh queues a single issue refresh without scheduling a full poll" do
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      next_poll_due_at_ms: System.monotonic_time(:millisecond) + 30_000,
+      poll_check_in_progress: false,
+      tick_timer_ref: nil,
+      tick_token: nil,
+      running: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil
+    }
+
+    assert {:reply, %{queued: true, coalesced: false, operations: ["targeted-reconcile"], issue_id: "github:pr:29"}, ^state} =
+             Orchestrator.handle_call({:request_issue_refresh, "github:pr:29"}, {self(), make_ref()}, state)
+
+    assert_receive {:refresh_issue, "github:pr:29"}
+  end
+
   test "select_worker_host_for_test skips full ssh hosts under the shared per-host cap" do
     write_workflow_file!(Workflow.workflow_file_path(),
       worker_ssh_hosts: ["worker-a", "worker-b"],

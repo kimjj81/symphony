@@ -50,7 +50,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       action = params |> Map.get("action") |> to_string()
 
       if github_webhook_refresh_event?(event, action) do
-        github_webhook_refresh_response(conn, event, action)
+        github_webhook_refresh_response(conn, event, action, github_webhook_issue_id(event, params))
       else
         conn
         |> put_status(202)
@@ -81,17 +81,23 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     |> json(%{error: %{code: code, message: message}})
   end
 
-  defp github_webhook_refresh_response(conn, event, action) do
-    case Presenter.webhook_refresh_payload(orchestrator(), github_webhook_follow_up_refresh_ms()) do
+  defp github_webhook_refresh_response(conn, event, action, issue_id) do
+    case Presenter.webhook_refresh_payload(orchestrator(), github_webhook_follow_up_refresh_ms(), issue_id) do
       {:ok, payload} ->
         conn
         |> put_status(202)
-        |> json(Map.merge(payload, %{event: event, action: action}))
+        |> json(Map.merge(payload, github_webhook_response_metadata(event, action, issue_id)))
 
       {:error, :unavailable} ->
         error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
     end
   end
+
+  defp github_webhook_response_metadata(event, action, issue_id) when is_binary(issue_id) do
+    %{event: event, action: action, issue_id: issue_id}
+  end
+
+  defp github_webhook_response_metadata(event, action, _issue_id), do: %{event: event, action: action}
 
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
@@ -158,4 +164,52 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   defp github_webhook_refresh_event?(event, action) do
     event in @github_webhook_events and action in @github_webhook_actions
   end
+
+  defp github_webhook_issue_id("pull_request", %{"pull_request" => %{"number" => number}}) do
+    github_issue_id(:pull_request, number)
+  end
+
+  defp github_webhook_issue_id("pull_request", %{"number" => number}) do
+    github_issue_id(:pull_request, number)
+  end
+
+  defp github_webhook_issue_id("pull_request_review", %{"pull_request" => %{"number" => number}}) do
+    github_issue_id(:pull_request, number)
+  end
+
+  defp github_webhook_issue_id("issue_comment", %{"issue" => issue}) when is_map(issue) do
+    github_issue_id(github_issue_kind(issue), Map.get(issue, "number"))
+  end
+
+  defp github_webhook_issue_id("issues", %{"issue" => issue}) when is_map(issue) do
+    github_issue_id(github_issue_kind(issue), Map.get(issue, "number"))
+  end
+
+  defp github_webhook_issue_id("issues", %{"number" => number}) do
+    github_issue_id(:issue, number)
+  end
+
+  defp github_webhook_issue_id(_event, _params), do: nil
+
+  defp github_issue_kind(%{"pull_request" => pull_request}) when is_map(pull_request), do: :pull_request
+  defp github_issue_kind(_issue), do: :issue
+
+  defp github_issue_id(kind, number) when kind in [:issue, :pull_request] do
+    case normalize_github_issue_number(number) do
+      number when is_integer(number) and kind == :pull_request -> "github:pr:#{number}"
+      number when is_integer(number) -> "github:issue:#{number}"
+      nil -> nil
+    end
+  end
+
+  defp normalize_github_issue_number(number) when is_integer(number) and number > 0, do: number
+
+  defp normalize_github_issue_number(number) when is_binary(number) do
+    case Integer.parse(number) do
+      {parsed, ""} when parsed > 0 -> parsed
+      _ -> nil
+    end
+  end
+
+  defp normalize_github_issue_number(_number), do: nil
 end

@@ -109,24 +109,51 @@ defmodule SymphonyElixir.GitHub.Client do
     state_from_labels(labels)
   end
 
+  @doc false
+  @spec collect_issues_matching_labels_for_test([String.t()], (-> {:ok, term()} | {:error, term()})) ::
+          {:ok, [map()]} | {:error, term()}
+  def collect_issues_matching_labels_for_test(labels, issue_lister)
+      when is_list(labels) and is_function(issue_lister, 0) do
+    collect_issues_matching_labels(labels, issue_lister)
+  end
+
   defp fetch_issues_by_labels([]), do: {:ok, []}
 
   defp fetch_issues_by_labels(labels) do
     labels
-    |> collect_issues_for_labels()
+    |> collect_issues_matching_labels()
     |> normalize_issues_for_labels()
   end
 
-  defp collect_issues_for_labels(labels) do
-    Enum.reduce_while(labels, {:ok, []}, fn label, {:ok, acc} ->
-      label
-      |> list_issues_for_label()
-      |> append_label_issues(acc)
-    end)
+  defp collect_issues_matching_labels(labels) do
+    collect_issues_matching_labels(labels, fn -> search_issues_for_labels(labels) end)
   end
 
-  defp append_label_issues({:ok, issues}, acc), do: {:cont, {:ok, issues ++ acc}}
-  defp append_label_issues({:error, reason}, _acc), do: {:halt, {:error, reason}}
+  defp collect_issues_matching_labels(labels, issue_lister) do
+    case issue_lister.() do
+      {:ok, issues} when is_list(issues) ->
+        {:ok, filter_issues_by_labels(issues, labels)}
+
+      {:ok, _payload} ->
+        {:error, :github_unexpected_issues_payload}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp filter_issues_by_labels(issues, labels) do
+    desired_labels =
+      labels
+      |> Enum.map(&normalize_label/1)
+      |> MapSet.new()
+
+    Enum.filter(issues, fn issue ->
+      issue
+      |> extract_labels()
+      |> Enum.any?(fn label -> MapSet.member?(desired_labels, normalize_label(label)) end)
+    end)
+  end
 
   defp normalize_issues_for_labels({:ok, issues}) do
     issues
@@ -146,15 +173,24 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp list_issues_for_label(label), do: list_issues_for_label(label, 1, [])
+  defp search_issues_for_labels(labels) do
+    Enum.reduce_while(labels, {:ok, []}, fn label, {:ok, acc} ->
+      case search_issues_for_label(label) do
+        {:ok, issues} -> {:cont, {:ok, issues ++ acc}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
 
-  defp list_issues_for_label(label, page, acc) do
-    case request(:get, "/issues", params: %{state: "all", labels: label, per_page: @per_page, page: page}) do
-      {:ok, issues} when is_list(issues) ->
+  defp search_issues_for_label(label), do: search_issues_for_label(label, 1, [])
+
+  defp search_issues_for_label(label, page, acc) do
+    case request(:get, "/search/issues", params: %{q: search_query_for_label(label), per_page: @per_page, page: page}) do
+      {:ok, %{"items" => issues}} when is_list(issues) ->
         next_acc = acc ++ issues
 
         if length(issues) == @per_page do
-          list_issues_for_label(label, page + 1, next_acc)
+          search_issues_for_label(label, page + 1, next_acc)
         else
           {:ok, next_acc}
         end
@@ -346,6 +382,12 @@ defmodule SymphonyElixir.GitHub.Client do
      ]}
   end
 
+  defp github_url(endpoint, _owner, _repo, "/search/" <> _ = path) do
+    endpoint
+    |> String.trim_trailing("/")
+    |> Kernel.<>(path)
+  end
+
   defp github_url(endpoint, owner, repo, path) do
     endpoint
     |> String.trim_trailing("/")
@@ -464,4 +506,16 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp normalize_label(value), do: value |> to_string() |> normalize_label()
+
+  defp search_query_for_label(label) do
+    tracker = Config.settings!().tracker
+    ~s(repo:#{tracker.owner}/#{tracker.repo} label:"#{escape_search_qualifier(label)}")
+  end
+
+  defp escape_search_qualifier(value) do
+    value
+    |> to_string()
+    |> String.replace("\\", "\\\\")
+    |> String.replace("\"", "\\\"")
+  end
 end

@@ -57,6 +57,39 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert issue.state == "Review"
   end
 
+  test "collects GitHub candidate issues by locally filtering Symphony labels" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    rework_pr = %{
+      "number" => 29,
+      "title" => "Rework requested",
+      "state" => "open",
+      "html_url" => "https://github.com/studiojin-dev/myven/pull/29",
+      "pull_request" => %{"url" => "https://api.github.com/repos/studiojin-dev/myven/pulls/29"},
+      "labels" => [%{"name" => "sym:rework"}]
+    }
+
+    human_review_pr = %{
+      "number" => 30,
+      "title" => "Waiting for a human",
+      "state" => "open",
+      "html_url" => "https://github.com/studiojin-dev/myven/pull/30",
+      "pull_request" => %{"url" => "https://api.github.com/repos/studiojin-dev/myven/pulls/30"},
+      "labels" => [%{"name" => "sym:human-review"}]
+    }
+
+    assert {:ok, [^rework_pr]} =
+             Client.collect_issues_matching_labels_for_test(["sym:rework"], fn ->
+               {:ok, [human_review_pr, rework_pr]}
+             end)
+  end
+
   test "skips GitHub issues without Symphony state labels" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",

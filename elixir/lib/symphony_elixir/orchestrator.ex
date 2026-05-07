@@ -117,6 +117,27 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  def handle_info({:refresh_issue, issue_id}, state) when is_binary(issue_id) do
+    state = refresh_runtime_config(state)
+
+    state =
+      case Tracker.fetch_issue_states_by_ids([issue_id]) do
+        {:ok, [%Issue{} = issue | _]} ->
+          handle_targeted_issue_refresh(state, issue)
+
+        {:ok, []} ->
+          Logger.info("Targeted issue refresh found no visible issue: issue_id=#{issue_id}")
+          release_issue_claim(state, issue_id)
+
+        {:error, reason} ->
+          Logger.warning("Targeted issue refresh failed: issue_id=#{issue_id} reason=#{inspect(reason)}")
+          state
+      end
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
         %{running: running} = state
@@ -442,6 +463,29 @@ defmodule SymphonyElixir.Orchestrator do
         %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
 
       _ ->
+        state
+    end
+  end
+
+  defp handle_targeted_issue_refresh(%State{} = state, %Issue{} = issue) do
+    active_states = active_state_set()
+    terminal_states = terminal_state_set()
+
+    cond do
+      Map.has_key?(state.running, issue.id) ->
+        reconcile_issue_state(issue, state, active_states, terminal_states)
+
+      terminal_issue_state?(issue.state, terminal_states) ->
+        Logger.info("Targeted issue refresh found terminal issue: #{issue_context(issue)} state=#{issue.state}; removing associated workspace")
+
+        cleanup_issue_workspace(issue.identifier)
+        release_issue_claim(state, issue.id)
+
+      should_dispatch_issue?(issue, state, active_states, terminal_states) ->
+        dispatch_issue(state, issue)
+
+      true ->
+        Logger.debug("Targeted issue refresh skipped non-dispatchable issue: #{issue_context(issue)} state=#{inspect(issue.state)}")
         state
     end
   end
@@ -1246,11 +1290,33 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec request_issue_refresh(GenServer.server(), String.t()) :: map() | :unavailable
+  def request_issue_refresh(server, issue_id) when is_binary(issue_id) do
+    if Process.whereis(server) do
+      GenServer.call(server, {:request_issue_refresh, issue_id})
+    else
+      :unavailable
+    end
+  end
+
   @spec request_refresh_after(GenServer.server(), non_neg_integer()) :: :ok | :unavailable
   def request_refresh_after(server, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     case Process.whereis(server) do
       pid when is_pid(pid) ->
         Process.send_after(pid, :tick, delay_ms)
+        :ok
+
+      _ ->
+        :unavailable
+    end
+  end
+
+  @spec request_issue_refresh_after(GenServer.server(), String.t(), non_neg_integer()) :: :ok | :unavailable
+  def request_issue_refresh_after(server, issue_id, delay_ms)
+      when is_binary(issue_id) and is_integer(delay_ms) and delay_ms >= 0 do
+    case Process.whereis(server) do
+      pid when is_pid(pid) ->
+        Process.send_after(pid, {:refresh_issue, issue_id}, delay_ms)
         :ok
 
       _ ->
@@ -1344,6 +1410,19 @@ defmodule SymphonyElixir.Orchestrator do
        coalesced: coalesced,
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
+     }, state}
+  end
+
+  def handle_call({:request_issue_refresh, issue_id}, _from, state) when is_binary(issue_id) do
+    send(self(), {:refresh_issue, issue_id})
+
+    {:reply,
+     %{
+       queued: true,
+       coalesced: Map.has_key?(state.running, issue_id) or Map.has_key?(state.retry_attempts, issue_id),
+       requested_at: DateTime.utc_now(),
+       operations: ["targeted-reconcile"],
+       issue_id: issue_id
      }, state}
   end
 

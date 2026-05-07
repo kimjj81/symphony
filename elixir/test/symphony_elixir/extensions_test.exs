@@ -106,8 +106,18 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
 
+    def handle_call({:request_issue_refresh, issue_id}, _from, state) do
+      send(Keyword.get(state, :recipient, self()), {:targeted_refresh, issue_id})
+      {:reply, Keyword.get(state, :targeted_refresh, :unavailable), state}
+    end
+
     def handle_info(:tick, state) do
       send(Keyword.get(state, :recipient, self()), :webhook_follow_up_refresh)
+      {:noreply, state}
+    end
+
+    def handle_info({:refresh_issue, issue_id}, state) do
+      send(Keyword.get(state, :recipient, self()), {:webhook_follow_up_refresh, issue_id})
       {:noreply, state}
     end
   end
@@ -506,9 +516,18 @@ defmodule SymphonyElixir.ExtensionsTest do
              json_response(conn, 202)
   end
 
-  test "github webhook queues refresh for valid signed events" do
+  test "github webhook queues targeted refresh for valid signed issue events" do
     secret = "github-webhook-secret"
-    body = Jason.encode!(%{action: "labeled"})
+
+    body =
+      Jason.encode!(%{
+        action: "labeled",
+        issue: %{
+          number: 29,
+          pull_request: %{url: "https://api.github.com/repos/studiojin-dev/myven/pulls/29"}
+        }
+      })
+
     orchestrator_name = Module.concat(__MODULE__, :GithubWebhookOrchestrator)
 
     {:ok, _pid} =
@@ -516,11 +535,12 @@ defmodule SymphonyElixir.ExtensionsTest do
         name: orchestrator_name,
         snapshot: static_snapshot(),
         recipient: self(),
-        refresh: %{
+        targeted_refresh: %{
           queued: true,
           coalesced: false,
           requested_at: DateTime.utc_now(),
-          operations: ["poll", "reconcile"]
+          operations: ["targeted-reconcile"],
+          issue_id: "github:pr:29"
         }
       )
 
@@ -541,13 +561,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert %{
              "queued" => true,
              "coalesced" => false,
-             "operations" => ["poll", "reconcile"],
+             "operations" => ["targeted-reconcile"],
              "event" => "issues",
              "action" => "labeled",
+             "issue_id" => "github:pr:29",
              "follow_up_refresh_in_ms" => 10
            } = json_response(conn, 202)
 
-    assert_receive :webhook_follow_up_refresh, 200
+    assert_receive {:targeted_refresh, "github:pr:29"}, 200
+    assert_receive {:webhook_follow_up_refresh, "github:pr:29"}, 200
   end
 
   test "github webhook rejects invalid signatures" do

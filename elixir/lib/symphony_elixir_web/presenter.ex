@@ -60,8 +60,26 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  @spec webhook_refresh_payload(GenServer.name(), non_neg_integer()) :: {:ok, map()} | {:error, :unavailable}
+  @spec webhook_refresh_payload(GenServer.name(), non_neg_integer()) ::
+          {:ok, map()} | {:error, :unavailable}
   def webhook_refresh_payload(orchestrator, follow_up_delay_ms) do
+    webhook_refresh_payload(orchestrator, follow_up_delay_ms, nil)
+  end
+
+  @spec webhook_refresh_payload(GenServer.name(), non_neg_integer(), String.t() | nil) ::
+          {:ok, map()} | {:error, :unavailable}
+  def webhook_refresh_payload(orchestrator, follow_up_delay_ms, issue_id) when is_binary(issue_id) do
+    case issue_refresh_payload(orchestrator, issue_id) do
+      {:ok, payload} ->
+        _ = Orchestrator.request_issue_refresh_after(orchestrator, issue_id, follow_up_delay_ms)
+        {:ok, Map.put(payload, :follow_up_refresh_in_ms, follow_up_delay_ms)}
+
+      error ->
+        error
+    end
+  end
+
+  def webhook_refresh_payload(orchestrator, follow_up_delay_ms, _issue_id) do
     case refresh_payload(orchestrator) do
       {:ok, payload} ->
         _ = Orchestrator.request_refresh_after(orchestrator, follow_up_delay_ms)
@@ -69,6 +87,16 @@ defmodule SymphonyElixirWeb.Presenter do
 
       error ->
         error
+    end
+  end
+
+  defp issue_refresh_payload(orchestrator, issue_id) do
+    case Orchestrator.request_issue_refresh(orchestrator, issue_id) do
+      :unavailable ->
+        {:error, :unavailable}
+
+      payload ->
+        {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
     end
   end
 
