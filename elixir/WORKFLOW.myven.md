@@ -214,7 +214,7 @@ hooks:
 
     exit "$cleanup_failed"
 agent:
-  max_concurrent_agents: 2
+  max_concurrent_agents: 3
   max_turns: 3
 codex:
   command: codex app-server
