@@ -150,6 +150,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:dispatch_kinds, {:array, :string}, default: ["issue", "pull_request"])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -157,7 +158,13 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state,
+          :dispatch_kinds
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
@@ -165,6 +172,8 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
+      |> update_change(:dispatch_kinds, &Schema.normalize_dispatch_kinds/1)
+      |> Schema.validate_dispatch_kinds(:dispatch_kinds)
     end
   end
 
@@ -442,6 +451,58 @@ defmodule SymphonyElixir.Config.Schema do
             []
         end
       end)
+    end)
+  end
+
+  @spec normalize_dispatch_kinds(term()) :: [String.t()]
+  def normalize_dispatch_kinds(kinds) when is_list(kinds) do
+    kinds
+    |> Enum.map(&normalize_dispatch_kind/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  def normalize_dispatch_kinds(_kinds), do: []
+
+  @spec normalize_dispatch_kind(term()) :: String.t() | nil
+  def normalize_dispatch_kind(nil), do: "issue"
+
+  def normalize_dispatch_kind(kind) when is_atom(kind) do
+    kind
+    |> Atom.to_string()
+    |> normalize_dispatch_kind()
+  end
+
+  def normalize_dispatch_kind(kind) when is_binary(kind) do
+    normalized =
+      kind
+      |> String.trim()
+      |> String.downcase()
+      |> String.replace("-", "_")
+
+    case normalized do
+      "" -> nil
+      value -> value
+    end
+  end
+
+  def normalize_dispatch_kind(_kind), do: nil
+
+  @spec validate_dispatch_kinds(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
+  def validate_dispatch_kinds(changeset, field) do
+    validate_change(changeset, field, fn ^field, kinds ->
+      invalid_kinds = Enum.reject(kinds, &(&1 in ["issue", "pull_request"]))
+
+      cond do
+        kinds == [] ->
+          [{field, "must include at least one kind"}]
+
+        invalid_kinds != [] ->
+          [{field, "must contain only issue or pull_request"}]
+
+        true ->
+          []
+      end
     end)
   end
 

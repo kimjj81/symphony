@@ -98,6 +98,9 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  dispatch_kinds:
+    - issue
+    - pull_request
 codex:
   command: codex app-server
 notifications:
@@ -151,6 +154,9 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.dispatch_kinds` limits which tracker item kinds can dispatch Codex workspace runs.
+  Supported values are `issue` and `pull_request`; the default is both. Use `["pull_request"]`
+  when issues should remain a planning/control surface and only PRs should create workspaces.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

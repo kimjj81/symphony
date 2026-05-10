@@ -216,6 +216,8 @@ hooks:
 agent:
   max_concurrent_agents: 3
   max_turns: 3
+  dispatch_kinds:
+    - pull_request
 codex:
   command: codex app-server
   approval_policy: on-request
@@ -271,7 +273,7 @@ Description:
 {% if issue.description %}{{ issue.description }}{% else %}No description provided.{% endif %}
 
 Instructions:
-1. Work only in the workspace generated for this ticket.
+1. This workflow dispatches only GitHub pull requests to Codex workspaces. GitHub issues are planning/control surfaces and must not create worktrees or Docker stacks.
 2. Keep changes scoped and minimal.
 3. Prefer safe, deterministic changes and record blockers in the workpad.
 4. Use the GitHub labels as the state machine: sym:todo, sym:planned, sym:in-progress, sym:review, sym:reviewing, sym:human-review, sym:rework, sym:merging, sym:done, sym:canceled, sym:duplicate.
@@ -285,19 +287,20 @@ Instructions:
    - If Chromium fails with `MachPortRendezvousServer`, `bootstrap_check_in`, Crashpad, or `Permission denied (1100)`, retry the same Playwright/E2E command once with `sandbox_permissions=require_escalated` before treating it as an application failure.
 8. For local URLs and browser/smoke verification, read the current worktree's `.env.local` and use its `MYVEN_*_PORT` values. Do not assume the default ports such as 4999, 8080, 8000, 8100, 5433, or 4566 are free in a Symphony worktree.
 9. Write GitHub issue comments, issue bodies, pull request titles, pull request descriptions, and pull request comments in Korean unless quoting source text or preserving an existing external title.
+   - When creating a stacked child pull request whose base branch belongs to another open pull request, prefix the child PR title with the parent PR number in the format `PR #<parent>: <child PR title>`, and mention the parent PR in the PR body.
 10. If this item is a GitHub issue in Todo, do not implement code and do not create, modify, commit, or push repository files, including `docs/draft/*`. Analyze the issue, record the plan only in the issue body or a GitHub comment, propose PR-sized work items in a GitHub comment, then move the item to Human Review.
-11. If this item is a GitHub issue in Planned, treat Planned as explicit human approval to execute only when the issue has `## 결정 사항` and `## 완료 기준` sections, required ADR coverage for schema/auth/secret/RLS/deploy changes, and 12 or fewer expected files. If any gate fails, do not implement; comment with the blocker and move it to Human Review.
+11. If this item is a GitHub issue in Planned, treat Planned as human approval for planning/splitting only. Do not implement in the issue lane; create or update PR-sized follow-up work and move the issue to Human Review.
 12. Symphony must not move a GitHub issue from Todo or Human Review to Planned by itself. Only a human-applied sym:planned label is an approval gate.
 13. If a Planned issue is explicitly a planning/splitting issue, create the requested PR-sized follow-up issues instead of changing product code. Label follow-up implementation issues sym:planned only when the parent issue explicitly asks for immediate execution; otherwise label them sym:todo for human review.
-14. If this item is a GitHub issue with an open linked pull request, exclude the source issue from active dispatch work even when it has an active label such as Review, Reviewing, Rework, or In Progress. Keep or move the source issue to Human Review, update only the issue summary/comment and the linked PR body/comment with current PR status, then stop; PR execution belongs to the linked pull request.
-15. If this item is a GitHub issue in In Progress and it does not have an open linked pull request, create or update PR-sized implementation work and keep the issue comment trail current. After implementation, open or update the implementation PR, complete the self-review checklist, move only the PR to Review, and keep the source issue in Human Review while updating the source issue summary/comment with the PR status.
+14. If this item is a GitHub issue with an open linked pull request, keep or move the source issue to Human Review, update only the issue summary/comment and the linked PR body/comment with current PR status, then stop; PR execution belongs to the linked pull request.
+15. If this item is a GitHub issue in In Progress and it does not have an open linked pull request, create or update a PR-sized implementation PR and keep the issue comment trail current. After opening or updating the implementation PR, move only the PR to Review and keep the source issue in Human Review while updating the source issue summary/comment with the PR status.
 16. If implementation becomes too large, stop before committing and comment: "이 PR은 너무 커졌으므로 여기까지 commit하지 않고 분할 제안". Move the item to Human Review with the split proposal.
 17. If this item is a pull request in Todo, improve the PR description, implementation plan, and validation plan, then move it to Human Review.
 18. If this item is a pull request in Planned, move it to In Progress, implement the approved change, run the narrowest useful validation, complete the self-review checklist, comment with results, move only the PR to Review, and keep the source issue in Human Review while updating the PR body/comment and source issue summary/comment with the PR status.
 19. If this item is a pull request in Review or Reviewing, perform automated code review and security review. If there are no required improvements, synchronize the PR body/comment and relevant docs/workpad, move only the PR to Human Review, and keep the source issue in Human Review. If improvements are required, leave a PR comment with findings, move only the PR to Rework, and keep the source issue in Human Review while updating the source issue summary/comment with the blocker summary.
 20. If this item is a pull request in Rework, read the latest GitHub review comments and PR comments first, address only the requested follow-up changes, comment with results, move only the PR to Review, and keep the source issue in Human Review while updating only the PR body/comment and source issue summary/comment. Do not move the source issue to Review, Reviewing, Rework, or In Progress while the PR remains open. Split new features or large design changes into a new issue instead of expanding PR Rework.
-21. If this item is a GitHub issue in Rework and it has an open linked pull request, do not implement or review in the issue workspace. Keep or move the issue to Human Review, add a Korean comment pointing to the linked PR and its current rework status, then stop. If there is no open linked pull request, treat it as issue-only Rework: read the latest issue comments first, clarify the requested issue-level follow-up in a Korean issue comment, and move the issue to Human Review unless a human explicitly applies Planned or In Progress.
-22. Human Review is a review-retention state, not a cleanup state. Do not delete or recreate the generated workspace while an issue or PR is in Human Review; the same directory must remain available for manual re-review and later Rework.
+21. If this item is a GitHub issue in Rework and it has an open linked pull request, do not implement or review in the issue lane. Keep or move the issue to Human Review, add a Korean comment pointing to the linked PR and its current rework status, then stop. If there is no open linked pull request, treat it as issue-only Rework: read the latest issue comments first, clarify the requested issue-level follow-up in a Korean issue comment, and move the issue to Human Review unless a human explicitly applies Planned.
+22. Human Review is a review-retention state, not a cleanup state. Do not delete or recreate the generated PR workspace while a PR is in Human Review; the same directory must remain available for manual re-review and later Rework.
 23. If this item is in Merging, treat it as approved merge work. Use the existing generated workspace and current PR branch, verify the PR is mergeable, follow repository merge instructions, and move the item to Done only after the merge succeeds.
 24. Cleanup is allowed only after a true final state: Done, Canceled, or Duplicate.
 25. For GitHub issues, terminal state labels must match the GitHub open/closed state: `sym:done` closes as completed, and `sym:canceled` or `sym:duplicate` close as not planned. Moving an issue back to a non-terminal Symphony label should reopen it.

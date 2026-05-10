@@ -17,6 +17,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.agent.dispatch_kinds == ["issue", "pull_request"]
     assert config.codex.auto_approve_requests == nil
     assert config.codex.auto_approve_command_patterns == []
 
@@ -38,6 +39,22 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), dispatch_kinds: ["pull-request", :issue])
+    assert Config.settings!().agent.dispatch_kinds == ["pull_request", "issue"]
+    assert Config.dispatch_kind_enabled?(:pull_request)
+    assert Config.dispatch_kind_enabled?(nil)
+    assert Config.Schema.normalize_dispatch_kinds(:issue) == []
+    assert Config.Schema.normalize_dispatch_kinds(["issue", " ", 123]) == ["issue"]
+    assert Config.Schema.normalize_dispatch_kind(123) == nil
+
+    write_workflow_file!(Workflow.workflow_file_path(), dispatch_kinds: [])
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "must include at least one kind"
+
+    write_workflow_file!(Workflow.workflow_file_path(), dispatch_kinds: ["issue", "milestone"])
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.dispatch_kinds"
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -132,9 +149,13 @@ defmodule SymphonyElixir.CoreTest do
     assert "pnpm e2e" in settings.codex.auto_approve_command_patterns
     assert "bash ./scripts/playwright-local.sh" in settings.codex.auto_approve_command_patterns
     assert settings.codex.read_timeout_ms == 10_000
+    assert settings.agent.dispatch_kinds == ["pull_request"]
     assert settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
     assert String.trim(prompt) != ""
     assert prompt =~ "sandbox_permissions=require_escalated"
+    assert prompt =~ "dispatches only GitHub pull requests to Codex workspaces"
+    assert prompt =~ "prefix the child PR title with the parent PR number"
+    assert prompt =~ "PR #<parent>: <child PR title>"
   end
 
   test "current WORKFLOW.myven.md before_remove cleans env and label compose projects" do
@@ -304,6 +325,38 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     refute Orchestrator.should_dispatch_issue_for_test(review_issue, state)
+    assert Orchestrator.should_dispatch_issue_for_test(review_pr, state)
+  end
+
+  test "dispatch kinds can restrict workspace execution to pull requests" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Planned", "Review"],
+      dispatch_kinds: ["pull_request"]
+    )
+
+    state = %Orchestrator.State{
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    planned_issue = %Issue{
+      id: "github:issue:42",
+      identifier: "#42",
+      title: "Planning issue",
+      state: "Planned",
+      kind: :issue
+    }
+
+    review_pr = %Issue{
+      id: "github:pr:42",
+      identifier: "PR #42",
+      title: "Implementation PR",
+      state: "Review",
+      kind: :pull_request
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(planned_issue, state)
     assert Orchestrator.should_dispatch_issue_for_test(review_pr, state)
   end
 

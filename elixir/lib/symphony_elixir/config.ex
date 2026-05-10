@@ -63,6 +63,13 @@ defmodule SymphonyElixir.Config do
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
 
+  @spec dispatch_kind_enabled?(term()) :: boolean()
+  def dispatch_kind_enabled?(kind) do
+    normalized_kind = Schema.normalize_dispatch_kind(kind)
+
+    normalized_kind in settings!().agent.dispatch_kinds
+  end
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do
