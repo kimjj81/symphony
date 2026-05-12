@@ -47,6 +47,12 @@ defmodule SymphonyElixir.Tracker.Memory do
     :ok
   end
 
+  @spec create_pull_request_for_issue(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
+  def create_pull_request_for_issue(%Issue{} = issue) do
+    send_event({:memory_tracker_create_pull_request_for_issue, issue})
+    {:error, :unsupported_pull_request_creation}
+  end
+
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])
   end

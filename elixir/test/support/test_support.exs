@@ -43,6 +43,8 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+          Application.delete_env(:symphony_elixir, :github_client_module)
+          Application.delete_env(:symphony_elixir, :github_request_fun)
           Application.delete_env(:symphony_elixir, :discord_request_fun)
           Application.delete_env(:symphony_elixir, :cmux_notify_fun)
           File.rm_rf(workflow_root)

@@ -67,6 +67,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       send(self(), {:github_update_issue_state_called, issue_id, state_name})
       :ok
     end
+
+    def create_pull_request_for_issue(issue) do
+      send(self(), {:github_create_pull_request_for_issue_called, issue})
+      {:ok, issue}
+    end
   end
 
   defmodule SlowOrchestrator do
@@ -246,12 +251,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
+    assert {:error, :unsupported_pull_request_creation} = SymphonyElixir.Tracker.create_pull_request_for_issue(issue)
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
+    assert_receive {:memory_tracker_create_pull_request_for_issue, ^issue}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
     assert :ok = Memory.create_comment("issue-1", "quiet")
     assert :ok = Memory.update_issue_state("issue-1", "Quiet")
+    assert {:error, :unsupported_pull_request_creation} = Memory.create_pull_request_for_issue(issue)
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert SymphonyElixir.Tracker.adapter() == Adapter
@@ -285,6 +293,10 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert_receive {:github_update_issue_state_called, "issue-1", "Done"}
+
+    issue = %Issue{id: "github:issue:1", identifier: "#1", title: "Issue", state: "Planned", kind: :issue}
+    assert {:ok, ^issue} = SymphonyElixir.Tracker.create_pull_request_for_issue(issue)
+    assert_receive {:github_create_pull_request_for_issue_called, ^issue}
   end
 
   test "linear compatibility issue helper returns tracker labels" do
@@ -406,6 +418,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
+    assert {:error, :unsupported_pull_request_creation} = Adapter.create_pull_request_for_issue(%Issue{})
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do

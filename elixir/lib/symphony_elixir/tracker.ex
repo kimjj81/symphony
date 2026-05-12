@@ -3,13 +3,14 @@ defmodule SymphonyElixir.Tracker do
   Adapter boundary for issue tracker reads and writes.
   """
 
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{Config, Tracker.Issue}
 
   @callback fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
+  @callback create_pull_request_for_issue(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
 
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues do
@@ -34,6 +35,11 @@ defmodule SymphonyElixir.Tracker do
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) do
     adapter().update_issue_state(issue_id, state_name)
+  end
+
+  @spec create_pull_request_for_issue(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
+  def create_pull_request_for_issue(%Issue{} = issue) do
+    adapter().create_pull_request_for_issue(issue)
   end
 
   @spec adapter() :: module()

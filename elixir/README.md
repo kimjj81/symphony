@@ -155,8 +155,11 @@ Notes:
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - `agent.dispatch_kinds` limits which tracker item kinds can dispatch Codex workspace runs.
-  Supported values are `issue` and `pull_request`; the default is both. Use `["pull_request"]`
-  when issues should remain a planning/control surface and only PRs should create workspaces.
+  Supported values are `issue` and `pull_request`; the default is both. Keep `issue` enabled
+  when Todo GitHub issues should run planning-only Codex turns that leave tracker comments.
+  Use `["pull_request"]` when issues should remain a manual planning/control surface and only PRs should create workspaces.
+  GitHub issue control actions, such as opening a PR from a Planned issue, can still run without
+  creating a Codex workspace for the source issue.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

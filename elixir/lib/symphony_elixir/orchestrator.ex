@@ -249,8 +249,7 @@ defmodule SymphonyElixir.Orchestrator do
     state = reconcile_running_issues(state)
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
+         {:ok, issues} <- Tracker.fetch_candidate_issues() do
       choose_issues(issues, state)
     else
       {:error, :missing_tracker_api_token} ->
@@ -302,9 +301,6 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.error("Failed to fetch from tracker: #{inspect(reason)}")
         state
-
-      false ->
-        state
     end
   end
 
@@ -347,6 +343,18 @@ defmodule SymphonyElixir.Orchestrator do
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
     should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec should_prepare_pull_request_for_issue_for_test(Issue.t(), term()) :: boolean()
+  def should_prepare_pull_request_for_issue_for_test(%Issue{} = issue, %State{} = state) do
+    should_prepare_pull_request_for_issue?(issue, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec handle_targeted_issue_refresh_for_test(term(), Issue.t()) :: term()
+  def handle_targeted_issue_refresh_for_test(%State{} = state, %Issue{} = issue) do
+    handle_targeted_issue_refresh(state, issue)
   end
 
   @doc false
@@ -480,6 +488,9 @@ defmodule SymphonyElixir.Orchestrator do
 
         cleanup_issue_workspace(issue.identifier)
         release_issue_claim(state, issue.id)
+
+      should_prepare_pull_request_for_issue?(issue, state, active_states, terminal_states) ->
+        prepare_pull_request_for_issue(state, issue)
 
       should_dispatch_issue?(issue, state, active_states, terminal_states) ->
         dispatch_issue(state, issue)
@@ -691,10 +702,15 @@ defmodule SymphonyElixir.Orchestrator do
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
+      cond do
+        should_prepare_pull_request_for_issue?(issue, state_acc, active_states, terminal_states) ->
+          prepare_pull_request_for_issue(state_acc, issue)
+
+        should_dispatch_issue?(issue, state_acc, active_states, terminal_states) ->
+          dispatch_issue(state_acc, issue)
+
+        true ->
+          state_acc
       end
     end)
   end
@@ -726,6 +742,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
+      !planned_github_source_issue?(issue, active_states, terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
@@ -735,6 +752,34 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp should_prepare_pull_request_for_issue?(
+         %Issue{id: id, identifier: identifier, title: title, state: state_name, kind: :issue} = issue,
+         %State{} = state,
+         active_states,
+         terminal_states
+       )
+       when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
+    planned_github_source_issue?(issue, active_states, terminal_states) and
+      issue_available_for_pull_request_preparation?(issue, state)
+  end
+
+  defp should_prepare_pull_request_for_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp planned_github_source_issue?(%Issue{state: state_name, kind: :issue} = issue, active_states, terminal_states) do
+    github_tracker?() and
+      normalize_issue_state(state_name) == "planned" and
+      issue_routable_to_worker?(issue) and
+      active_issue_state?(state_name, active_states) and
+      !terminal_issue_state?(state_name, terminal_states) and
+      !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
+  end
+
+  defp planned_github_source_issue?(_issue, _active_states, _terminal_states), do: false
+
+  defp issue_available_for_pull_request_preparation?(%Issue{id: id}, %State{running: running, claimed: claimed}) do
+    !MapSet.member?(claimed, id) and !Map.has_key?(running, id)
+  end
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -824,6 +869,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp normalize_issue_state(_state_name), do: ""
 
+  defp github_tracker?, do: Config.settings!().tracker.kind == "github"
+
   defp terminal_state_set do
     Config.settings!().tracker.terminal_states
     |> Enum.map(&normalize_issue_state/1)
@@ -864,6 +911,108 @@ defmodule SymphonyElixir.Orchestrator do
         state
     end
   end
+
+  defp prepare_pull_request_for_issue(%State{} = state, %Issue{} = issue) do
+    active_states = active_state_set()
+    terminal_states = terminal_state_set()
+
+    case revalidate_issue_for_pull_request_preparation(
+           issue,
+           &Tracker.fetch_issue_states_by_ids/1,
+           state,
+           active_states,
+           terminal_states
+         ) do
+      {:ok, %Issue{} = refreshed_issue} ->
+        case Tracker.create_pull_request_for_issue(refreshed_issue) do
+          {:ok, %Issue{} = pull_request} ->
+            Logger.info("Created or found pull request for planned issue without source worktree: #{issue_context(refreshed_issue)} pull_request=#{issue_context(pull_request)}")
+
+            move_issue_to_human_review_after_pull_request(refreshed_issue)
+            request_pull_request_refresh(pull_request)
+            state
+
+          {:error, reason} ->
+            Logger.warning("Skipping pull request preparation for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+            state
+        end
+
+      {:skip, :missing} ->
+        Logger.info("Skipping pull request preparation; issue no longer active or visible: #{issue_context(issue)}")
+        state
+
+      {:skip, %Issue{} = refreshed_issue} ->
+        Logger.info(
+          "Skipping stale pull request preparation after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}"
+        )
+
+        state
+
+      {:error, reason} ->
+        Logger.warning("Skipping pull request preparation; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp revalidate_issue_for_pull_request_preparation(
+         %Issue{id: issue_id},
+         issue_fetcher,
+         %State{} = state,
+         active_states,
+         terminal_states
+       )
+       when is_binary(issue_id) and is_function(issue_fetcher, 1) do
+    case issue_fetcher.([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} ->
+        if should_prepare_pull_request_for_issue?(
+             refreshed_issue,
+             state,
+             active_states,
+             terminal_states
+           ) do
+          {:ok, refreshed_issue}
+        else
+          {:skip, refreshed_issue}
+        end
+
+      {:ok, []} ->
+        {:skip, :missing}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp revalidate_issue_for_pull_request_preparation(
+         issue,
+         _issue_fetcher,
+         _state,
+         _active_states,
+         _terminal_states
+       ),
+       do: {:ok, issue}
+
+  defp move_issue_to_human_review_after_pull_request(%Issue{id: issue_id} = issue)
+       when is_binary(issue_id) do
+    case Tracker.update_issue_state(issue_id, "Human Review") do
+      :ok ->
+        Logger.info("Moved planned source issue to Human Review after pull request preparation: #{issue_context(issue)}")
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Failed to move planned source issue to Human Review after pull request preparation for #{issue_context(issue)}: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp move_issue_to_human_review_after_pull_request(_issue), do: :ok
+
+  defp request_pull_request_refresh(%Issue{id: pull_request_id}) when is_binary(pull_request_id) do
+    send(self(), {:refresh_issue, pull_request_id})
+    :ok
+  end
+
+  defp request_pull_request_refresh(_pull_request), do: :ok
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()

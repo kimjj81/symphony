@@ -1,6 +1,39 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  defmodule PlannedIssueGitHubClient do
+    def fetch_issue_states_by_ids(["github:issue:42"]) do
+      {:ok,
+       [
+         %SymphonyElixir.Tracker.Issue{
+           id: "github:issue:42",
+           identifier: "#42",
+           title: "Prepare implementation",
+           state: "Planned",
+           kind: :issue
+         }
+       ]}
+    end
+
+    def create_pull_request_for_issue(issue) do
+      send(self(), {:github_create_pull_request_for_issue_called, issue.identifier})
+
+      {:ok,
+       %SymphonyElixir.Tracker.Issue{
+         id: "github:pr:88",
+         identifier: "PR #88",
+         title: "Issue #42: Prepare implementation",
+         state: "Planned",
+         kind: :pull_request
+       }}
+    end
+
+    def update_issue_state(issue_id, state_name) do
+      send(self(), {:github_update_issue_state_called, issue_id, state_name})
+      :ok
+    end
+  end
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -149,11 +182,12 @@ defmodule SymphonyElixir.CoreTest do
     assert "pnpm e2e" in settings.codex.auto_approve_command_patterns
     assert "bash ./scripts/playwright-local.sh" in settings.codex.auto_approve_command_patterns
     assert settings.codex.read_timeout_ms == 10_000
-    assert settings.agent.dispatch_kinds == ["pull_request"]
+    assert settings.agent.dispatch_kinds == ["issue", "pull_request"]
     assert settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
     assert String.trim(prompt) != ""
     assert prompt =~ "sandbox_permissions=require_escalated"
-    assert prompt =~ "dispatches only GitHub pull requests to Codex workspaces"
+    assert prompt =~ "GitHub Todo issues are planning-only Codex runs"
+    assert prompt =~ "Create or reuse a PR without creating a source-issue worktree"
     assert prompt =~ "prefix the child PR title with the parent PR number"
     assert prompt =~ "PR #<parent>: <child PR title>"
   end
@@ -330,7 +364,10 @@ defmodule SymphonyElixir.CoreTest do
 
   test "dispatch kinds can restrict workspace execution to pull requests" do
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_kind: "memory",
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
       tracker_active_states: ["Planned", "Review"],
       dispatch_kinds: ["pull_request"]
     )
@@ -357,7 +394,77 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     refute Orchestrator.should_dispatch_issue_for_test(planned_issue, state)
+    assert Orchestrator.should_prepare_pull_request_for_issue_for_test(planned_issue, state)
     assert Orchestrator.should_dispatch_issue_for_test(review_pr, state)
+  end
+
+  test "planned GitHub issue prepares a pull request without dispatching a source issue workspace" do
+    Application.put_env(:symphony_elixir, :github_client_module, PlannedIssueGitHubClient)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_active_states: ["Planned", "In Progress"],
+      dispatch_kinds: ["pull_request"]
+    )
+
+    state = %Orchestrator.State{
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "github:issue:42",
+      identifier: "#42",
+      title: "Prepare implementation",
+      state: "Planned",
+      kind: :issue
+    }
+
+    next_state = Orchestrator.handle_targeted_issue_refresh_for_test(state, issue)
+
+    assert next_state.running == %{}
+    assert_receive {:github_create_pull_request_for_issue_called, "#42"}
+    assert_receive {:github_update_issue_state_called, "github:issue:42", "Human Review"}
+    assert_receive {:refresh_issue, "github:pr:88"}
+  end
+
+  test "current WORKFLOW.myven.md dispatches Todo GitHub issues for planning" do
+    workflow_path = Path.expand("../../WORKFLOW.myven.md", __DIR__)
+
+    assert {:ok, %{config: config}} = Workflow.load(workflow_path)
+    assert {:ok, _settings} = Config.Schema.parse(config)
+
+    previous_workflow_file = Workflow.workflow_file_path()
+    on_exit(fn -> Workflow.set_workflow_file_path(previous_workflow_file) end)
+    Workflow.set_workflow_file_path(workflow_path)
+
+    state = %Orchestrator.State{
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    todo_issue = %Issue{
+      id: "github:issue:45",
+      identifier: "#45",
+      title: "Plan operator surface",
+      state: "Todo",
+      kind: :issue
+    }
+
+    planned_issue = %Issue{
+      id: "github:issue:46",
+      identifier: "#46",
+      title: "Prepare implementation",
+      state: "Planned",
+      kind: :issue
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(todo_issue, state)
+    refute Orchestrator.should_dispatch_issue_for_test(planned_issue, state)
+    assert Orchestrator.should_prepare_pull_request_for_issue_for_test(planned_issue, state)
   end
 
   test "linear api token resolves from LINEAR_API_KEY env var" do

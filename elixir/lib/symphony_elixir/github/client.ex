@@ -97,6 +97,33 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  @spec create_pull_request_for_issue(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
+  def create_pull_request_for_issue(%Issue{kind: :issue} = issue) do
+    case parse_issue_id(issue.id) do
+      {:ok, number, :issue} ->
+        branch = issue_pull_request_branch(number)
+
+        case fetch_open_pull_request_for_branch(branch) do
+          {:ok, %Issue{} = pull_request} ->
+            {:ok, pull_request}
+
+          {:ok, nil} ->
+            create_issue_pull_request(issue, number, branch)
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:ok, _number, kind} ->
+        {:error, {:unsupported_github_issue_kind, kind}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def create_pull_request_for_issue(%Issue{kind: kind}), do: {:error, {:unsupported_github_issue_kind, kind}}
+
   @doc false
   @spec normalize_issue_for_test(map()) :: {:ok, Issue.t()} | :skip
   def normalize_issue_for_test(raw_issue) when is_map(raw_issue) do
@@ -333,6 +360,219 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  defp fetch_open_pull_request_for_branch(branch) when is_binary(branch) do
+    with {:ok, tracker} <- github_tracker_config(),
+         {:ok, pulls} <-
+           request(:get, "/pulls", params: %{state: "open", head: "#{tracker.owner}:#{branch}", per_page: 1}) do
+      case pulls do
+        [%{"number" => number} | _] when is_integer(number) ->
+          fetch_visible_or_plan_pull_request("github:pr:#{number}")
+
+        [] ->
+          {:ok, nil}
+
+        _ ->
+          {:error, :github_unexpected_pulls_payload}
+      end
+    end
+  end
+
+  defp fetch_visible_or_plan_pull_request(issue_id) do
+    case fetch_issue_by_id(issue_id) do
+      {:ok, %Issue{} = issue} ->
+        {:ok, issue}
+
+      :skip ->
+        with :ok <- update_issue_state(issue_id, "Planned") do
+          fetch_visible_issue_by_id(issue_id)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp create_issue_pull_request(issue, number, branch) do
+    with {:ok, base_branch} <- pull_request_base_branch(),
+         {:ok, _branch_sha} <- ensure_issue_pull_request_branch(issue, number, branch, base_branch),
+         {:ok, raw_pull_request} <-
+           request(:post, "/pulls",
+             json: %{
+               title: issue_pull_request_title(number, issue),
+               head: branch,
+               base: base_branch,
+               body: issue_pull_request_body(number, issue),
+               draft: false
+             }
+           ),
+         pull_number when is_integer(pull_number) <- raw_pull_request["number"],
+         pull_request_id <- "github:pr:#{pull_number}",
+         :ok <- update_issue_state(pull_request_id, "Planned") do
+      fetch_visible_issue_by_id(pull_request_id)
+    else
+      {:error, {:github_api_status, 422, _body}} ->
+        case fetch_open_pull_request_for_branch(branch) do
+          {:ok, %Issue{} = pull_request} -> {:ok, pull_request}
+          {:ok, nil} -> {:error, :github_pull_request_creation_failed}
+          {:error, reason} -> {:error, reason}
+        end
+
+      nil ->
+        {:error, :github_pull_request_number_missing}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :github_pull_request_creation_failed}
+    end
+  end
+
+  defp ensure_issue_pull_request_branch(issue, number, branch, base_branch) do
+    case fetch_branch_sha(branch) do
+      {:ok, branch_sha} ->
+        {:ok, branch_sha}
+
+      {:error, {:github_api_status, 404, _body}} ->
+        with {:ok, base_sha} <- fetch_branch_sha(base_branch),
+             {:ok, tree_sha} <- fetch_commit_tree_sha(base_sha),
+             {:ok, commit_sha} <- create_issue_pull_request_commit(issue, number, base_sha, tree_sha),
+             :ok <- create_branch_ref(branch, commit_sha) do
+          {:ok, commit_sha}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp fetch_branch_sha(branch) when is_binary(branch) do
+    case request(:get, "/git/ref/heads/#{branch}") do
+      {:ok, %{"object" => %{"sha" => sha}}} when is_binary(sha) -> {:ok, sha}
+      {:ok, _payload} -> {:error, :github_unexpected_ref_payload}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fetch_commit_tree_sha(commit_sha) when is_binary(commit_sha) do
+    case request(:get, "/git/commits/#{commit_sha}") do
+      {:ok, %{"tree" => %{"sha" => tree_sha}}} when is_binary(tree_sha) -> {:ok, tree_sha}
+      {:ok, _payload} -> {:error, :github_unexpected_commit_payload}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp create_issue_pull_request_commit(issue, number, base_sha, tree_sha) do
+    case request(:post, "/git/commits",
+           json: %{
+             message: "chore: prepare issue ##{number} implementation PR",
+             tree: tree_sha,
+             parents: [base_sha],
+             author: %{
+               name: "Symphony",
+               email: "symphony@users.noreply.github.com"
+             }
+           }
+         ) do
+      {:ok, %{"sha" => sha}} when is_binary(sha) ->
+        {:ok, sha}
+
+      {:ok, _payload} ->
+        {:error, :github_unexpected_commit_create_payload}
+
+      {:error, reason} ->
+        Logger.warning("Failed to create empty PR commit for #{inspect(issue.identifier)}: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp create_branch_ref(branch, sha) when is_binary(branch) and is_binary(sha) do
+    case request(:post, "/git/refs", json: %{ref: "refs/heads/#{branch}", sha: sha}) do
+      {:ok, _payload} -> :ok
+      {:error, {:github_api_status, 422, _body}} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fetch_visible_issue_by_id(issue_id) do
+    case fetch_issue_by_id(issue_id) do
+      {:ok, %Issue{} = issue} -> {:ok, issue}
+      :skip -> {:error, {:github_issue_not_visible, issue_id}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp pull_request_base_branch do
+    base_ref =
+      Config.settings!().workspace.base_ref
+      |> to_string()
+      |> String.trim()
+
+    cond do
+      base_ref == "" or base_ref == "HEAD" ->
+        default_branch()
+
+      String.starts_with?(base_ref, "origin/") ->
+        {:ok, String.replace_prefix(base_ref, "origin/", "")}
+
+      String.starts_with?(base_ref, "refs/heads/") ->
+        {:ok, String.replace_prefix(base_ref, "refs/heads/", "")}
+
+      true ->
+        {:ok, base_ref}
+    end
+  end
+
+  defp default_branch do
+    case request(:get, "") do
+      {:ok, %{"default_branch" => branch}} when is_binary(branch) and branch != "" -> {:ok, branch}
+      {:ok, _payload} -> {:error, :github_default_branch_missing}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp issue_pull_request_branch(number) when is_integer(number), do: "symphony/_#{number}"
+
+  defp issue_pull_request_title(number, %Issue{title: title}) do
+    title =
+      case title do
+        value when is_binary(value) ->
+          value = String.trim(value)
+          if value == "", do: "Issue #{number}", else: value
+
+        _ ->
+          "Issue #{number}"
+      end
+
+    truncate_text("Issue ##{number}: #{title}", 250)
+  end
+
+  defp issue_pull_request_body(number, %Issue{} = issue) do
+    issue_url = issue.url || "##{number}"
+    description = issue.description || ""
+
+    """
+    ## 작업 소스
+
+    - 원본 이슈: #{issue_url}
+    - 완료 시 연결 이슈 정리: Closes ##{number}
+    - 이 PR은 `sym:planned` 이슈에서 자동 생성되었습니다.
+    - 실제 구현은 PR lane의 `sym:planned` 실행에서 진행합니다.
+
+    ## 원본 이슈 내용
+
+    #{description}
+    """
+  end
+
+  defp truncate_text(value, max_length) when is_binary(value) and is_integer(max_length) do
+    if String.length(value) > max_length do
+      String.slice(value, 0, max(max_length - 3, 0)) <> "..."
+    else
+      value
+    end
+  end
+
   defp request(method, path, opts \\ []) when method in [:get, :post, :delete] and is_binary(path) do
     with {:ok, tracker} <- github_tracker_config(),
          {:ok, headers} <- github_headers(tracker) do
@@ -346,7 +586,9 @@ defmodule SymphonyElixir.GitHub.Client do
         |> maybe_put_json(Keyword.get(opts, :json))
         |> maybe_put_params(Keyword.get(opts, :params))
 
-      case Req.request(request_opts) do
+      request_fun = Application.get_env(:symphony_elixir, :github_request_fun, &Req.request/1)
+
+      case request_fun.(request_opts) do
         {:ok, %{status: status, body: body}} when status in 200..299 ->
           {:ok, body}
 

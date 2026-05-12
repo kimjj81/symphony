@@ -217,6 +217,7 @@ agent:
   max_concurrent_agents: 3
   max_turns: 3
   dispatch_kinds:
+    - issue
     - pull_request
 codex:
   command: codex app-server
@@ -273,7 +274,7 @@ Description:
 {% if issue.description %}{{ issue.description }}{% else %}No description provided.{% endif %}
 
 Instructions:
-1. This workflow dispatches only GitHub pull requests to Codex workspaces. GitHub issues are planning/control surfaces and must not create worktrees or Docker stacks.
+1. GitHub Todo issues are planning-only Codex runs. Implementation work belongs to pull request lanes; when a GitHub issue enters Planned, Symphony's control path may create or reuse a PR for that issue without implementing in the source issue lane.
 2. Keep changes scoped and minimal.
 3. Prefer safe, deterministic changes and record blockers in the workpad.
 4. Use the GitHub labels as the state machine: sym:todo, sym:planned, sym:in-progress, sym:review, sym:reviewing, sym:human-review, sym:rework, sym:merging, sym:done, sym:canceled, sym:duplicate.
@@ -289,9 +290,9 @@ Instructions:
 9. Write GitHub issue comments, issue bodies, pull request titles, pull request descriptions, and pull request comments in Korean unless quoting source text or preserving an existing external title.
    - When creating a stacked child pull request whose base branch belongs to another open pull request, prefix the child PR title with the parent PR number in the format `PR #<parent>: <child PR title>`, and mention the parent PR in the PR body.
 10. If this item is a GitHub issue in Todo, do not implement code and do not create, modify, commit, or push repository files, including `docs/draft/*`. Analyze the issue, record the plan only in the issue body or a GitHub comment, propose PR-sized work items in a GitHub comment, then move the item to Human Review.
-11. If this item is a GitHub issue in Planned, treat Planned as human approval for planning/splitting only. Do not implement in the issue lane; create or update PR-sized follow-up work and move the issue to Human Review.
+11. If this item is a GitHub issue in Planned, do not implement in the issue lane. Create or reuse a PR without creating a source-issue worktree, label the PR Planned for implementation, then move the source issue to Human Review.
 12. Symphony must not move a GitHub issue from Todo or Human Review to Planned by itself. Only a human-applied sym:planned label is an approval gate.
-13. If a Planned issue is explicitly a planning/splitting issue, create the requested PR-sized follow-up issues instead of changing product code. Label follow-up implementation issues sym:planned only when the parent issue explicitly asks for immediate execution; otherwise label them sym:todo for human review.
+13. If a Planned issue is explicitly a planning/splitting issue, create the requested PR-sized follow-up issues instead of changing product code. Label follow-up implementation issues sym:planned only when the parent issue explicitly asks for immediate execution; otherwise label them sym:todo for human review. If a direct implementation PR is needed, create the PR and let the PR lane do the work.
 14. If this item is a GitHub issue with an open linked pull request, keep or move the source issue to Human Review, update only the issue summary/comment and the linked PR body/comment with current PR status, then stop; PR execution belongs to the linked pull request.
 15. If this item is a GitHub issue in In Progress and it does not have an open linked pull request, create or update a PR-sized implementation PR and keep the issue comment trail current. After opening or updating the implementation PR, move only the PR to Review and keep the source issue in Human Review while updating the source issue summary/comment with the PR status.
 16. If implementation becomes too large, stop before committing and comment: "이 PR은 너무 커졌으므로 여기까지 commit하지 않고 분할 제안". Move the item to Human Review with the split proposal.

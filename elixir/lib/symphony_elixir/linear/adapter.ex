@@ -73,6 +73,9 @@ defmodule SymphonyElixir.Linear.Adapter do
     end
   end
 
+  @spec create_pull_request_for_issue(term()) :: {:error, :unsupported_pull_request_creation}
+  def create_pull_request_for_issue(_issue), do: {:error, :unsupported_pull_request_creation}
+
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
   end

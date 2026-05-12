@@ -90,6 +90,114 @@ defmodule SymphonyElixir.GitHubClientTest do
              end)
   end
 
+  test "creates an implementation pull request for a planned GitHub issue" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil,
+      workspace_base_ref: "origin/main"
+    )
+
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      params = Keyword.get(opts, :params)
+      json = Keyword.get(opts, :json)
+
+      send(test_pid, {:github_request, method, path, params, json})
+
+      case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/pulls"} ->
+          assert params == %{state: "open", head: "studiojin-dev:symphony/_37", per_page: 1}
+          github_response(200, [])
+
+        {:get, "/repos/studiojin-dev/myven/git/ref/heads/symphony/_37"} ->
+          github_response(404, %{"message" => "Not Found"})
+
+        {:get, "/repos/studiojin-dev/myven/git/ref/heads/main"} ->
+          github_response(200, %{"object" => %{"sha" => "base-sha"}})
+
+        {:get, "/repos/studiojin-dev/myven/git/commits/base-sha"} ->
+          github_response(200, %{"tree" => %{"sha" => "tree-sha"}})
+
+        {:post, "/repos/studiojin-dev/myven/git/commits"} ->
+          assert json == %{
+                   message: "chore: prepare issue #37 implementation PR",
+                   tree: "tree-sha",
+                   parents: ["base-sha"],
+                   author: %{
+                     name: "Symphony",
+                     email: "symphony@users.noreply.github.com"
+                   }
+                 }
+
+          github_response(201, %{"sha" => "empty-sha"})
+
+        {:post, "/repos/studiojin-dev/myven/git/refs"} ->
+          assert json == %{ref: "refs/heads/symphony/_37", sha: "empty-sha"}
+          github_response(201, %{"ref" => "refs/heads/symphony/_37", "object" => %{"sha" => "empty-sha"}})
+
+        {:post, "/repos/studiojin-dev/myven/pulls"} ->
+          assert json.head == "symphony/_37"
+          assert json.base == "main"
+          assert json.title == "Issue #37: Default empty strings"
+          assert json.body =~ "https://github.com/studiojin-dev/myven/issues/37"
+          assert json.body =~ "Closes #37"
+
+          github_response(201, %{"number" => 88})
+
+        {:get, "/repos/studiojin-dev/myven/issues/88"} ->
+          issue_fetch_count = Process.get(:github_client_test_issue_88_fetch_count, 0) + 1
+          Process.put(:github_client_test_issue_88_fetch_count, issue_fetch_count)
+
+          labels =
+            if issue_fetch_count == 1 do
+              []
+            else
+              [%{"name" => "sym:planned"}]
+            end
+
+          github_response(200, raw_pull_request_issue(88, labels))
+
+        {:get, "/repos/studiojin-dev/myven/labels/sym%3Aplanned"} ->
+          github_response(200, %{"name" => "sym:planned"})
+
+        {:post, "/repos/studiojin-dev/myven/issues/88/labels"} ->
+          assert json == %{labels: ["sym:planned"]}
+          github_response(200, [%{"name" => "sym:planned"}])
+
+        {:get, "/repos/studiojin-dev/myven/pulls/88"} ->
+          github_response(200, %{"head" => %{"ref" => "symphony/_37"}, "merged" => false})
+      end
+    end)
+
+    issue = %Issue{
+      id: "github:issue:37",
+      identifier: "#37",
+      title: "Default empty strings",
+      description: "Use real defaults instead of ad-hoc blank strings.",
+      state: "Planned",
+      kind: :issue,
+      url: "https://github.com/studiojin-dev/myven/issues/37"
+    }
+
+    assert {:ok, pull_request} = Client.create_pull_request_for_issue(issue)
+
+    assert pull_request.id == "github:pr:88"
+    assert pull_request.identifier == "PR #88"
+    assert pull_request.state == "Planned"
+    assert pull_request.kind == :pull_request
+    assert pull_request.branch_name == "symphony/_37"
+
+    assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/pulls", nil, pull_request_json}
+    assert pull_request_json.draft == false
+  end
+
   test "skips GitHub issues without Symphony state labels" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",
@@ -143,5 +251,21 @@ defmodule SymphonyElixir.GitHubClientTest do
              Client.state_from_labels_for_test(["sym:todo", "sym:rework"])
 
     assert Enum.sort(states) == ["Rework", "Todo"]
+  end
+
+  defp github_response(status, body), do: {:ok, %Req.Response{status: status, body: body}}
+
+  defp raw_pull_request_issue(number, labels) do
+    %{
+      "number" => number,
+      "title" => "Issue #37: Default empty strings",
+      "body" => "Implementation PR",
+      "state" => "open",
+      "html_url" => "https://github.com/studiojin-dev/myven/pull/#{number}",
+      "pull_request" => %{"url" => "https://api.github.com/repos/studiojin-dev/myven/pulls/#{number}"},
+      "labels" => labels,
+      "created_at" => "2026-05-10T00:00:00Z",
+      "updated_at" => "2026-05-10T00:00:00Z"
+    }
   end
 end
