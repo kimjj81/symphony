@@ -49,6 +49,11 @@ mix specs.check
 ## PR Requirements
 
 - PR body must follow `../.github/pull_request_template.md` exactly.
+- Default GitHub PR merges to squash merge.
+- Before updating a remote PR branch, fetch `origin/main` and rebase the current branch onto
+  `origin/main`; resolve conflicts locally, then update the remote branch with
+  `git push --force-with-lease`.
+- Use a merge commit only when the PR body explicitly requests one.
 - Validate PR body locally when needed:
 
 ```bash
