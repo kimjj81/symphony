@@ -183,7 +183,8 @@ defmodule SymphonyElixir.CoreTest do
     assert "bash ./scripts/playwright-local.sh" in settings.codex.auto_approve_command_patterns
     assert settings.codex.read_timeout_ms == 10_000
     assert settings.agent.dispatch_kinds == ["issue", "pull_request"]
-    assert settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
+    assert settings.hooks.after_sync_local_files == "pnpm run worktree:copy-env\n"
+    refute settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
     assert String.trim(prompt) != ""
     assert prompt =~ "sandbox_permissions=require_escalated"
     assert prompt =~ "GitHub Todo issues are planning-only Codex runs"

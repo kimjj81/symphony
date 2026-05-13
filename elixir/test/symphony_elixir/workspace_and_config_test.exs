@@ -632,6 +632,45 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace runs after_sync_local_files hook after every local file sync" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-sync-hook-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      hook_marker = Path.join(test_root, "after_sync_local_files.log")
+      after_create_counter = Path.join(test_root, "after_create.count")
+
+      File.mkdir_p!(source)
+      File.mkdir_p!(workspace_root)
+      File.write!(Path.join(source, ".env.local"), "VALUE=one\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_source: source,
+        workspace_local_files: [%{"path" => ".env.local", "mode" => "copy", "required" => true}],
+        hook_after_sync_local_files: "cat .env.local >> \"#{hook_marker}\"",
+        hook_after_create: "echo call >> \"#{after_create_counter}\""
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-SYNC-HOOK")
+      assert File.read!(Path.join(workspace, ".env.local")) == "VALUE=one\n"
+
+      File.write!(Path.join(source, ".env.local"), "VALUE=two\n")
+
+      assert {:ok, ^workspace} = Workspace.create_for_issue("MT-SYNC-HOOK")
+      assert File.read!(Path.join(workspace, ".env.local")) == "VALUE=two\n"
+      assert File.read!(hook_marker) == "VALUE=one\nVALUE=two\n"
+      assert length(String.split(String.trim(File.read!(after_create_counter)), "\n")) == 1
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace remove continues when before_remove hook fails" do
     test_root =
       Path.join(

@@ -46,6 +46,8 @@ workspace:
       mode: symlink
       required: false
 hooks:
+  after_sync_local_files: |
+    pnpm run worktree:copy-env
   after_create: |
     : "${CODEX_WS_HOST:=127.0.0.1}"
     : "${CODEX_WS_PORT:=4500}"
@@ -100,12 +102,6 @@ hooks:
     upsert_port_var MYVEN_OTEL_HEALTH_PORT 10
     upsert_port_var MYVEN_OTEL_METRICS_PORT 11
     upsert_env_var MYVEN_LOCAL_BASE_URL "http://127.0.0.1:${myven_web_port}"
-
-    if [ -f package.json ] && command -v pnpm >/dev/null 2>&1; then
-      pnpm run worktree:bootstrap
-    else
-      printf "WARN: skipped worktree bootstrap; package.json or pnpm not found\n" >&2
-    fi
   before_remove: |
     workspace_root="$(pwd)"
     workspace_physical_root="$(pwd -P 2>/dev/null || pwd)"

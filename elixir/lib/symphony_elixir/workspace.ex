@@ -22,6 +22,7 @@ defmodule SymphonyElixir.Workspace do
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, issue_context, worker_host),
            :ok <- sync_local_files(workspace, worker_host),
+           :ok <- maybe_run_after_sync_local_files_hook(workspace, issue_context, worker_host),
            :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
         {:ok, workspace}
       end
@@ -259,6 +260,18 @@ defmodule SymphonyElixir.Workspace do
 
       false ->
         :ok
+    end
+  end
+
+  defp maybe_run_after_sync_local_files_hook(workspace, issue_context, worker_host) do
+    hooks = Config.settings!().hooks
+
+    case hooks.after_sync_local_files do
+      nil ->
+        :ok
+
+      command ->
+        run_hook(command, workspace, issue_context, "after_sync_local_files", worker_host)
     end
   end
 
