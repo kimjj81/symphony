@@ -160,6 +160,12 @@ Notes:
   Use `["pull_request"]` when issues should remain a manual planning/control surface and only PRs should create workspaces.
   GitHub issue control actions, such as opening a PR from a Planned issue, can still run without
   creating a Codex workspace for the source issue.
+- `agent.source_checkout_states` lists issue states that should run from the configured
+  `workspace.source` checkout instead of creating a per-issue workspace. Use this for planning-only
+  states such as GitHub `Todo` when the agent should review the latest `main` tree and leave only
+  tracker comments. Source-checkout runs require the source checkout to be on the branch implied by
+  `workspace.base_ref` and clean; Symphony updates it with `git pull --ff-only origin <branch>` and
+  starts Codex with a read-only sandbox.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

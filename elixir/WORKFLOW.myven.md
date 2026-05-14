@@ -215,6 +215,8 @@ agent:
   dispatch_kinds:
     - issue
     - pull_request
+  source_checkout_states:
+    - Todo
 codex:
   command: codex app-server
   approval_policy: on-request

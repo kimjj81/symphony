@@ -51,6 +51,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
     assert config.agent.dispatch_kinds == ["issue", "pull_request"]
+    assert config.agent.source_checkout_states == []
     assert config.codex.auto_approve_requests == nil
     assert config.codex.auto_approve_command_patterns == []
 
@@ -78,6 +79,14 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.dispatch_kind_enabled?(:pull_request)
     assert Config.dispatch_kind_enabled?(nil)
     assert Config.Schema.normalize_dispatch_kinds(:issue) == []
+
+    write_workflow_file!(Workflow.workflow_file_path(), source_checkout_states: ["Todo", " todo ", :planned])
+    assert Config.settings!().agent.source_checkout_states == ["todo", "planned"]
+    assert Config.source_checkout_state?("Todo")
+    assert Config.source_checkout_state?("planned")
+    assert Config.Schema.normalize_issue_state(nil) == ""
+    assert Config.Schema.normalize_issue_state(123) == "123"
+    assert Config.Schema.normalize_issue_states(:todo) == []
     assert Config.Schema.normalize_dispatch_kinds(["issue", " ", 123]) == ["issue"]
     assert Config.Schema.normalize_dispatch_kind(123) == nil
 
@@ -183,11 +192,13 @@ defmodule SymphonyElixir.CoreTest do
     assert "bash ./scripts/playwright-local.sh" in settings.codex.auto_approve_command_patterns
     assert settings.codex.read_timeout_ms == 10_000
     assert settings.agent.dispatch_kinds == ["issue", "pull_request"]
+    assert settings.agent.source_checkout_states == ["todo"]
     assert settings.hooks.after_sync_local_files == "pnpm run worktree:copy-env\n"
     refute settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
     assert String.trim(prompt) != ""
     assert prompt =~ "sandbox_permissions=require_escalated"
     assert prompt =~ "GitHub Todo issues are planning-only Codex runs"
+    assert prompt =~ "do not create, modify, commit, or push repository files"
     assert prompt =~ "Create or reuse a PR without creating a source-issue worktree"
     assert prompt =~ "prefix the child PR title with the parent PR number"
     assert prompt =~ "PR #<parent>: <child PR title>"
@@ -1722,6 +1733,142 @@ defmodule SymphonyElixir.CoreTest do
       workspace = Path.join(workspace_root, workspace_name)
       assert File.exists?(workspace)
       assert File.exists?(Path.join(workspace, "README.md"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner uses source checkout for configured planning issue states" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-source-checkout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      origin_repo = Path.join(test_root, "origin.git")
+      source_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-source-checkout.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEX_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEX_TRACE")
+        end
+      end)
+
+      File.mkdir_p!(workspace_root)
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+
+      System.cmd("git", ["init", "--bare", origin_repo])
+      System.cmd("git", ["clone", origin_repo, source_repo])
+      System.cmd("git", ["-C", source_repo, "checkout", "-b", "main"])
+      System.cmd("git", ["-C", source_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source_repo, "config", "user.email", "test@example.com"])
+      File.write!(Path.join(source_repo, "README.md"), "# source checkout")
+      System.cmd("git", ["-C", source_repo, "add", "README.md"])
+      System.cmd("git", ["-C", source_repo, "commit", "-m", "initial"])
+      System.cmd("git", ["-C", source_repo, "push", "-u", "origin", "main"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/codex-source-checkout.trace}"
+      printf 'CWD:%s\\n' "$(pwd -P)" >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-source"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-source"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "github",
+        tracker_owner: "studiojin-dev",
+        tracker_repo: "myven",
+        workspace_root: workspace_root,
+        workspace_strategy: "git_worktree",
+        workspace_source: source_repo,
+        workspace_base_ref: "origin/main",
+        source_checkout_states: ["Todo"],
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "github:issue:77",
+        identifier: "#77",
+        title: "Plan implementation",
+        description: "Review current main before planning",
+        state: "Todo",
+        kind: :issue,
+        url: "https://example.org/issues/77",
+        labels: ["sym:todo"]
+      }
+
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Human Review"}]} end)
+
+      assert File.ls!(workspace_root) == []
+
+      {:ok, canonical_source} = SymphonyElixir.PathSafety.canonicalize(source_repo)
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\n", trim: true)
+
+      assert "CWD:#{canonical_source}" in lines
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 line
+                 |> String.trim_leading("JSON:")
+                 |> Jason.decode!()
+                 |> then(fn payload ->
+                   payload["method"] == "thread/start" &&
+                     get_in(payload, ["params", "sandbox"]) == "read-only" &&
+                     get_in(payload, ["params", "cwd"]) == canonical_source
+                 end)
+               else
+                 false
+               end
+             end)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 line
+                 |> String.trim_leading("JSON:")
+                 |> Jason.decode!()
+                 |> then(fn payload ->
+                   payload["method"] == "turn/start" &&
+                     get_in(payload, ["params", "cwd"]) == canonical_source &&
+                     get_in(payload, ["params", "sandboxPolicy"]) == %{"type" => "readOnly", "networkAccess" => true}
+                 end)
+               else
+                 false
+               end
+             end)
     after
       File.rm_rf(test_root)
     end

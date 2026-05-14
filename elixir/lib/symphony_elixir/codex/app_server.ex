@@ -44,7 +44,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
         {:ok,
          %{
@@ -154,6 +154,9 @@ defmodule SymphonyElixir.Codex.AppServer do
       canonical_root_prefix = canonical_root <> "/"
 
       cond do
+        source_checkout_cwd?(canonical_workspace) ->
+          {:ok, canonical_workspace}
+
         canonical_workspace == canonical_root ->
           {:error, {:invalid_workspace_cwd, :workspace_root, canonical_workspace}}
 
@@ -183,6 +186,19 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       true ->
         {:ok, workspace}
+    end
+  end
+
+  defp source_checkout_cwd?(canonical_workspace) when is_binary(canonical_workspace) do
+    case Config.settings!().workspace.source do
+      source when is_binary(source) and source != "" ->
+        case PathSafety.canonicalize(Path.expand(source)) do
+          {:ok, canonical_source} -> canonical_workspace == canonical_source
+          {:error, _reason} -> false
+        end
+
+      _ ->
+        false
     end
   end
 
@@ -262,13 +278,23 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp session_policies(workspace, nil) do
-    Config.codex_runtime_settings(workspace)
+  defp session_policies(workspace, nil, opts) do
+    with {:ok, settings} <- Config.codex_runtime_settings(workspace) do
+      {:ok, merge_runtime_overrides(settings, Keyword.get(opts, :runtime_overrides, %{}))}
+    end
   end
 
-  defp session_policies(workspace, worker_host) when is_binary(worker_host) do
-    Config.codex_runtime_settings(workspace, remote: true)
+  defp session_policies(workspace, worker_host, opts) when is_binary(worker_host) do
+    with {:ok, settings} <- Config.codex_runtime_settings(workspace, remote: true) do
+      {:ok, merge_runtime_overrides(settings, Keyword.get(opts, :runtime_overrides, %{}))}
+    end
   end
+
+  defp merge_runtime_overrides(settings, overrides) when is_map(overrides) do
+    Map.merge(settings, overrides)
+  end
+
+  defp merge_runtime_overrides(settings, _overrides), do: settings
 
   defp auto_approve_policy(%{approval_policy: approval_policy} = session_policies) do
     auto_approve_all =

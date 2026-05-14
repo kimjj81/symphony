@@ -30,20 +30,46 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
+    case prepare_agent_workspace(issue, worker_host) do
+      {:ok, workspace, app_server_opts} ->
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+          with :ok <- maybe_run_before_run_hook(workspace, issue, worker_host, app_server_opts) do
+            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, app_server_opts)
           end
         after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+          maybe_run_after_run_hook(workspace, issue, worker_host, app_server_opts)
         end
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp prepare_agent_workspace(%Issue{kind: :issue, state: state_name} = issue, nil)
+       when is_binary(state_name) do
+    if Config.source_checkout_state?(state_name) do
+      with {:ok, source_checkout} <- Workspace.prepare_source_checkout_for_issue(issue) do
+        {:ok, source_checkout,
+         [
+           runtime_overrides: %{
+             thread_sandbox: "read-only",
+             turn_sandbox_policy: %{"type" => "readOnly", "networkAccess" => true}
+           },
+           skip_workspace_hooks: true
+         ]}
+      end
+    else
+      prepare_issue_workspace(issue, nil)
+    end
+  end
+
+  defp prepare_agent_workspace(issue, worker_host), do: prepare_issue_workspace(issue, worker_host)
+
+  defp prepare_issue_workspace(issue, worker_host) do
+    with {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host) do
+      {:ok, workspace, []}
     end
   end
 
@@ -77,11 +103,27 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
-  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+  defp maybe_run_before_run_hook(workspace, issue, worker_host, app_server_opts) do
+    if Keyword.get(app_server_opts, :skip_workspace_hooks, false) do
+      :ok
+    else
+      Workspace.run_before_run_hook(workspace, issue, worker_host)
+    end
+  end
+
+  defp maybe_run_after_run_hook(workspace, issue, worker_host, app_server_opts) do
+    if Keyword.get(app_server_opts, :skip_workspace_hooks, false) do
+      :ok
+    else
+      Workspace.run_after_run_hook(workspace, issue, worker_host)
+    end
+  end
+
+  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, app_server_opts) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    with {:ok, session} <- AppServer.start_session(workspace, Keyword.put(app_server_opts, :worker_host, worker_host)) do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after

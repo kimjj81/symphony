@@ -151,6 +151,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
       field(:dispatch_kinds, {:array, :string}, default: ["issue", "pull_request"])
+      field(:source_checkout_states, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -163,7 +164,8 @@ defmodule SymphonyElixir.Config.Schema do
           :max_turns,
           :max_retry_backoff_ms,
           :max_concurrent_agents_by_state,
-          :dispatch_kinds
+          :dispatch_kinds,
+          :source_checkout_states
         ],
         empty_values: []
       )
@@ -174,6 +176,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
       |> update_change(:dispatch_kinds, &Schema.normalize_dispatch_kinds/1)
       |> Schema.validate_dispatch_kinds(:dispatch_kinds)
+      |> update_change(:source_checkout_states, &Schema.normalize_issue_states/1)
     end
   end
 
@@ -423,10 +426,26 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
-  @spec normalize_issue_state(String.t()) :: String.t()
+  @spec normalize_issue_state(term()) :: String.t()
   def normalize_issue_state(state_name) when is_binary(state_name) do
-    String.downcase(state_name)
+    state_name
+    |> String.trim()
+    |> String.downcase()
   end
+
+  def normalize_issue_state(nil), do: ""
+  def normalize_issue_state(state_name), do: state_name |> to_string() |> normalize_issue_state()
+
+  @doc false
+  @spec normalize_issue_states(term()) :: [String.t()]
+  def normalize_issue_states(states) when is_list(states) do
+    states
+    |> Enum.map(&normalize_issue_state/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  def normalize_issue_states(_states), do: []
 
   @doc false
   @spec normalize_state_limits(nil | map()) :: map()

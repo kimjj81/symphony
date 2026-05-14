@@ -70,6 +70,11 @@ defmodule SymphonyElixir.Config do
     normalized_kind in settings!().agent.dispatch_kinds
   end
 
+  @spec source_checkout_state?(term()) :: boolean()
+  def source_checkout_state?(state_name) do
+    Schema.normalize_issue_state(state_name) in settings!().agent.source_checkout_states
+  end
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do

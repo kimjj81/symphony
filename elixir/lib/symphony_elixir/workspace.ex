@@ -33,6 +33,24 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @spec prepare_source_checkout_for_issue(map() | String.t() | nil) :: {:ok, Path.t()} | {:error, term()}
+  def prepare_source_checkout_for_issue(issue_or_identifier) do
+    issue_context = issue_context(issue_or_identifier)
+    settings = Config.settings!().workspace
+
+    with source when is_binary(source) and source != "" <- settings.source,
+         {:ok, source} <- canonical_source_checkout(source),
+         :ok <- sync_source_checkout(source, settings.base_ref) do
+      Logger.info("Prepared source checkout #{issue_log_context(issue_context)} source=#{source}")
+      {:ok, source}
+    else
+      nil -> {:error, :missing_workspace_source}
+      "" -> {:error, :missing_workspace_source}
+      {:error, reason} -> {:error, reason}
+      other -> {:error, {:invalid_workspace_source, other}}
+    end
+  end
+
   defp ensure_workspace(workspace, issue_context, nil) do
     case Config.settings!().workspace.strategy do
       "git_worktree" -> ensure_git_worktree(workspace, issue_context)
@@ -119,6 +137,66 @@ defmodule SymphonyElixir.Workspace do
           {_output, 0} -> {:ok, workspace, true}
           {output, status} -> {:error, {:git_worktree_add_failed, status, output}}
         end
+    end
+  end
+
+  defp canonical_source_checkout(source) when is_binary(source) do
+    source = Path.expand(source)
+
+    if File.dir?(source) do
+      PathSafety.canonicalize(source)
+    else
+      {:error, {:source_checkout_missing, source}}
+    end
+  end
+
+  defp sync_source_checkout(source, base_ref) do
+    branch = source_branch_from_base_ref(base_ref)
+
+    with :ok <- ensure_git_branch(source, branch),
+         :ok <- ensure_clean_git_status(source) do
+      pull_source_branch(source, branch)
+    end
+  end
+
+  defp source_branch_from_base_ref(base_ref) when is_binary(base_ref) do
+    case String.split(String.trim(base_ref), "/", parts: 2) do
+      ["origin", branch] when branch != "" -> branch
+      [branch] when branch != "" -> branch
+      _ -> "main"
+    end
+  end
+
+  defp source_branch_from_base_ref(_base_ref), do: "main"
+
+  defp ensure_git_branch(source, expected_branch) do
+    case System.cmd("git", ["-C", source, "rev-parse", "--abbrev-ref", "HEAD"], stderr_to_stdout: true) do
+      {branch, 0} ->
+        current_branch = String.trim(branch)
+
+        if current_branch == expected_branch do
+          :ok
+        else
+          {:error, {:source_checkout_wrong_branch, current_branch, expected_branch}}
+        end
+
+      {output, status} ->
+        {:error, {:source_checkout_branch_failed, status, output}}
+    end
+  end
+
+  defp ensure_clean_git_status(source) do
+    case System.cmd("git", ["-C", source, "status", "--short"], stderr_to_stdout: true) do
+      {"", 0} -> :ok
+      {status_output, 0} -> {:error, {:source_checkout_dirty, status_output}}
+      {output, status} -> {:error, {:source_checkout_status_failed, status, output}}
+    end
+  end
+
+  defp pull_source_branch(source, branch) do
+    case System.cmd("git", ["-C", source, "pull", "--ff-only", "origin", branch], stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, status} -> {:error, {:source_checkout_pull_failed, status, output}}
     end
   end
 
