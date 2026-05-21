@@ -1278,6 +1278,54 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, retry_window_started_at_ms, 9_000, 10_500)
   end
 
+  test "reported agent runner failures schedule retry without task crash" do
+    issue_id = "issue-runner-failed"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :ReportedRunnerFailureOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "#79",
+      issue: %Issue{id: issue_id, identifier: "#79", state: "Todo"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    retry_window_started_at_ms = System.monotonic_time(:millisecond)
+    reason = {:source_checkout_dirty, " M apps/web/src/lib/landing.ts\n"}
+
+    send(pid, {:agent_run_failed, issue_id, reason})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+
+    assert %{
+             attempt: 1,
+             due_at_ms: due_at_ms,
+             identifier: "#79",
+             error: "agent run failed: {:source_checkout_dirty, \" M apps/web/src/lib/landing.ts\\n\"}"
+           } = state.retry_attempts[issue_id]
+
+    assert_due_in_range(due_at_ms, retry_window_started_at_ms, 9_000, 10_500)
+  end
+
   test "stale retry timer messages do not consume newer retry entries" do
     issue_id = "issue-stale-retry"
     orchestrator_name = Module.concat(__MODULE__, :StaleRetryOrchestrator)
@@ -2026,6 +2074,11 @@ defmodule SymphonyElixir.CoreTest do
       assert_raise RuntimeError, ~r/workspace_prepare_failed/, fn ->
         AgentRunner.run(issue, nil, worker_host: "worker-a")
       end
+
+      assert {:error, {:workspace_prepare_failed, "worker-a", 75, output}} =
+               AgentRunner.run(issue, nil, worker_host: "worker-a", raise_on_error: false)
+
+      assert output =~ "worker-a prepare failed"
 
       trace = File.read!(trace_file)
       assert trace =~ "worker-a bash -lc"

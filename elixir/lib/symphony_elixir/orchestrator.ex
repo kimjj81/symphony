@@ -187,6 +187,40 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_info({:agent_run_failed, issue_id, reason}, state) when is_binary(issue_id) do
+    case Map.has_key?(state.running, issue_id) do
+      false ->
+        {:noreply, state}
+
+      true ->
+        {running_entry, state} = pop_running_entry(state, issue_id)
+        state = record_session_completion_totals(state, running_entry)
+        session_id = running_entry_session_id(running_entry)
+        ref = Map.get(running_entry, :ref)
+
+        if is_reference(ref) do
+          Process.demonitor(ref, [:flush])
+        end
+
+        Logger.warning("Agent run failed for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+
+        next_attempt = next_retry_attempt_from_running(running_entry)
+
+        state =
+          schedule_issue_retry(state, issue_id, next_attempt, %{
+            identifier: running_entry.identifier,
+            error: "agent run failed: #{inspect(reason)}",
+            worker_host: Map.get(running_entry, :worker_host),
+            workspace_path: Map.get(running_entry, :workspace_path)
+          })
+
+        Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
+
+        notify_dashboard()
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:worker_runtime_info, issue_id, runtime_info}, %{running: running} = state)
       when is_binary(issue_id) and is_map(runtime_info) do
     case Map.get(running, issue_id) do
@@ -1029,7 +1063,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           run_agent_for_orchestrator(issue, recipient, attempt, worker_host)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -1077,6 +1111,17 @@ defmodule SymphonyElixir.Orchestrator do
           error: "failed to spawn agent: #{inspect(reason)}",
           worker_host: worker_host
         })
+    end
+  end
+
+  defp run_agent_for_orchestrator(issue, recipient, attempt, worker_host) do
+    case AgentRunner.run(issue, recipient,
+           attempt: attempt,
+           worker_host: worker_host,
+           raise_on_error: false
+         ) do
+      :ok -> :ok
+      {:error, reason} -> send(recipient, {:agent_run_failed, issue.id, reason})
     end
   end
 
