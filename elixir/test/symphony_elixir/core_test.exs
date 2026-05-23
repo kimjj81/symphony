@@ -202,7 +202,9 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "The goal is a scope guard, not permission to expand work"
     assert prompt =~ "Planned or Rework PR goal"
     assert prompt =~ "do not create, modify, commit, or push repository files"
-    assert prompt =~ "Create or reuse a PR without creating a source-issue worktree"
+    assert prompt =~ "Create or reuse PR-sized implementation pull request(s)"
+    assert prompt =~ "do not create a single catch-all implementation PR"
+    assert prompt =~ "PR 진행 방식: 병렬"
     assert prompt =~ "prefix the child PR title with the parent PR number"
     assert prompt =~ "PR #<parent>: <child PR title>"
   end

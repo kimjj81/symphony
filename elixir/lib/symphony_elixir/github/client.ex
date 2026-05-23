@@ -101,18 +101,7 @@ defmodule SymphonyElixir.GitHub.Client do
   def create_pull_request_for_issue(%Issue{kind: :issue} = issue) do
     case parse_issue_id(issue.id) do
       {:ok, number, :issue} ->
-        branch = issue_pull_request_branch(number)
-
-        case fetch_open_pull_request_for_branch(branch) do
-          {:ok, %Issue{} = pull_request} ->
-            {:ok, pull_request}
-
-          {:ok, nil} ->
-            create_issue_pull_request(issue, number, branch)
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        create_issue_pull_requests(issue, issue_pull_request_specs(number, issue))
 
       {:ok, _number, kind} ->
         {:error, {:unsupported_github_issue_kind, kind}}
@@ -392,16 +381,44 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp create_issue_pull_request(issue, number, branch) do
+  defp create_issue_pull_requests(issue, specs) when is_list(specs) and specs != [] do
+    specs
+    |> Enum.reduce_while({:ok, []}, fn spec, {:ok, acc} ->
+      case fetch_or_create_issue_pull_request(issue, spec) do
+        {:ok, %Issue{} = pull_request} -> {:cont, {:ok, [pull_request | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, pull_requests} when pull_requests != [] -> {:ok, pull_requests |> Enum.reverse() |> List.first()}
+      {:ok, []} -> {:error, :github_pull_request_creation_failed}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fetch_or_create_issue_pull_request(issue, %{branch: branch} = spec) do
+    case fetch_open_pull_request_for_branch(branch) do
+      {:ok, %Issue{} = pull_request} ->
+        {:ok, pull_request}
+
+      {:ok, nil} ->
+        create_issue_pull_request(issue, spec)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp create_issue_pull_request(issue, %{number: number, branch: branch} = spec) do
     with {:ok, base_branch} <- pull_request_base_branch(),
          {:ok, _branch_sha} <- ensure_issue_pull_request_branch(issue, number, branch, base_branch),
          {:ok, raw_pull_request} <-
            request(:post, "/pulls",
              json: %{
-               title: issue_pull_request_title(number, issue),
+               title: issue_pull_request_title(issue, spec),
                head: branch,
                base: base_branch,
-               body: issue_pull_request_body(number, issue),
+               body: issue_pull_request_body(issue, spec),
                draft: false
              }
            ),
@@ -531,9 +548,77 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  defp issue_pull_request_specs(number, %Issue{} = issue) when is_integer(number) do
+    sections = issue_pr_sections(issue.description || "")
+
+    if length(sections) >= 2 do
+      all_specs =
+        Enum.map(sections, fn section ->
+          %{
+            number: number,
+            branch: "symphony/_#{number}-pr#{section.number}",
+            split?: true,
+            section: section,
+            followups: Enum.reject(sections, &(&1.number == section.number))
+          }
+        end)
+
+      if parallel_pr_plan?(issue.description || "") do
+        all_specs
+      else
+        [List.first(all_specs)]
+      end
+    else
+      [
+        %{
+          number: number,
+          branch: issue_pull_request_branch(number),
+          split?: false,
+          section: nil,
+          followups: []
+        }
+      ]
+    end
+  end
+
   defp issue_pull_request_branch(number) when is_integer(number), do: "symphony/_#{number}"
 
-  defp issue_pull_request_title(number, %Issue{title: title}) do
+  defp issue_pr_sections(description) when is_binary(description) do
+    regex = ~r/^###\s*PR\s*(\d+)\s*[:：.\-–—]?\s*(.*?)\s*$/im
+    matches = Regex.scan(regex, description, return: :index)
+
+    matches
+    |> Enum.with_index()
+    |> Enum.map(fn {[{start, length}, {number_start, number_length}, {title_start, title_length}], index} ->
+      body_start = start + length
+      body_end = next_match_start(matches, index, byte_size(description))
+
+      %{
+        number: description |> binary_part(number_start, number_length) |> String.to_integer(),
+        title: description |> binary_part(title_start, title_length) |> String.trim(),
+        body: description |> binary_part(body_start, body_end - body_start) |> String.trim()
+      }
+    end)
+    |> Enum.filter(&(&1.title != "" or &1.body != ""))
+  end
+
+  defp next_match_start(matches, index, fallback) do
+    case Enum.at(matches, index + 1) do
+      [{start, _length} | _captures] -> start
+      _ -> fallback
+    end
+  end
+
+  defp parallel_pr_plan?(description) when is_binary(description) do
+    Regex.match?(~r/(PR\s*진행\s*방식|실행\s*방식|execution\s*mode)\s*[:：-]?\s*(병렬|parallel)/iu, description)
+  end
+
+  defp issue_pull_request_title(%Issue{}, %{split?: true, number: number, section: section}) do
+    section_title = section_title(section)
+    truncate_text("Issue ##{number} PR#{section.number}: #{section_title}", 250)
+  end
+
+  defp issue_pull_request_title(%Issue{title: title}, %{number: number}) do
     title =
       case title do
         value when is_binary(value) ->
@@ -547,7 +632,30 @@ defmodule SymphonyElixir.GitHub.Client do
     truncate_text("Issue ##{number}: #{title}", 250)
   end
 
-  defp issue_pull_request_body(number, %Issue{} = issue) do
+  defp issue_pull_request_body(%Issue{} = issue, %{split?: true, number: number, section: section, followups: followups}) do
+    issue_url = issue.url || "##{number}"
+    followup_text = followup_pr_text(followups)
+
+    """
+    ## 작업 소스
+
+    - 원본 이슈: #{issue_url}
+    - 연결 이슈 정리: Refs ##{number}
+    - 분할 PR: PR#{section.number} / #{length(followups) + 1}
+    - 이 PR은 `sym:planned` 이슈의 PR-sized 섹션에서 자동 생성되었습니다.
+    - 실제 구현은 이 PR lane의 `sym:planned` 실행에서 진행합니다.
+
+    ## 이번 PR 범위
+
+    ### PR#{section.number}: #{section_title(section)}
+
+    #{section.body}
+
+    #{followup_text}
+    """
+  end
+
+  defp issue_pull_request_body(%Issue{} = issue, %{number: number}) do
     issue_url = issue.url || "##{number}"
     description = issue.description || ""
 
@@ -563,6 +671,26 @@ defmodule SymphonyElixir.GitHub.Client do
 
     #{description}
     """
+  end
+
+  defp section_title(%{number: number, title: title}) when is_binary(title) do
+    title = String.trim(title)
+    if title == "", do: "PR#{number}", else: title
+  end
+
+  defp followup_pr_text([]), do: "## 후속 PR\n\n없음"
+
+  defp followup_pr_text(followups) do
+    items =
+      followups
+      |> Enum.map_join("\n", fn section -> "- PR#{section.number}: #{section_title(section)}" end)
+
+    """
+    ## 후속 PR
+
+    #{items}
+    """
+    |> String.trim()
   end
 
   defp truncate_text(value, max_length) when is_binary(value) and is_integer(max_length) do

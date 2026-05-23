@@ -198,6 +198,227 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert pull_request_json.draft == false
   end
 
+  test "creates only the first split pull request for a sequential planned GitHub issue" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil,
+      workspace_base_ref: "origin/main"
+    )
+
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      params = Keyword.get(opts, :params)
+      json = Keyword.get(opts, :json)
+
+      send(test_pid, {:github_request, method, path, params, json})
+
+      case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/pulls"} ->
+          assert params == %{state: "open", head: "studiojin-dev:symphony/_84-pr1", per_page: 1}
+          github_response(200, [])
+
+        {:get, "/repos/studiojin-dev/myven/git/ref/heads/symphony/_84-pr1"} ->
+          github_response(404, %{"message" => "Not Found"})
+
+        {:get, "/repos/studiojin-dev/myven/git/ref/heads/main"} ->
+          github_response(200, %{"object" => %{"sha" => "base-sha"}})
+
+        {:get, "/repos/studiojin-dev/myven/git/commits/base-sha"} ->
+          github_response(200, %{"tree" => %{"sha" => "tree-sha"}})
+
+        {:post, "/repos/studiojin-dev/myven/git/commits"} ->
+          github_response(201, %{"sha" => "empty-sha"})
+
+        {:post, "/repos/studiojin-dev/myven/git/refs"} ->
+          assert json == %{ref: "refs/heads/symphony/_84-pr1", sha: "empty-sha"}
+          github_response(201, %{"ref" => "refs/heads/symphony/_84-pr1", "object" => %{"sha" => "empty-sha"}})
+
+        {:post, "/repos/studiojin-dev/myven/pulls"} ->
+          assert json.head == "symphony/_84-pr1"
+          assert json.base == "main"
+          assert json.title == "Issue #84 PR1: 사용자 비밀번호 재설정 흐름 완성"
+          assert json.body =~ "Refs #84"
+          refute json.body =~ "Closes #84"
+          assert json.body =~ "### PR1: 사용자 비밀번호 재설정 흐름 완성"
+          assert json.body =~ "로그인/회원가입 링크와 Mailpit E2E를 추가한다."
+          assert json.body =~ "- PR2: operator 비밀번호 찾기 상태 조회"
+          refute json.body =~ "operator 목록과 API를 추가한다."
+
+          github_response(201, %{"number" => 89})
+
+        {:get, "/repos/studiojin-dev/myven/issues/89"} ->
+          issue_fetch_count = Process.get(:github_client_test_issue_89_fetch_count, 0) + 1
+          Process.put(:github_client_test_issue_89_fetch_count, issue_fetch_count)
+
+          labels =
+            if issue_fetch_count == 1 do
+              []
+            else
+              [%{"name" => "sym:planned"}]
+            end
+
+          github_response(200, raw_pull_request_issue(89, labels))
+
+        {:get, "/repos/studiojin-dev/myven/labels/sym%3Aplanned"} ->
+          github_response(200, %{"name" => "sym:planned"})
+
+        {:post, "/repos/studiojin-dev/myven/issues/89/labels"} ->
+          assert json == %{labels: ["sym:planned"]}
+          github_response(200, [%{"name" => "sym:planned"}])
+
+        {:get, "/repos/studiojin-dev/myven/pulls/89"} ->
+          github_response(200, %{"head" => %{"ref" => "symphony/_84-pr1"}, "merged" => false})
+      end
+    end)
+
+    issue = %Issue{
+      id: "github:issue:84",
+      identifier: "#84",
+      title: "비밀번호 재설정 흐름 완성",
+      description: """
+      ## PR 진행 계획
+
+      ### PR1: 사용자 비밀번호 재설정 흐름 완성
+
+      로그인/회원가입 링크와 Mailpit E2E를 추가한다.
+
+      ### PR2: operator 비밀번호 찾기 상태 조회
+
+      operator 목록과 API를 추가한다.
+      """,
+      state: "Planned",
+      kind: :issue,
+      url: "https://github.com/studiojin-dev/myven/issues/84"
+    }
+
+    assert {:ok, pull_request} = Client.create_pull_request_for_issue(issue)
+    assert pull_request.id == "github:pr:89"
+    assert pull_request.branch_name == "symphony/_84-pr1"
+
+    refute_receive {:github_request, :get, "/repos/studiojin-dev/myven/git/ref/heads/symphony/_84-pr2", _, _}
+  end
+
+  test "creates all split pull requests when the planned GitHub issue explicitly marks parallel execution" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil,
+      workspace_base_ref: "origin/main"
+    )
+
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      params = Keyword.get(opts, :params)
+      json = Keyword.get(opts, :json)
+
+      send(test_pid, {:github_request, method, path, params, json})
+
+      case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/pulls"} ->
+          assert params in [
+                   %{state: "open", head: "studiojin-dev:symphony/_91-pr1", per_page: 1},
+                   %{state: "open", head: "studiojin-dev:symphony/_91-pr2", per_page: 1}
+                 ]
+
+          github_response(200, [])
+
+        {:get, "/repos/studiojin-dev/myven/git/ref/heads/symphony/_91-pr1"} ->
+          github_response(404, %{"message" => "Not Found"})
+
+        {:get, "/repos/studiojin-dev/myven/git/ref/heads/symphony/_91-pr2"} ->
+          github_response(404, %{"message" => "Not Found"})
+
+        {:get, "/repos/studiojin-dev/myven/git/ref/heads/main"} ->
+          github_response(200, %{"object" => %{"sha" => "base-sha"}})
+
+        {:get, "/repos/studiojin-dev/myven/git/commits/base-sha"} ->
+          github_response(200, %{"tree" => %{"sha" => "tree-sha"}})
+
+        {:post, "/repos/studiojin-dev/myven/git/commits"} ->
+          github_response(201, %{"sha" => "empty-sha-#{System.unique_integer([:positive])}"})
+
+        {:post, "/repos/studiojin-dev/myven/git/refs"} ->
+          assert json.ref in ["refs/heads/symphony/_91-pr1", "refs/heads/symphony/_91-pr2"]
+          github_response(201, %{"ref" => json.ref, "object" => %{"sha" => json.sha}})
+
+        {:post, "/repos/studiojin-dev/myven/pulls"} ->
+          pull_number =
+            case json.head do
+              "symphony/_91-pr1" ->
+                assert json.title == "Issue #91 PR1: 독립 API 테스트"
+                90
+
+              "symphony/_91-pr2" ->
+                assert json.title == "Issue #91 PR2: 독립 UI 스모크"
+                91
+            end
+
+          assert json.body =~ "Refs #91"
+          refute json.body =~ "Closes #91"
+          github_response(201, %{"number" => pull_number})
+
+        {:get, "/repos/studiojin-dev/myven/issues/" <> pull_number_text} ->
+          github_response(200, raw_pull_request_issue(String.to_integer(pull_number_text), [%{"name" => "sym:planned"}]))
+
+        {:get, "/repos/studiojin-dev/myven/labels/sym%3Aplanned"} ->
+          github_response(200, %{"name" => "sym:planned"})
+
+        {:delete, "/repos/studiojin-dev/myven/issues/" <> label_path} ->
+          assert String.ends_with?(label_path, "/labels/sym%3Aplanned")
+          github_response(200, %{})
+
+        {:post, "/repos/studiojin-dev/myven/issues/" <> pull_label_path} ->
+          assert String.ends_with?(pull_label_path, "/labels")
+          github_response(200, [%{"name" => "sym:planned"}])
+
+        {:get, "/repos/studiojin-dev/myven/pulls/90"} ->
+          github_response(200, %{"head" => %{"ref" => "symphony/_91-pr1"}, "merged" => false})
+
+        {:get, "/repos/studiojin-dev/myven/pulls/91"} ->
+          github_response(200, %{"head" => %{"ref" => "symphony/_91-pr2"}, "merged" => false})
+      end
+    end)
+
+    issue = %Issue{
+      id: "github:issue:91",
+      identifier: "#91",
+      title: "병렬 분할 작업",
+      description: """
+      PR 진행 방식: 병렬
+
+      ### PR1: 독립 API 테스트
+
+      API 테스트를 추가한다.
+
+      ### PR2: 독립 UI 스모크
+
+      UI 스모크를 추가한다.
+      """,
+      state: "Planned",
+      kind: :issue,
+      url: "https://github.com/studiojin-dev/myven/issues/91"
+    }
+
+    assert {:ok, pull_request} = Client.create_pull_request_for_issue(issue)
+    assert pull_request.id == "github:pr:90"
+
+    assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/pulls", nil, %{head: "symphony/_91-pr1"}}
+    assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/pulls", nil, %{head: "symphony/_91-pr2"}}
+  end
+
   test "skips GitHub issues without Symphony state labels" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",
