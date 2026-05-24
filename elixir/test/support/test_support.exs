@@ -121,6 +121,7 @@ defmodule SymphonyElixir.TestSupport do
           dispatch_kinds: ["issue", "pull_request"],
           source_checkout_states: [],
           codex_command: "codex app-server",
+          codex_task_profiles: nil,
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
           codex_turn_sandbox_policy: nil,
@@ -173,6 +174,7 @@ defmodule SymphonyElixir.TestSupport do
     dispatch_kinds = Keyword.get(config, :dispatch_kinds)
     source_checkout_states = Keyword.get(config, :source_checkout_states)
     codex_command = Keyword.get(config, :codex_command)
+    codex_task_profiles = Keyword.get(config, :codex_task_profiles)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
     codex_turn_sandbox_policy = Keyword.get(config, :codex_turn_sandbox_policy)
@@ -232,6 +234,7 @@ defmodule SymphonyElixir.TestSupport do
         "  source_checkout_states: #{yaml_value(source_checkout_states)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
+        "  task_profiles: #{yaml_value(codex_task_profiles)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
         "  thread_sandbox: #{yaml_value(codex_thread_sandbox)}",
         "  turn_sandbox_policy: #{yaml_value(codex_turn_sandbox_policy)}",

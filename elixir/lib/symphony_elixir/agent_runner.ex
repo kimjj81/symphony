@@ -5,6 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.Codex.TaskClassifier
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
@@ -130,8 +131,23 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, app_server_opts) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    task_profile = select_codex_task_profile(issue)
 
-    with {:ok, session} <- AppServer.start_session(workspace, Keyword.put(app_server_opts, :worker_host, worker_host)) do
+    Logger.info([
+      "Selected Codex task profile for #{issue_context(issue)}",
+      " task_type=#{task_profile.task_type}",
+      " model=#{task_profile.model}",
+      " effort=#{task_profile.effort}"
+    ])
+
+    app_server_opts =
+      app_server_opts
+      |> Keyword.put(:worker_host, worker_host)
+      |> Keyword.put(:codex_command, task_profile.command)
+
+    opts = Keyword.put(opts, :codex_task_profile, task_profile)
+
+    with {:ok, session} <- AppServer.start_session(workspace, app_server_opts) do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
@@ -140,15 +156,27 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    task_profile = Keyword.fetch!(opts, :codex_task_profile)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: codex_message_handler(codex_update_recipient, issue),
+             model: task_profile.model,
+             effort: task_profile.effort
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
@@ -179,6 +207,20 @@ defmodule SymphonyElixir.AgentRunner do
           {:error, reason}
       end
     end
+  end
+
+  defp select_codex_task_profile(issue) do
+    settings = Config.settings!()
+    task_type = TaskClassifier.classify(issue)
+    profiles = settings.codex.task_profiles
+    profile = Map.get(profiles, task_type) || Map.fetch!(profiles, "default")
+
+    %{
+      task_type: task_type,
+      command: Map.fetch!(profile, "command"),
+      model: Map.fetch!(profile, "model"),
+      effort: Map.fetch!(profile, "effort")
+    }
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)

@@ -185,9 +185,23 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    @default_model "gpt-5.5"
+    @default_command "codex app-server"
+    @task_profile_defaults %{
+      "single_file_edit" => %{"model" => @default_model, "effort" => "low"},
+      "bug_with_test_log" => %{"model" => @default_model, "effort" => "medium"},
+      "unknown_bug" => %{"model" => @default_model, "effort" => "high"},
+      "multi_file_refactor" => %{"model" => @default_model, "effort" => "high"},
+      "feature_without_tests" => %{"model" => @default_model, "effort" => "xhigh"},
+      "default" => %{"model" => @default_model, "effort" => "medium"}
+    }
+    @task_profile_keys Map.keys(@task_profile_defaults)
+    @reasoning_efforts ~w(none minimal low medium high xhigh)
+
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
+      field(:task_profiles, :map)
 
       field(:approval_policy, StringOrMap,
         default: %{
@@ -215,6 +229,7 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :command,
+          :task_profiles,
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
@@ -227,11 +242,117 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_required([:command])
+      |> validate_task_profiles()
       |> validate_string_list(:auto_approve_command_patterns)
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
     end
+
+    @spec default_task_profiles(String.t() | nil) :: map()
+    def default_task_profiles(command \\ @default_command) do
+      command = if is_binary(command), do: command, else: @default_command
+
+      Map.new(@task_profile_defaults, fn {profile_key, profile} ->
+        {profile_key, Map.put(profile, "command", command)}
+      end)
+    end
+
+    @spec resolve_task_profiles(map() | nil, String.t() | nil) :: map()
+    def resolve_task_profiles(profiles, command) do
+      defaults = default_task_profiles(command)
+
+      profiles
+      |> normalize_task_profiles()
+      |> Enum.reduce(defaults, fn {profile_key, profile}, resolved ->
+        Map.update!(resolved, profile_key, &Map.merge(&1, profile))
+      end)
+    end
+
+    defp validate_task_profiles(changeset) do
+      validate_change(changeset, :task_profiles, fn :task_profiles, profiles ->
+        profiles
+        |> normalize_task_profiles()
+        |> validate_profile_entries()
+      end)
+    end
+
+    defp validate_profile_entries(profiles) do
+      Enum.flat_map(profiles, fn {profile_key, profile} ->
+        cond do
+          profile_key not in @task_profile_keys ->
+            [task_profiles: "contains unsupported profile #{profile_key}"]
+
+          not is_map(profile) ->
+            [task_profiles: "profile #{profile_key} must be a map"]
+
+          true ->
+            validate_profile_entry(profile_key, profile)
+        end
+      end)
+    end
+
+    defp validate_profile_entry(profile_key, profile) do
+      []
+      |> validate_profile_command(profile_key, Map.get(profile, "command"))
+      |> validate_profile_model(profile_key, Map.get(profile, "model"))
+      |> validate_profile_effort(profile_key, Map.get(profile, "effort"))
+    end
+
+    defp validate_profile_command(errors, _profile_key, nil), do: errors
+
+    defp validate_profile_command(errors, profile_key, command)
+         when is_binary(command) do
+      if String.trim(command) == "" do
+        [{:task_profiles, "profile #{profile_key} command can't be blank"} | errors]
+      else
+        errors
+      end
+    end
+
+    defp validate_profile_command(errors, profile_key, _command) do
+      [{:task_profiles, "profile #{profile_key} command must be a string"} | errors]
+    end
+
+    defp validate_profile_model(errors, _profile_key, nil), do: errors
+
+    defp validate_profile_model(errors, _profile_key, @default_model), do: errors
+
+    defp validate_profile_model(errors, profile_key, model) when is_binary(model) do
+      [{:task_profiles, "profile #{profile_key} model must be #{@default_model}, got #{model}"} | errors]
+    end
+
+    defp validate_profile_model(errors, profile_key, _model) do
+      [{:task_profiles, "profile #{profile_key} model must be a string"} | errors]
+    end
+
+    defp validate_profile_effort(errors, _profile_key, nil), do: errors
+
+    defp validate_profile_effort(errors, profile_key, effort) when is_binary(effort) do
+      if effort in @reasoning_efforts do
+        errors
+      else
+        [{:task_profiles, "profile #{profile_key} effort must be one of #{Enum.join(@reasoning_efforts, "|")}"} | errors]
+      end
+    end
+
+    defp validate_profile_effort(errors, profile_key, _effort) do
+      [{:task_profiles, "profile #{profile_key} effort must be a string"} | errors]
+    end
+
+    defp normalize_task_profiles(nil), do: %{}
+
+    defp normalize_task_profiles(profiles) when is_map(profiles) do
+      Map.new(profiles, fn {profile_key, profile} ->
+        {to_string(profile_key), normalize_profile(profile)}
+      end)
+    end
+
+    defp normalize_profile(profile) when is_map(profile) do
+      Map.new(profile, fn {key, value} -> {to_string(key), value} end)
+    end
+
+    defp normalize_profile(profile), do: profile
 
     defp validate_string_list(changeset, field) do
       validate_change(changeset, field, fn ^field, values ->
@@ -562,7 +683,8 @@ defmodule SymphonyElixir.Config.Schema do
     codex = %{
       settings.codex
       | approval_policy: normalize_keys(settings.codex.approval_policy),
-        turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
+        turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy),
+        task_profiles: Codex.resolve_task_profiles(settings.codex.task_profiles, settings.codex.command)
     }
 
     notifications = resolve_notifications(settings.notifications)

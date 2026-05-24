@@ -219,6 +219,31 @@ agent:
     - Todo
 codex:
   command: codex app-server
+  task_profiles:
+    single_file_edit:
+      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=low app-server
+      model: gpt-5.5
+      effort: low
+    bug_with_test_log:
+      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=medium app-server
+      model: gpt-5.5
+      effort: medium
+    unknown_bug:
+      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=high app-server
+      model: gpt-5.5
+      effort: high
+    multi_file_refactor:
+      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=high app-server
+      model: gpt-5.5
+      effort: high
+    feature_without_tests:
+      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
+      model: gpt-5.5
+      effort: xhigh
+    default:
+      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=medium app-server
+      model: gpt-5.5
+      effort: medium
   approval_policy: on-request
   auto_approve_command_patterns:
     - pnpm e2e
@@ -271,6 +296,15 @@ Tracker context:
 Description:
 {% if issue.description %}{{ issue.description }}{% else %}No description provided.{% endif %}
 
+Reasoning profile policy:
+| 작업 유형 | 기본 정책 |
+| --- | --- |
+| 명확한 단일 파일 수정 | 짧은 reasoning: `gpt-5.5` + `low` effort |
+| 테스트 실패 로그가 있는 버그 | 중간 reasoning: `gpt-5.5` + `medium` effort, 테스트 로그 포함 |
+| 원인 불명 버그 | 긴 reasoning: `gpt-5.5` + `high` effort, 먼저 진단 계획 |
+| 다중 파일 리팩터 | 긴 reasoning: `gpt-5.5` + `high` effort, plan 먼저 + patch 나중 |
+| 테스트가 없는 기능 추가 | 강한 reasoning: `gpt-5.5` + `xhigh` effort, 테스트 설계 먼저 |
+
 Instructions:
 1. GitHub Todo issues are planning-only Codex runs. Implementation work belongs to pull request lanes; when a GitHub issue enters Planned, Symphony's control path may create or reuse a PR for that issue without implementing in the source issue lane.
 2. Keep changes scoped and minimal.
@@ -312,6 +346,7 @@ Instructions:
 22. If this item is a GitHub issue in Rework and it has an open linked pull request, do not implement or review in the issue lane. Keep or move the issue to Human Review, add a Korean comment pointing to the linked PR and its current rework status, then stop. If there is no open linked pull request, treat it as issue-only Rework: read the latest issue comments first, clarify the requested issue-level follow-up in a Korean issue comment, and move the issue to Human Review unless a human explicitly applies Planned.
 23. Human Review is a review-retention state, not a cleanup state. Do not delete or recreate the generated PR workspace while a PR is in Human Review; the same directory must remain available for manual re-review and later Rework.
 24. If this item is in Merging, treat it as approved merge work. Use the existing generated workspace and current PR branch, verify the PR is mergeable, follow repository merge instructions, and move the item to Done only after the merge succeeds.
+   - Before merging, inspect the code changed by this PR for user-facing text that bypasses the repository's i18n/localization path. If untranslated literals or missing locale entries are found, add the required translations and focused i18n verification in the PR branch before merging.
 25. Cleanup is allowed only after a true final state: Done, Canceled, or Duplicate.
 26. For GitHub issues, terminal state labels must match the GitHub open/closed state: `sym:done` closes as completed, and `sym:canceled` or `sym:duplicate` close as not planned. Moving an issue back to a non-terminal Symphony label should reopen it.
 27. Do not continue working after moving the item to Human Review.

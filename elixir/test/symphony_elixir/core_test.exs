@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Config.Schema.Codex, as: CodexConfig
+
   defmodule PlannedIssueGitHubClient do
     def fetch_issue_states_by_ids(["github:issue:42"]) do
       {:ok,
@@ -54,6 +56,20 @@ defmodule SymphonyElixir.CoreTest do
     assert config.agent.source_checkout_states == []
     assert config.codex.auto_approve_requests == nil
     assert config.codex.auto_approve_command_patterns == []
+
+    assert config.codex.task_profiles["single_file_edit"] == %{
+             "command" => "codex app-server",
+             "model" => "gpt-5.5",
+             "effort" => "low"
+           }
+
+    assert config.codex.task_profiles["default"]["effort"] == "medium"
+
+    assert CodexConfig.default_task_profiles()["feature_without_tests"] == %{
+             "command" => "codex app-server",
+             "model" => "gpt-5.5",
+             "effort" => "xhigh"
+           }
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -149,8 +165,63 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.auto_approve_command_patterns"
 
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_task_profiles: %{default: %{model: "gpt-5.5", effort: "extreme"}}
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.task_profiles"
+    assert message =~ "effort must be one of"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_task_profiles: %{default: %{command: "codex app-server"}}
+    )
+
+    assert Config.settings!().codex.task_profiles["default"] == %{
+             "command" => "codex app-server",
+             "model" => "gpt-5.5",
+             "effort" => "medium"
+           }
+
+    invalid_task_profile_cases = [
+      {%{unsupported: %{model: "gpt-5.5", effort: "medium"}}, "contains unsupported profile unsupported"},
+      {%{default: "bad"}, "profile default must be a map"},
+      {%{default: %{command: " ", model: "gpt-5.5", effort: "medium"}}, "profile default command can't be blank"},
+      {%{default: %{command: 123, model: "gpt-5.5", effort: "medium"}}, "profile default command must be a string"},
+      {%{default: %{model: "gpt-4.1", effort: "medium"}}, "profile default model must be gpt-5.5"},
+      {%{default: %{model: 123, effort: "medium"}}, "profile default model must be a string"},
+      {%{default: %{model: "gpt-5.5", effort: 123}}, "profile default effort must be a string"}
+    ]
+
+    Enum.each(invalid_task_profile_cases, fn {task_profiles, expected_message} ->
+      write_workflow_file!(Workflow.workflow_file_path(), codex_task_profiles: task_profiles)
+      assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+      assert message =~ expected_message
+    end)
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "123")
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
+  end
+
+  test "WORKFLOW.myven task profile config is valid" do
+    workflow_path = Path.expand("WORKFLOW.myven.md", File.cwd!())
+
+    assert {:ok, %{config: config, prompt: prompt}} = Workflow.load(workflow_path)
+    assert {:ok, settings} = Config.Schema.parse(config)
+
+    assert settings.codex.task_profiles["single_file_edit"] == %{
+             "command" => "codex --config 'model=\"gpt-5.5\"' --config model_reasoning_effort=low app-server",
+             "model" => "gpt-5.5",
+             "effort" => "low"
+           }
+
+    assert settings.codex.task_profiles["bug_with_test_log"]["effort"] == "medium"
+    assert settings.codex.task_profiles["unknown_bug"]["effort"] == "high"
+    assert settings.codex.task_profiles["multi_file_refactor"]["effort"] == "high"
+    assert settings.codex.task_profiles["feature_without_tests"]["effort"] == "xhigh"
+    assert settings.codex.task_profiles["default"]["effort"] == "medium"
+    assert prompt =~ "Reasoning profile policy:"
+    assert prompt =~ "| 테스트가 없는 기능 추가 | 강한 reasoning"
   end
 
   test "current WORKFLOW.md file is valid and complete" do
@@ -2173,8 +2244,8 @@ defmodule SymphonyElixir.CoreTest do
            %Issue{
              id: "issue-continue",
              identifier: "MT-247",
-             title: "Continue until done",
-             description: "Still active after first turn",
+             title: "Add export feature",
+             description: "기능 추가 scope",
              state: state
            }
          ]}
@@ -2199,22 +2270,134 @@ defmodule SymphonyElixir.CoreTest do
       assert length(Enum.filter(lines, &String.starts_with?(&1, "RUN:"))) == 1
       assert length(Enum.filter(lines, &String.contains?(&1, "\"method\":\"thread/start\""))) == 1
 
-      turn_texts =
+      turn_payloads =
         lines
         |> Enum.filter(&String.starts_with?(&1, "JSON:"))
         |> Enum.map(&String.trim_leading(&1, "JSON:"))
         |> Enum.map(&Jason.decode!/1)
         |> Enum.filter(&(&1["method"] == "turn/start"))
+
+      turn_texts =
+        turn_payloads
         |> Enum.map(fn payload ->
           get_in(payload, ["params", "input"])
           |> Enum.map_join("\n", &Map.get(&1, "text", ""))
         end)
+
+      assert Enum.all?(turn_payloads, fn payload ->
+               get_in(payload, ["params", "model"]) == "gpt-5.5" &&
+                 get_in(payload, ["params", "effort"]) == "medium"
+             end)
 
       assert length(turn_texts) == 2
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner starts app server with selected task profile command" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-task-profile-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-task-profile.trace")
+
+      File.mkdir_p!(test_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-task-profile.trace}"
+      count=0
+      printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-profile"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-profile"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_task_profiles: %{
+          single_file_edit: %{
+            command: "#{codex_binary} --config model_reasoning_effort=low app-server",
+            model: "gpt-5.5",
+            effort: "low"
+          },
+          default: %{
+            command: "#{codex_binary} --config model_reasoning_effort=medium app-server",
+            model: "gpt-5.5",
+            effort: "medium"
+          }
+        }
+      )
+
+      issue = %Issue{
+        id: "issue-task-profile",
+        identifier: "MT-249",
+        title: "Update lib/symphony_elixir/codex/app_server.ex",
+        description: "A clear single file edit",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(issue, nil, issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end)
+
+      lines = File.read!(trace_file) |> String.split("\n", trim: true)
+      assert argv_line = Enum.find(lines, &String.starts_with?(&1, "ARGV:"))
+      assert String.contains?(argv_line, "model_reasoning_effort=low app-server")
+      refute String.contains?(argv_line, "model_reasoning_effort=medium")
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 line
+                 |> String.trim_leading("JSON:")
+                 |> Jason.decode!()
+                 |> then(fn payload ->
+                   payload["method"] == "turn/start" &&
+                     get_in(payload, ["params", "model"]) == "gpt-5.5" &&
+                     get_in(payload, ["params", "effort"]) == "low"
+                 end)
+               else
+                 false
+               end
+             end)
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
