@@ -419,6 +419,135 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/pulls", nil, %{head: "symphony/_91-pr2"}}
   end
 
+  test "syncs labeled issue webhook by keeping one Symphony state label" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/42/labels", github_response(200, [%{"name" => "sym:todo"}, %{"name" => "sym:planned"}, %{"name" => "enhancement"}])},
+      {:get, "/repos/studiojin-dev/myven/labels/sym%3Aplanned", github_response(200, %{"name" => "sym:planned"})},
+      {:delete, "/repos/studiojin-dev/myven/issues/42/labels/sym%3Atodo", github_response(200, %{})},
+      {:get, "/repos/studiojin-dev/myven/issues/42", github_response(200, %{"state" => "open", "state_reason" => nil})}
+    ])
+
+    assert :ok =
+             Client.sync_webhook_state("issues", "labeled", %{
+               "issue" => %{"number" => 42},
+               "label" => %{"name" => "sym:planned"}
+             })
+
+    assert_receive {:github_request, :get, "/repos/studiojin-dev/myven/issues/42/labels", %{per_page: 100}, nil}
+    assert_receive {:github_request, :get, "/repos/studiojin-dev/myven/labels/sym%3Aplanned", nil, nil}
+    assert_receive {:github_request, :delete, "/repos/studiojin-dev/myven/issues/42/labels/sym%3Atodo", nil, nil}
+    assert_receive {:github_request, :get, "/repos/studiojin-dev/myven/issues/42", nil, nil}
+    refute_receive {:github_request, :post, "/repos/studiojin-dev/myven/issues/42/labels", _, _}
+    assert_github_responses_consumed()
+  end
+
+  test "ignores stale labeled issue webhook when payload label is no longer present" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/43/labels", github_response(200, [%{"name" => "sym:todo"}])}
+    ])
+
+    assert :ok =
+             Client.sync_webhook_state("issues", "labeled", %{
+               "issue" => %{"number" => 43},
+               "label" => %{"name" => "sym:planned"}
+             })
+
+    assert_receive {:github_request, :get, "/repos/studiojin-dev/myven/issues/43/labels", %{per_page: 100}, nil}
+    assert_github_responses_consumed()
+  end
+
+  test "syncs terminal and reopen issue state from labeled issue webhooks" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    for {number, label, issue_state, issue_reason, expected_patch} <- [
+          {44, "sym:done", "open", nil, %{state: "closed", state_reason: "completed"}},
+          {45, "sym:canceled", "open", nil, %{state: "closed", state_reason: "not_planned"}},
+          {46, "sym:duplicate", "open", nil, %{state: "closed", state_reason: "not_planned"}},
+          {47, "sym:planned", "closed", "completed", %{state: "open"}}
+        ] do
+      patch_path = "/repos/studiojin-dev/myven/issues/#{number}"
+
+      stub_github_requests(self(), [
+        {:get, "/repos/studiojin-dev/myven/issues/#{number}/labels", github_response(200, [%{"name" => label}])},
+        {:get, "/repos/studiojin-dev/myven/labels/#{URI.encode_www_form(label)}", github_response(200, %{"name" => label})},
+        {:get, patch_path, github_response(200, %{"state" => issue_state, "state_reason" => issue_reason})},
+        {:patch, patch_path, github_response(200, %{})}
+      ])
+
+      assert :ok =
+               Client.sync_webhook_state("issues", "labeled", %{
+                 "issue" => %{"number" => number},
+                 "label" => %{"name" => label}
+               })
+
+      assert_receive {:github_request, :patch, ^patch_path, nil, ^expected_patch}
+      assert_github_responses_consumed()
+    end
+  end
+
+  test "syncs merged and closed pull request webhooks to terminal state labels" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    for {number, merged?, existing_labels, target_label, removed_label} <- [
+          {48, true, [%{"name" => "sym:merging"}], "sym:done", "sym:merging"},
+          {49, false, [], "sym:canceled", nil}
+        ] do
+      post_path = "/repos/studiojin-dev/myven/issues/#{number}/labels"
+
+      responses =
+        [
+          {:get, "/repos/studiojin-dev/myven/issues/#{number}/labels", github_response(200, existing_labels)},
+          {:get, "/repos/studiojin-dev/myven/labels/#{URI.encode_www_form(target_label)}", github_response(200, %{"name" => target_label})}
+        ] ++
+          if removed_label do
+            [
+              {:delete, "/repos/studiojin-dev/myven/issues/#{number}/labels/#{URI.encode_www_form(removed_label)}", github_response(200, %{})}
+            ]
+          else
+            []
+          end ++
+          [{:post, post_path, github_response(200, [%{"name" => target_label}])}]
+
+      stub_github_requests(self(), responses)
+
+      assert :ok =
+               Client.sync_webhook_state("pull_request", "closed", %{
+                 "pull_request" => %{"number" => number, "merged" => merged?}
+               })
+
+      assert_receive {:github_request, :post, ^post_path, nil, %{labels: [^target_label]}}
+      assert_github_responses_consumed()
+    end
+  end
+
   test "skips GitHub issues without Symphony state labels" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",
@@ -475,6 +604,35 @@ defmodule SymphonyElixir.GitHubClientTest do
   end
 
   defp github_response(status, body), do: {:ok, %Req.Response{status: status, body: body}}
+
+  defp stub_github_requests(test_pid, responses) do
+    Process.put(:github_client_test_responses, responses)
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      params = Keyword.get(opts, :params)
+      json = Keyword.get(opts, :json)
+
+      send(test_pid, {:github_request, method, path, params, json})
+
+      case Process.get(:github_client_test_responses, []) do
+        [{^method, ^path, response} | rest] ->
+          Process.put(:github_client_test_responses, rest)
+          response
+
+        [{expected_method, expected_path, _response} | _rest] ->
+          raise "unexpected GitHub request #{inspect({method, path})}, expected #{inspect({expected_method, expected_path})}"
+
+        [] ->
+          raise "unexpected GitHub request #{inspect({method, path})}"
+      end
+    end)
+  end
+
+  defp assert_github_responses_consumed do
+    assert Process.get(:github_client_test_responses, []) == []
+  end
 
   defp raw_pull_request_issue(number, labels) do
     %{

@@ -22,6 +22,9 @@ defmodule SymphonyElixir.GitHub.Adapter do
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name), do: client_module().update_issue_state(issue_id, state_name)
 
+  @spec sync_webhook_state(String.t(), String.t(), map()) :: :ok | {:error, term()}
+  def sync_webhook_state(event, action, payload), do: client_module().sync_webhook_state(event, action, payload)
+
   @spec create_pull_request_for_issue(term()) :: {:ok, term()} | {:error, term()}
   def create_pull_request_for_issue(issue), do: client_module().create_pull_request_for_issue(issue)
 

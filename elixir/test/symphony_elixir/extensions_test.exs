@@ -68,6 +68,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       :ok
     end
 
+    def sync_webhook_state(event, action, payload) do
+      send(self(), {:github_sync_webhook_state_called, event, action, payload})
+      :ok
+    end
+
     def create_pull_request_for_issue(issue) do
       send(self(), {:github_create_pull_request_for_issue_called, issue})
       {:ok, issue}
@@ -293,6 +298,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert_receive {:github_update_issue_state_called, "issue-1", "Done"}
+
+    assert :ok = GitHubAdapter.sync_webhook_state("issues", "labeled", %{"label" => %{"name" => "sym:todo"}})
+    assert_receive {:github_sync_webhook_state_called, "issues", "labeled", %{"label" => %{"name" => "sym:todo"}}}
 
     issue = %Issue{id: "github:issue:1", identifier: "#1", title: "Issue", state: "Planned", kind: :issue}
     assert {:ok, ^issue} = SymphonyElixir.Tracker.create_pull_request_for_issue(issue)
@@ -532,9 +540,42 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "github webhook queues targeted refresh for valid signed issue events" do
     secret = "github-webhook-secret"
 
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven"
+    )
+
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      params = Keyword.get(opts, :params)
+      json = Keyword.get(opts, :json)
+
+      send(test_pid, {:github_webhook_sync_request, method, path, params, json})
+
+      case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/issues/29/labels"} ->
+          github_response(200, [%{"name" => "sym:todo"}, %{"name" => "sym:planned"}])
+
+        {:get, "/repos/studiojin-dev/myven/labels/sym%3Aplanned"} ->
+          github_response(200, %{"name" => "sym:planned"})
+
+        {:delete, "/repos/studiojin-dev/myven/issues/29/labels/sym%3Atodo"} ->
+          github_response(200, %{})
+
+        {:get, "/repos/studiojin-dev/myven/issues/29"} ->
+          github_response(200, %{"state" => "open", "state_reason" => nil})
+      end
+    end)
+
     body =
       Jason.encode!(%{
         action: "labeled",
+        label: %{name: "sym:planned"},
         issue: %{
           number: 29,
           pull_request: %{url: "https://api.github.com/repos/studiojin-dev/myven/pulls/29"}
@@ -583,6 +624,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert_receive {:targeted_refresh, "github:pr:29"}, 200
     assert_receive {:webhook_follow_up_refresh, "github:pr:29"}, 200
+    assert_receive {:github_webhook_sync_request, :delete, "/repos/studiojin-dev/myven/issues/29/labels/sym%3Atodo", nil, nil}
   end
 
   test "github webhook rejects invalid signatures" do
@@ -919,6 +961,8 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     "sha256=" <> signature
   end
+
+  defp github_response(status, body), do: {:ok, %Req.Response{status: status, body: body}}
 
   defp static_snapshot do
     %{

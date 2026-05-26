@@ -80,6 +80,17 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  @spec sync_webhook_state(String.t(), String.t(), map()) :: :ok | {:error, term()}
+  def sync_webhook_state(event, action, payload)
+      when is_binary(event) and is_binary(action) and is_map(payload) do
+    case {event, action} do
+      {"issues", "labeled"} -> sync_labeled_webhook(:issue, payload)
+      {"pull_request", "labeled"} -> sync_labeled_webhook(:pull_request, payload)
+      {"pull_request", "closed"} -> sync_closed_pull_request_webhook(payload)
+      _ -> :ok
+    end
+  end
+
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) when is_binary(issue_id) and is_binary(state_name) do
     with {:ok, number, _kind} <- parse_issue_id(issue_id),
@@ -313,7 +324,107 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp fallback_closed_state(_raw_issue, _pull_data), do: nil
 
+  defp sync_labeled_webhook(_kind, %{"sender" => %{"login" => "github-actions[bot]"}}), do: :ok
+
+  defp sync_labeled_webhook(kind, payload) when kind in [:issue, :pull_request] do
+    label = get_in(payload, ["label", "name"])
+
+    with state_name when is_binary(state_name) <- state_for_label(label),
+         {:ok, number} <- webhook_issue_number(kind, payload),
+         {:ok, labels} <- current_labels(number) do
+      if label_present?(labels, label) do
+        with :ok <- set_state_label(number, label, labels, remove_target?: false) do
+          if kind == :issue, do: sync_issue_open_state(number, state_name), else: :ok
+        end
+      else
+        :ok
+      end
+    else
+      nil -> :ok
+      :skip -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp sync_closed_pull_request_webhook(payload) do
+    state_name = if get_in(payload, ["pull_request", "merged"]) == true, do: "Done", else: "Canceled"
+
+    with target_label when is_binary(target_label) <- label_for_state(state_name),
+         {:ok, number} <- webhook_issue_number(:pull_request, payload),
+         {:ok, labels} <- current_labels(number) do
+      set_state_label(number, target_label, labels, remove_target?: false)
+    else
+      nil -> :ok
+      :skip -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp sync_issue_open_state(number, state_name) do
+    with {:ok, issue} <- request(:get, "/issues/#{number}") do
+      case terminal_issue_state_reason(state_name) do
+        reason when is_binary(reason) ->
+          maybe_update_issue_open_state(issue, number, "closed", reason)
+
+        nil ->
+          if issue["state"] == "closed" do
+            update_issue(number, %{state: "open"})
+          else
+            :ok
+          end
+      end
+    end
+  end
+
+  defp maybe_update_issue_open_state(issue, number, target_state, state_reason) do
+    if issue["state"] == target_state and issue["state_reason"] == state_reason do
+      :ok
+    else
+      update_issue(number, %{state: target_state, state_reason: state_reason})
+    end
+  end
+
+  defp update_issue(number, json) when is_integer(number) and is_map(json) do
+    case request(:patch, "/issues/#{number}", json: json) do
+      {:ok, _body} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp set_state_label(number, target_label, current_labels, opts) do
+    remove_target? = Keyword.get(opts, :remove_target?, true)
+
+    with :ok <- ensure_label(target_label),
+         :ok <- remove_state_labels(number, current_labels, target_label, remove_target?),
+         :ok <- maybe_add_label(number, current_labels, target_label, remove_target?) do
+      :ok
+    end
+  end
+
+  defp maybe_add_label(number, current_labels, target_label, remove_target?) do
+    if remove_target? or not label_present?(current_labels, target_label) do
+      case request(:post, "/issues/#{number}/labels", json: %{labels: [target_label]}) do
+        {:ok, _body} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp current_labels(number) when is_integer(number) do
+    case request(:get, "/issues/#{number}/labels", params: %{per_page: 100}) do
+      {:ok, labels} when is_list(labels) -> {:ok, extract_labels(%{"labels" => labels})}
+      {:ok, _payload} -> {:error, :github_unexpected_labels_payload}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp remove_state_labels(number, current_labels) do
+    remove_state_labels(number, current_labels, nil, true)
+  end
+
+  defp remove_state_labels(number, current_labels, target_label, remove_target?) do
     state_label_set =
       state_label_map()
       |> Map.values()
@@ -321,7 +432,11 @@ defmodule SymphonyElixir.GitHub.Client do
       |> MapSet.new()
 
     current_labels
-    |> Enum.filter(fn label -> MapSet.member?(state_label_set, normalize_label(label)) end)
+    |> Enum.filter(fn label ->
+      state_label? = MapSet.member?(state_label_set, normalize_label(label))
+      target_label? = not is_nil(target_label) and normalize_label(label) == normalize_label(target_label)
+      state_label? and (remove_target? or not target_label?)
+    end)
     |> Enum.reduce_while(:ok, fn label, :ok ->
       case request(:delete, "/issues/#{number}/labels/#{URI.encode_www_form(label)}") do
         {:ok, _body} -> {:cont, :ok}
@@ -330,6 +445,42 @@ defmodule SymphonyElixir.GitHub.Client do
       end
     end)
   end
+
+  defp terminal_issue_state_reason(state_name) do
+    case normalize_state(state_name) do
+      "done" -> "completed"
+      state when state in ["canceled", "duplicate"] -> "not_planned"
+      _ -> nil
+    end
+  end
+
+  defp webhook_issue_number(:issue, payload) do
+    payload
+    |> get_in(["issue", "number"])
+    |> fallback_value(Map.get(payload, "number"))
+    |> normalize_github_number()
+  end
+
+  defp webhook_issue_number(:pull_request, payload) do
+    payload
+    |> get_in(["pull_request", "number"])
+    |> fallback_value(Map.get(payload, "number"))
+    |> normalize_github_number()
+  end
+
+  defp fallback_value(nil, fallback), do: fallback
+  defp fallback_value(value, _fallback), do: value
+
+  defp normalize_github_number(number) when is_integer(number) and number > 0, do: {:ok, number}
+
+  defp normalize_github_number(number) when is_binary(number) do
+    case Integer.parse(number) do
+      {parsed, ""} when parsed > 0 -> {:ok, parsed}
+      _ -> :skip
+    end
+  end
+
+  defp normalize_github_number(_number), do: :skip
 
   defp ensure_label(label) when is_binary(label) do
     case request(:get, "/labels/#{URI.encode_www_form(label)}") do
@@ -701,7 +852,7 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp request(method, path, opts \\ []) when method in [:get, :post, :delete] and is_binary(path) do
+  defp request(method, path, opts \\ []) when method in [:get, :post, :patch, :delete] and is_binary(path) do
     with {:ok, tracker} <- github_tracker_config(),
          {:ok, headers} <- github_headers(tracker) do
       request_opts =
@@ -793,6 +944,13 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp label_for_state(_state_name), do: nil
 
+  defp state_for_label(label) when is_binary(label) do
+    label_to_state_map()
+    |> Map.get(normalize_label(label))
+  end
+
+  defp state_for_label(_label), do: nil
+
   defp state_label_map do
     configured =
       Config.settings!().tracker.state_labels
@@ -876,6 +1034,13 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp normalize_label(value), do: value |> to_string() |> normalize_label()
+
+  defp label_present?(labels, target_label) when is_list(labels) and is_binary(target_label) do
+    target_label = normalize_label(target_label)
+    Enum.any?(labels, &(normalize_label(&1) == target_label))
+  end
+
+  defp label_present?(_labels, _target_label), do: false
 
   defp search_query_for_label(label) do
     tracker = Config.settings!().tracker

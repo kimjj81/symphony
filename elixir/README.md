@@ -205,7 +205,9 @@ codex:
   `/api/v1/github/webhook`.
 - `POST /api/v1/github/webhook` accepts GitHub `issues`, `pull_request`,
   `pull_request_review`, and `issue_comment` events. Set `SYMPHONY_GITHUB_WEBHOOK_SECRET` so
-  Symphony can verify `X-Hub-Signature-256` before queueing an immediate refresh.
+  Symphony can verify `X-Hub-Signature-256` before queueing an immediate refresh. For GitHub tracker
+  workflows, labeled and pull-request closed events also synchronize the configured Symphony state
+  labels before the refresh is queued.
 
 ## Web dashboard
 

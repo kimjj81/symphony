@@ -5,7 +5,11 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   use Phoenix.Controller, formats: [:json]
 
+  require Logger
+
   alias Plug.Conn
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub.Adapter, as: GitHubAdapter
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @github_webhook_events ~w(issues pull_request pull_request_review issue_comment)
@@ -48,9 +52,12 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
          :ok <- verify_github_signature(conn, secret) do
       event = conn |> header_value("x-github-event") |> to_string()
       action = params |> Map.get("action") |> to_string()
+      issue_id = github_webhook_issue_id(event, params)
+
+      sync_github_webhook_state(event, action, params, issue_id)
 
       if github_webhook_refresh_event?(event, action) do
-        github_webhook_refresh_response(conn, event, action, github_webhook_issue_id(event, params))
+        github_webhook_refresh_response(conn, event, action, issue_id)
       else
         conn
         |> put_status(202)
@@ -98,6 +105,27 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   defp github_webhook_response_metadata(event, action, _issue_id), do: %{event: event, action: action}
+
+  defp sync_github_webhook_state(event, action, params, issue_id) do
+    case Config.settings() do
+      {:ok, %{tracker: %{kind: "github"}}} ->
+        do_sync_github_webhook_state(event, action, params, issue_id)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp do_sync_github_webhook_state(event, action, params, issue_id) do
+    case GitHubAdapter.sync_webhook_state(event, action, params) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("GitHub webhook state sync failed event=#{event} action=#{action} issue_id=#{inspect(issue_id)} reason=#{inspect(reason)}")
+        :ok
+    end
+  end
 
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
