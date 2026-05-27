@@ -85,6 +85,7 @@ defmodule SymphonyElixir.GitHub.Client do
       when is_binary(event) and is_binary(action) and is_map(payload) do
     case {event, action} do
       {"issues", "labeled"} -> sync_labeled_webhook(:issue, payload)
+      {"issues", "closed"} -> sync_closed_issue_webhook(payload)
       {"pull_request", "labeled"} -> sync_labeled_webhook(:pull_request, payload)
       {"pull_request", "closed"} -> sync_closed_pull_request_webhook(payload)
       _ -> :ok
@@ -97,9 +98,11 @@ defmodule SymphonyElixir.GitHub.Client do
          target_label when is_binary(target_label) <- label_for_state(state_name),
          {:ok, raw_issue} <- request(:get, "/issues/#{number}"),
          current_labels <- extract_labels(raw_issue),
+         {:ok, target_label} <- guarded_target_state_label(number, state_name, target_label),
          :ok <- ensure_label(target_label),
          :ok <- remove_state_labels(number, current_labels),
-         {:ok, _body} <- request(:post, "/issues/#{number}/labels", json: %{labels: [target_label]}) do
+         {:ok, _body} <- request(:post, "/issues/#{number}/labels", json: %{labels: [target_label]}),
+         :ok <- maybe_reopen_guarded_parent(raw_issue, number, state_name, target_label) do
       :ok
     else
       nil -> {:error, {:unknown_github_state, state_name}}
@@ -112,7 +115,7 @@ defmodule SymphonyElixir.GitHub.Client do
   def create_pull_request_for_issue(%Issue{kind: :issue} = issue) do
     case parse_issue_id(issue.id) do
       {:ok, number, :issue} ->
-        create_issue_pull_requests(issue, issue_pull_request_specs(number, issue))
+        create_pull_request_for_issue_number(issue, number)
 
       {:ok, _number, kind} ->
         {:error, {:unsupported_github_issue_kind, kind}}
@@ -332,13 +335,34 @@ defmodule SymphonyElixir.GitHub.Client do
     with state_name when is_binary(state_name) <- state_for_label(label),
          {:ok, number} <- webhook_issue_number(kind, payload),
          {:ok, labels} <- current_labels(number) do
-      if label_present?(labels, label) do
-        with :ok <- set_state_label(number, label, labels, remove_target?: false) do
-          if kind == :issue, do: sync_issue_open_state(number, state_name), else: :ok
-        end
-      else
-        :ok
+      sync_labeled_state(kind, number, label, labels, state_name)
+    else
+      nil -> :ok
+      :skip -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp sync_labeled_state(kind, number, label, labels, state_name) do
+    if label_present?(labels, label) do
+      with :ok <- set_state_label(number, label, labels, remove_target?: false) do
+        maybe_sync_labeled_issue_open_state(kind, number, state_name)
       end
+    else
+      :ok
+    end
+  end
+
+  defp maybe_sync_labeled_issue_open_state(:issue, number, state_name), do: sync_issue_and_parent_open_state(number, state_name)
+  defp maybe_sync_labeled_issue_open_state(_kind, _number, _state_name), do: :ok
+
+  defp sync_closed_issue_webhook(payload) do
+    with {:ok, number} <- webhook_issue_number(:issue, payload),
+         state_name <- closed_issue_state_name(payload),
+         target_label when is_binary(target_label) <- label_for_state(state_name),
+         {:ok, labels} <- current_labels(number),
+         :ok <- set_state_label(number, target_label, labels, remove_target?: false) do
+      sync_issue_and_parent_open_state(number, state_name)
     else
       nil -> :ok
       :skip -> :ok
@@ -360,19 +384,124 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  defp sync_issue_and_parent_open_state(number, state_name) do
+    with :ok <- sync_issue_open_state(number, state_name) do
+      maybe_sync_parent_issue_after_child_state(number, state_name)
+    end
+  end
+
   defp sync_issue_open_state(number, state_name) do
     with {:ok, issue} <- request(:get, "/issues/#{number}") do
-      case terminal_issue_state_reason(state_name) do
-        reason when is_binary(reason) ->
-          maybe_update_issue_open_state(issue, number, "closed", reason)
+      sync_issue_open_state_for_target(number, issue, state_name)
+    end
+  end
 
-        nil ->
-          if issue["state"] == "closed" do
-            update_issue(number, %{state: "open"})
-          else
-            :ok
-          end
+  defp sync_issue_open_state_for_target(number, issue, state_name) do
+    case terminal_issue_state_reason(state_name) do
+      reason when is_binary(reason) -> sync_terminal_issue_open_state(number, issue, reason)
+      nil -> maybe_reopen_issue(number, issue)
+    end
+  end
+
+  defp sync_terminal_issue_open_state(number, issue, reason) do
+    case parent_issue_terminal_guard(number) do
+      :allow -> maybe_update_issue_open_state(issue, number, "closed", reason)
+      :defer -> keep_issue_in_human_review(number, issue)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp maybe_reopen_issue(number, issue) do
+    if issue["state"] == "closed" do
+      update_issue(number, %{state: "open"})
+    else
+      :ok
+    end
+  end
+
+  defp maybe_sync_parent_issue_after_child_state(number, state_name) do
+    case terminal_issue_state_reason(state_name) do
+      nil -> :ok
+      _reason -> sync_parent_issue_after_terminal_child(number)
+    end
+  end
+
+  defp sync_parent_issue_after_terminal_child(number) do
+    case fetch_parent_issue_number(number) do
+      {:ok, parent_number} when is_integer(parent_number) -> sync_parent_issue_from_sub_issues(parent_number)
+      {:ok, nil} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp sync_parent_issue_from_sub_issues(parent_number) when is_integer(parent_number) do
+    with {:ok, issue} <- request(:get, "/issues/#{parent_number}") do
+      sync_parent_issue_from_guard(parent_number, issue, parent_issue_terminal_guard(parent_number))
+    end
+  end
+
+  defp sync_parent_issue_from_guard(parent_number, issue, :allow), do: mark_parent_issue_done(parent_number, issue)
+  defp sync_parent_issue_from_guard(parent_number, issue, :defer), do: keep_issue_in_human_review(parent_number, issue)
+  defp sync_parent_issue_from_guard(_parent_number, _issue, {:error, reason}), do: {:error, reason}
+
+  defp mark_parent_issue_done(parent_number, issue) do
+    with {:ok, labels} <- current_labels(parent_number),
+         target_label when is_binary(target_label) <- label_for_state("Done"),
+         :ok <- set_state_label(parent_number, target_label, labels, remove_target?: false) do
+      maybe_update_issue_open_state(issue, parent_number, "closed", "completed")
+    end
+  end
+
+  defp parent_issue_terminal_guard(number) when is_integer(number) do
+    with {:ok, sub_issues} <- fetch_sub_issues(number) do
+      cond do
+        sub_issues == [] -> :allow
+        Enum.all?(sub_issues, &terminal_sub_issue?/1) -> :allow
+        true -> :defer
       end
+    end
+  end
+
+  defp terminal_sub_issue?(raw_issue) when is_map(raw_issue) do
+    state =
+      case state_from_labels(extract_labels(raw_issue)) do
+        {:ok, state} -> state || fallback_closed_state(raw_issue, nil)
+        {:error, _reason} -> nil
+      end
+
+    not is_nil(state) and terminal_issue_state_reason(state) != nil
+  end
+
+  defp keep_issue_in_human_review(number, issue) when is_integer(number) and is_map(issue) do
+    with {:ok, labels} <- current_labels(number),
+         target_label when is_binary(target_label) <- label_for_state("Human Review"),
+         :ok <- set_state_label(number, target_label, labels, remove_target?: true) do
+      if issue["state"] == "closed" do
+        update_issue(number, %{state: "open"})
+      else
+        :ok
+      end
+    end
+  end
+
+  defp guarded_target_state_label(number, state_name, target_label) when is_integer(number) do
+    if terminal_issue_state_reason(state_name) do
+      case parent_issue_terminal_guard(number) do
+        :allow -> {:ok, target_label}
+        :defer -> {:ok, label_for_state("Human Review")}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, target_label}
+    end
+  end
+
+  defp maybe_reopen_guarded_parent(issue, number, state_name, target_label) do
+    if terminal_issue_state_reason(state_name) && target_label == label_for_state("Human Review") &&
+         issue["state"] == "closed" do
+      update_issue(number, %{state: "open"})
+    else
+      :ok
     end
   end
 
@@ -395,9 +524,8 @@ defmodule SymphonyElixir.GitHub.Client do
     remove_target? = Keyword.get(opts, :remove_target?, true)
 
     with :ok <- ensure_label(target_label),
-         :ok <- remove_state_labels(number, current_labels, target_label, remove_target?),
-         :ok <- maybe_add_label(number, current_labels, target_label, remove_target?) do
-      :ok
+         :ok <- remove_state_labels(number, current_labels, target_label, remove_target?) do
+      maybe_add_label(number, current_labels, target_label, remove_target?)
     end
   end
 
@@ -416,6 +544,32 @@ defmodule SymphonyElixir.GitHub.Client do
     case request(:get, "/issues/#{number}/labels", params: %{per_page: 100}) do
       {:ok, labels} when is_list(labels) -> {:ok, extract_labels(%{"labels" => labels})}
       {:ok, _payload} -> {:error, :github_unexpected_labels_payload}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fetch_sub_issues(number) when is_integer(number) do
+    case request(:get, "/issues/#{number}/sub_issues", params: %{per_page: 100}) do
+      {:ok, sub_issues} when is_list(sub_issues) ->
+        {:ok, sub_issues}
+
+      {:ok, _payload} ->
+        {:error, :github_unexpected_sub_issues_payload}
+
+      {:error, {:github_api_status, status, _body}} when status in [404, 410] ->
+        {:ok, []}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp fetch_parent_issue_number(number) when is_integer(number) do
+    case request(:get, "/issues/#{number}/parent") do
+      {:ok, %{"number" => parent_number}} when is_integer(parent_number) -> {:ok, parent_number}
+      {:ok, nil} -> {:ok, nil}
+      {:ok, _payload} -> {:error, :github_unexpected_parent_issue_payload}
+      {:error, {:github_api_status, status, _body}} when status in [404, 410] -> {:ok, nil}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -451,6 +605,14 @@ defmodule SymphonyElixir.GitHub.Client do
       "done" -> "completed"
       state when state in ["canceled", "duplicate"] -> "not_planned"
       _ -> nil
+    end
+  end
+
+  defp closed_issue_state_name(payload) do
+    case get_in(payload, ["issue", "state_reason"]) do
+      "duplicate" -> "Duplicate"
+      "not_planned" -> "Canceled"
+      _ -> "Done"
     end
   end
 
@@ -530,6 +692,48 @@ defmodule SymphonyElixir.GitHub.Client do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp create_pull_request_for_issue_number(%Issue{} = issue, number) when is_integer(number) do
+    with {:ok, sub_issues} <- fetch_sub_issues(number) do
+      create_pull_request_for_issue_sub_issues(issue, number, sub_issues)
+    end
+  end
+
+  defp create_pull_request_for_issue_sub_issues(_issue, parent_number, sub_issues)
+       when is_list(sub_issues) and sub_issues != [] do
+    case first_planned_sub_issue(sub_issues) do
+      {:ok, %Issue{} = sub_issue, sub_issue_number} ->
+        create_issue_pull_requests(
+          sub_issue,
+          issue_pull_request_specs(sub_issue_number, sub_issue, parent_number: parent_number)
+        )
+
+      :none ->
+        {:error, {:github_no_planned_sub_issue, parent_number}}
+    end
+  end
+
+  defp create_pull_request_for_issue_sub_issues(%Issue{} = issue, number, []) do
+    with {:ok, parent_number} <- fetch_parent_issue_number(number) do
+      create_issue_pull_requests(
+        issue,
+        issue_pull_request_specs(number, issue, parent_number: parent_number)
+      )
+    end
+  end
+
+  defp first_planned_sub_issue(sub_issues) when is_list(sub_issues) do
+    Enum.find_value(sub_issues, :none, fn raw_issue ->
+      with true <- raw_issue["state"] != "closed",
+           {:ok, "Planned"} <- raw_issue |> extract_labels() |> state_from_labels(),
+           number when is_integer(number) <- raw_issue["number"],
+           {:ok, %Issue{} = issue} <- normalize_issue(raw_issue) do
+        {:ok, issue, number}
+      else
+        _ -> false
+      end
+    end)
   end
 
   defp create_issue_pull_requests(issue, specs) when is_list(specs) and specs != [] do
@@ -699,8 +903,9 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp issue_pull_request_specs(number, %Issue{} = issue) when is_integer(number) do
+  defp issue_pull_request_specs(number, %Issue{} = issue, opts) when is_integer(number) do
     sections = issue_pr_sections(issue.description || "")
+    parent_number = Keyword.get(opts, :parent_number)
 
     if length(sections) >= 2 do
       all_specs =
@@ -710,7 +915,8 @@ defmodule SymphonyElixir.GitHub.Client do
             branch: "symphony/_#{number}-pr#{section.number}",
             split?: true,
             section: section,
-            followups: Enum.reject(sections, &(&1.number == section.number))
+            followups: Enum.reject(sections, &(&1.number == section.number)),
+            parent_number: parent_number
           }
         end)
 
@@ -726,7 +932,8 @@ defmodule SymphonyElixir.GitHub.Client do
           branch: issue_pull_request_branch(number),
           split?: false,
           section: nil,
-          followups: []
+          followups: [],
+          parent_number: parent_number
         }
       ]
     end
@@ -783,15 +990,17 @@ defmodule SymphonyElixir.GitHub.Client do
     truncate_text("Issue ##{number}: #{title}", 250)
   end
 
-  defp issue_pull_request_body(%Issue{} = issue, %{split?: true, number: number, section: section, followups: followups}) do
+  defp issue_pull_request_body(%Issue{} = issue, %{split?: true, number: number, section: section, followups: followups} = spec) do
     issue_url = issue.url || "##{number}"
     followup_text = followup_pr_text(followups)
+    parent_ref_text = parent_issue_ref_text(spec[:parent_number])
 
     """
     ## 작업 소스
 
     - 원본 이슈: #{issue_url}
     - 연결 이슈 정리: Refs ##{number}
+    #{parent_ref_text}\
     - 분할 PR: PR#{section.number} / #{length(followups) + 1}
     - 이 PR은 `sym:planned` 이슈의 PR-sized 섹션에서 자동 생성되었습니다.
     - 실제 구현은 이 PR lane의 `sym:planned` 실행에서 진행합니다.
@@ -806,15 +1015,17 @@ defmodule SymphonyElixir.GitHub.Client do
     """
   end
 
-  defp issue_pull_request_body(%Issue{} = issue, %{number: number}) do
+  defp issue_pull_request_body(%Issue{} = issue, %{number: number} = spec) do
     issue_url = issue.url || "##{number}"
     description = issue.description || ""
+    parent_ref_text = parent_issue_ref_text(spec[:parent_number])
 
     """
     ## 작업 소스
 
     - 원본 이슈: #{issue_url}
     - 완료 시 연결 이슈 정리: Closes ##{number}
+    #{parent_ref_text}\
     - 이 PR은 `sym:planned` 이슈에서 자동 생성되었습니다.
     - 실제 구현은 PR lane의 `sym:planned` 실행에서 진행합니다.
 
@@ -823,6 +1034,12 @@ defmodule SymphonyElixir.GitHub.Client do
     #{description}
     """
   end
+
+  defp parent_issue_ref_text(parent_number) when is_integer(parent_number) do
+    "- 부모 이슈 정리: Refs ##{parent_number}\n"
+  end
+
+  defp parent_issue_ref_text(_parent_number), do: ""
 
   defp section_title(%{number: number, title: title}) when is_binary(title) do
     title = String.trim(title)

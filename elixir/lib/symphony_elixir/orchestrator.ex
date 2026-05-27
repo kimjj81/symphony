@@ -967,7 +967,7 @@ defmodule SymphonyElixir.Orchestrator do
             state
 
           {:error, reason} ->
-            Logger.warning("Skipping pull request preparation for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+            handle_pull_request_preparation_error(refreshed_issue, reason)
             state
         end
 
@@ -1040,6 +1040,30 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp move_issue_to_human_review_after_pull_request(_issue), do: :ok
+
+  defp handle_pull_request_preparation_error(%Issue{} = issue, {:github_no_planned_sub_issue, _parent_number}) do
+    Logger.info("Moving planned parent issue with no planned sub-issue to Human Review: #{issue_context(issue)}")
+
+    body = """
+    Symphony가 이 이슈의 native sub-issue를 확인했지만 `sym:planned` 상태의 열린 sub-issue를 찾지 못했습니다.
+
+    부모 이슈에서는 직접 구현 PR을 만들지 않습니다. 구현할 sub-issue에 `sym:planned`를 적용한 뒤 다시 진행해 주세요.
+    """
+
+    case Tracker.create_comment(issue.id, body) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Failed to comment on parent issue without planned sub-issue for #{issue_context(issue)}: #{inspect(reason)}")
+    end
+
+    move_issue_to_human_review_after_pull_request(issue)
+  end
+
+  defp handle_pull_request_preparation_error(%Issue{} = issue, reason) do
+    Logger.warning("Skipping pull request preparation for #{issue_context(issue)}: #{inspect(reason)}")
+  end
 
   defp request_pull_request_refresh(%Issue{id: pull_request_id}) when is_binary(pull_request_id) do
     send(self(), {:refresh_issue, pull_request_id})

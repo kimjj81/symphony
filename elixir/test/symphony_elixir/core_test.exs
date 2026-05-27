@@ -36,6 +36,36 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  defmodule ParentIssueWithoutPlannedChildGitHubClient do
+    def fetch_issue_states_by_ids(["github:issue:122"]) do
+      {:ok,
+       [
+         %SymphonyElixir.Tracker.Issue{
+           id: "github:issue:122",
+           identifier: "#122",
+           title: "Parent issue",
+           state: "Planned",
+           kind: :issue
+         }
+       ]}
+    end
+
+    def create_pull_request_for_issue(issue) do
+      send(self(), {:github_create_pull_request_for_issue_called, issue.identifier})
+      {:error, {:github_no_planned_sub_issue, 122}}
+    end
+
+    def create_comment(issue_id, body) do
+      send(self(), {:github_create_comment_called, issue_id, body})
+      :ok
+    end
+
+    def update_issue_state(issue_id, state_name) do
+      send(self(), {:github_update_issue_state_called, issue_id, state_name})
+      :ok
+    end
+  end
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -517,6 +547,41 @@ defmodule SymphonyElixir.CoreTest do
     assert_receive {:github_create_pull_request_for_issue_called, "#42"}
     assert_receive {:github_update_issue_state_called, "github:issue:42", "Human Review"}
     assert_receive {:refresh_issue, "github:pr:88"}
+  end
+
+  test "planned parent GitHub issue without a planned sub-issue returns to human review" do
+    Application.put_env(:symphony_elixir, :github_client_module, ParentIssueWithoutPlannedChildGitHubClient)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_active_states: ["Planned", "In Progress"],
+      dispatch_kinds: ["pull_request"]
+    )
+
+    state = %Orchestrator.State{
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "github:issue:122",
+      identifier: "#122",
+      title: "Parent issue",
+      state: "Planned",
+      kind: :issue
+    }
+
+    next_state = Orchestrator.handle_targeted_issue_refresh_for_test(state, issue)
+
+    assert next_state.running == %{}
+    assert_receive {:github_create_pull_request_for_issue_called, "#122"}
+    assert_receive {:github_create_comment_called, "github:issue:122", body}
+    assert body =~ "native sub-issue"
+    assert_receive {:github_update_issue_state_called, "github:issue:122", "Human Review"}
+    refute_receive {:refresh_issue, _issue_id}
   end
 
   test "current WORKFLOW.myven.md dispatches Todo GitHub issues for planning" do

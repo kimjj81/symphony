@@ -112,6 +112,12 @@ defmodule SymphonyElixir.GitHubClientTest do
       send(test_pid, {:github_request, method, path, params, json})
 
       case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/issues/37/sub_issues"} ->
+          github_response(200, [])
+
+        {:get, "/repos/studiojin-dev/myven/issues/37/parent"} ->
+          github_response(404, %{"message" => "Not Found"})
+
         {:get, "/repos/studiojin-dev/myven/pulls"} ->
           assert params == %{state: "open", head: "studiojin-dev:symphony/_37", per_page: 1}
           github_response(200, [])
@@ -220,6 +226,12 @@ defmodule SymphonyElixir.GitHubClientTest do
       send(test_pid, {:github_request, method, path, params, json})
 
       case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/issues/84/sub_issues"} ->
+          github_response(200, [])
+
+        {:get, "/repos/studiojin-dev/myven/issues/84/parent"} ->
+          github_response(404, %{"message" => "Not Found"})
+
         {:get, "/repos/studiojin-dev/myven/pulls"} ->
           assert params == %{state: "open", head: "studiojin-dev:symphony/_84-pr1", per_page: 1}
           github_response(200, [])
@@ -327,6 +339,12 @@ defmodule SymphonyElixir.GitHubClientTest do
       send(test_pid, {:github_request, method, path, params, json})
 
       case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/issues/91/sub_issues"} ->
+          github_response(200, [])
+
+        {:get, "/repos/studiojin-dev/myven/issues/91/parent"} ->
+          github_response(404, %{"message" => "Not Found"})
+
         {:get, "/repos/studiojin-dev/myven/pulls"} ->
           assert params in [
                    %{state: "open", head: "studiojin-dev:symphony/_91-pr1", per_page: 1},
@@ -419,6 +437,128 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/pulls", nil, %{head: "symphony/_91-pr2"}}
   end
 
+  test "delegates parent issue pull request creation to the first planned sub-issue" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil,
+      workspace_base_ref: "origin/main"
+    )
+
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      params = Keyword.get(opts, :params)
+      json = Keyword.get(opts, :json)
+
+      send(test_pid, {:github_request, method, path, params, json})
+
+      case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/issues/122/sub_issues"} ->
+          github_response(200, [
+            raw_issue(123, "Sub issue one", "Child implementation", [%{"name" => "sym:planned"}]),
+            raw_issue(124, "Sub issue two", "Later child", [%{"name" => "sym:todo"}])
+          ])
+
+        {:get, "/repos/studiojin-dev/myven/pulls"} ->
+          assert params == %{state: "open", head: "studiojin-dev:symphony/_123", per_page: 1}
+          github_response(200, [])
+
+        {:get, "/repos/studiojin-dev/myven/git/ref/heads/symphony/_123"} ->
+          github_response(404, %{"message" => "Not Found"})
+
+        {:get, "/repos/studiojin-dev/myven/git/ref/heads/main"} ->
+          github_response(200, %{"object" => %{"sha" => "base-sha"}})
+
+        {:get, "/repos/studiojin-dev/myven/git/commits/base-sha"} ->
+          github_response(200, %{"tree" => %{"sha" => "tree-sha"}})
+
+        {:post, "/repos/studiojin-dev/myven/git/commits"} ->
+          assert json.message == "chore: prepare issue #123 implementation PR"
+          github_response(201, %{"sha" => "empty-sha"})
+
+        {:post, "/repos/studiojin-dev/myven/git/refs"} ->
+          assert json == %{ref: "refs/heads/symphony/_123", sha: "empty-sha"}
+          github_response(201, %{"ref" => "refs/heads/symphony/_123", "object" => %{"sha" => "empty-sha"}})
+
+        {:post, "/repos/studiojin-dev/myven/pulls"} ->
+          assert json.head == "symphony/_123"
+          assert json.title == "Issue #123: Sub issue one"
+          assert json.body =~ "Closes #123"
+          assert json.body =~ "Refs #122"
+          refute json.body =~ "Closes #122"
+          github_response(201, %{"number" => 130})
+
+        {:get, "/repos/studiojin-dev/myven/issues/130"} ->
+          github_response(200, raw_pull_request_issue(130, [%{"name" => "sym:planned"}]))
+
+        {:get, "/repos/studiojin-dev/myven/labels/sym%3Aplanned"} ->
+          github_response(200, %{"name" => "sym:planned"})
+
+        {:delete, "/repos/studiojin-dev/myven/issues/130/labels/sym%3Aplanned"} ->
+          github_response(200, %{})
+
+        {:post, "/repos/studiojin-dev/myven/issues/130/labels"} ->
+          github_response(200, [%{"name" => "sym:planned"}])
+
+        {:get, "/repos/studiojin-dev/myven/pulls/130"} ->
+          github_response(200, %{"head" => %{"ref" => "symphony/_123"}, "merged" => false})
+      end
+    end)
+
+    issue = %Issue{
+      id: "github:issue:122",
+      identifier: "#122",
+      title: "Parent performance work",
+      description: "Coordinate sub-issues.",
+      state: "Planned",
+      kind: :issue,
+      url: "https://github.com/studiojin-dev/myven/issues/122"
+    }
+
+    assert {:ok, pull_request} = Client.create_pull_request_for_issue(issue)
+    assert pull_request.id == "github:pr:130"
+    assert pull_request.branch_name == "symphony/_123"
+
+    refute_receive {:github_request, :get, "/repos/studiojin-dev/myven/pulls", %{head: "studiojin-dev:symphony/_122"}, _}
+  end
+
+  test "does not create a parent pull request when no sub-issue is planned" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/122/sub_issues",
+       github_response(200, [
+         raw_issue(123, "Sub issue one", "Child implementation", [%{"name" => "sym:human-review"}]),
+         raw_issue(124, "Sub issue two", "Later child", [%{"name" => "sym:todo"}])
+       ])}
+    ])
+
+    issue = %Issue{
+      id: "github:issue:122",
+      identifier: "#122",
+      title: "Parent performance work",
+      description: "Coordinate sub-issues.",
+      state: "Planned",
+      kind: :issue
+    }
+
+    assert {:error, {:github_no_planned_sub_issue, 122}} = Client.create_pull_request_for_issue(issue)
+    assert_github_responses_consumed()
+  end
+
   test "syncs labeled issue webhook by keeping one Symphony state label" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",
@@ -489,12 +629,25 @@ defmodule SymphonyElixir.GitHubClientTest do
         ] do
       patch_path = "/repos/studiojin-dev/myven/issues/#{number}"
 
-      stub_github_requests(self(), [
-        {:get, "/repos/studiojin-dev/myven/issues/#{number}/labels", github_response(200, [%{"name" => label}])},
-        {:get, "/repos/studiojin-dev/myven/labels/#{URI.encode_www_form(label)}", github_response(200, %{"name" => label})},
-        {:get, patch_path, github_response(200, %{"state" => issue_state, "state_reason" => issue_reason})},
-        {:patch, patch_path, github_response(200, %{})}
-      ])
+      responses =
+        [
+          {:get, "/repos/studiojin-dev/myven/issues/#{number}/labels", github_response(200, [%{"name" => label}])},
+          {:get, "/repos/studiojin-dev/myven/labels/#{URI.encode_www_form(label)}", github_response(200, %{"name" => label})},
+          {:get, patch_path, github_response(200, %{"state" => issue_state, "state_reason" => issue_reason})}
+        ] ++
+          if label in ["sym:done", "sym:canceled", "sym:duplicate"] do
+            [
+              {:get, "/repos/studiojin-dev/myven/issues/#{number}/sub_issues", github_response(200, [])},
+              {:patch, patch_path, github_response(200, %{})},
+              {:get, "/repos/studiojin-dev/myven/issues/#{number}/parent", github_response(404, %{"message" => "Not Found"})}
+            ]
+          else
+            [
+              {:patch, patch_path, github_response(200, %{})}
+            ]
+          end
+
+      stub_github_requests(self(), responses)
 
       assert :ok =
                Client.sync_webhook_state("issues", "labeled", %{
@@ -505,6 +658,119 @@ defmodule SymphonyElixir.GitHubClientTest do
       assert_receive {:github_request, :patch, ^patch_path, nil, ^expected_patch}
       assert_github_responses_consumed()
     end
+  end
+
+  test "keeps parent issue in human review when terminal label arrives before all sub-issues are terminal" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/122/labels", github_response(200, [%{"name" => "sym:done"}])},
+      {:get, "/repos/studiojin-dev/myven/labels/sym%3Adone", github_response(200, %{"name" => "sym:done"})},
+      {:get, "/repos/studiojin-dev/myven/issues/122", github_response(200, %{"state" => "closed", "state_reason" => "completed"})},
+      {:get, "/repos/studiojin-dev/myven/issues/122/sub_issues",
+       github_response(200, [
+         raw_issue(123, "Done child", "Done", [%{"name" => "sym:done"}], "closed"),
+         raw_issue(124, "Planned child", "Not done", [%{"name" => "sym:planned"}])
+       ])},
+      {:get, "/repos/studiojin-dev/myven/issues/122/labels", github_response(200, [%{"name" => "sym:done"}])},
+      {:get, "/repos/studiojin-dev/myven/labels/sym%3Ahuman-review", github_response(200, %{"name" => "sym:human-review"})},
+      {:delete, "/repos/studiojin-dev/myven/issues/122/labels/sym%3Adone", github_response(200, %{})},
+      {:post, "/repos/studiojin-dev/myven/issues/122/labels", github_response(200, [%{"name" => "sym:human-review"}])},
+      {:patch, "/repos/studiojin-dev/myven/issues/122", github_response(200, %{})},
+      {:get, "/repos/studiojin-dev/myven/issues/122/parent", github_response(404, %{"message" => "Not Found"})}
+    ])
+
+    assert :ok =
+             Client.sync_webhook_state("issues", "labeled", %{
+               "issue" => %{"number" => 122},
+               "label" => %{"name" => "sym:done"}
+             })
+
+    assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/issues/122/labels", nil, %{labels: ["sym:human-review"]}}
+    assert_receive {:github_request, :patch, "/repos/studiojin-dev/myven/issues/122", nil, %{state: "open"}}
+    assert_github_responses_consumed()
+  end
+
+  test "closed child issue webhook marks parent done only after all sub-issues are terminal" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/123/labels", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/labels/sym%3Adone", github_response(200, %{"name" => "sym:done"})},
+      {:post, "/repos/studiojin-dev/myven/issues/123/labels", github_response(200, [%{"name" => "sym:done"}])},
+      {:get, "/repos/studiojin-dev/myven/issues/123", github_response(200, %{"state" => "open", "state_reason" => nil})},
+      {:get, "/repos/studiojin-dev/myven/issues/123/sub_issues", github_response(200, [])},
+      {:patch, "/repos/studiojin-dev/myven/issues/123", github_response(200, %{})},
+      {:get, "/repos/studiojin-dev/myven/issues/123/parent", github_response(200, %{"number" => 122})},
+      {:get, "/repos/studiojin-dev/myven/issues/122", github_response(200, %{"state" => "open", "state_reason" => nil})},
+      {:get, "/repos/studiojin-dev/myven/issues/122/sub_issues",
+       github_response(200, [
+         raw_issue(123, "Done child", "Done", [%{"name" => "sym:done"}], "closed"),
+         raw_issue(124, "Canceled child", "Canceled", [%{"name" => "sym:canceled"}], "closed")
+       ])},
+      {:get, "/repos/studiojin-dev/myven/issues/122/labels", github_response(200, [%{"name" => "sym:human-review"}])},
+      {:get, "/repos/studiojin-dev/myven/labels/sym%3Adone", github_response(200, %{"name" => "sym:done"})},
+      {:delete, "/repos/studiojin-dev/myven/issues/122/labels/sym%3Ahuman-review", github_response(200, %{})},
+      {:post, "/repos/studiojin-dev/myven/issues/122/labels", github_response(200, [%{"name" => "sym:done"}])},
+      {:patch, "/repos/studiojin-dev/myven/issues/122", github_response(200, %{})}
+    ])
+
+    assert :ok =
+             Client.sync_webhook_state("issues", "closed", %{
+               "issue" => %{"number" => 123, "state_reason" => "completed"}
+             })
+
+    assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/issues/123/labels", nil, %{labels: ["sym:done"]}}
+    assert_receive {:github_request, :patch, "/repos/studiojin-dev/myven/issues/123", nil, %{state: "closed", state_reason: "completed"}}
+    assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/issues/122/labels", nil, %{labels: ["sym:done"]}}
+    assert_receive {:github_request, :patch, "/repos/studiojin-dev/myven/issues/122", nil, %{state: "closed", state_reason: "completed"}}
+    assert_github_responses_consumed()
+  end
+
+  test "direct done state update for parent issue is guarded by incomplete sub-issues" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/122",
+       github_response(200, %{
+         "number" => 122,
+         "labels" => [%{"name" => "sym:human-review"}],
+         "state" => "closed"
+       })},
+      {:get, "/repos/studiojin-dev/myven/issues/122/sub_issues",
+       github_response(200, [
+         raw_issue(123, "Done child", "Done", [%{"name" => "sym:done"}], "closed"),
+         raw_issue(124, "Planned child", "Not done", [%{"name" => "sym:planned"}])
+       ])},
+      {:get, "/repos/studiojin-dev/myven/labels/sym%3Ahuman-review", github_response(200, %{"name" => "sym:human-review"})},
+      {:delete, "/repos/studiojin-dev/myven/issues/122/labels/sym%3Ahuman-review", github_response(200, %{})},
+      {:post, "/repos/studiojin-dev/myven/issues/122/labels", github_response(200, [%{"name" => "sym:human-review"}])},
+      {:patch, "/repos/studiojin-dev/myven/issues/122", github_response(200, %{})}
+    ])
+
+    assert :ok = Client.update_issue_state("github:issue:122", "Done")
+    assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/issues/122/labels", nil, %{labels: ["sym:human-review"]}}
+    assert_receive {:github_request, :patch, "/repos/studiojin-dev/myven/issues/122", nil, %{state: "open"}}
+    refute_receive {:github_request, :post, "/repos/studiojin-dev/myven/issues/122/labels", nil, %{labels: ["sym:done"]}}
+    assert_github_responses_consumed()
   end
 
   test "syncs merged and closed pull request webhooks to terminal state labels" do
@@ -632,6 +898,19 @@ defmodule SymphonyElixir.GitHubClientTest do
 
   defp assert_github_responses_consumed do
     assert Process.get(:github_client_test_responses, []) == []
+  end
+
+  defp raw_issue(number, title, body, labels, state \\ "open") do
+    %{
+      "number" => number,
+      "title" => title,
+      "body" => body,
+      "state" => state,
+      "html_url" => "https://github.com/studiojin-dev/myven/issues/#{number}",
+      "labels" => labels,
+      "created_at" => "2026-05-10T00:00:00Z",
+      "updated_at" => "2026-05-10T00:00:00Z"
+    }
   end
 
   defp raw_pull_request_issue(number, labels) do
