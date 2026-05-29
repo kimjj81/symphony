@@ -662,13 +662,13 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp fetch_open_pull_request_for_branch(branch) when is_binary(branch) do
+  defp fetch_open_pull_request_for_branch(branch, desired_state) when is_binary(branch) do
     with {:ok, tracker} <- github_tracker_config(),
          {:ok, pulls} <-
            request(:get, "/pulls", params: %{state: "open", head: "#{tracker.owner}:#{branch}", per_page: 1}) do
       case pulls do
         [%{"number" => number} | _] when is_integer(number) ->
-          fetch_visible_or_plan_pull_request("github:pr:#{number}")
+          fetch_visible_or_plan_pull_request("github:pr:#{number}", desired_state)
 
         [] ->
           {:ok, nil}
@@ -679,13 +679,13 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp fetch_visible_or_plan_pull_request(issue_id) do
+  defp fetch_visible_or_plan_pull_request(issue_id, desired_state) do
     case fetch_issue_by_id(issue_id) do
       {:ok, %Issue{} = issue} ->
         {:ok, issue}
 
       :skip ->
-        with :ok <- update_issue_state(issue_id, "Planned") do
+        with :ok <- update_issue_state(issue_id, desired_state) do
           fetch_visible_issue_by_id(issue_id)
         end
 
@@ -745,16 +745,22 @@ defmodule SymphonyElixir.GitHub.Client do
       end
     end)
     |> case do
-      {:ok, pull_requests} when pull_requests != [] -> {:ok, pull_requests |> Enum.reverse() |> List.first()}
-      {:ok, []} -> {:error, :github_pull_request_creation_failed}
-      {:error, reason} -> {:error, reason}
+      {:ok, pull_requests} when pull_requests != [] ->
+        pull_requests = Enum.reverse(pull_requests)
+        {:ok, Enum.find(pull_requests, List.first(pull_requests), &(!Map.get(&1.metadata || %{}, :integration_pull_request?, false)))}
+
+      {:ok, []} ->
+        {:error, :github_pull_request_creation_failed}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
   defp fetch_or_create_issue_pull_request(issue, %{branch: branch} = spec) do
-    case fetch_open_pull_request_for_branch(branch) do
+    case fetch_open_pull_request_for_branch(branch, Map.get(spec, :state, "Planned")) do
       {:ok, %Issue{} = pull_request} ->
-        {:ok, pull_request}
+        {:ok, maybe_mark_integration_pull_request(pull_request, spec)}
 
       {:ok, nil} ->
         create_issue_pull_request(issue, spec)
@@ -765,8 +771,11 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp create_issue_pull_request(issue, %{number: number, branch: branch} = spec) do
-    with {:ok, base_branch} <- pull_request_base_branch(),
-         {:ok, _branch_sha} <- ensure_issue_pull_request_branch(issue, number, branch, base_branch),
+    with {:ok, default_base_branch} <- pull_request_base_branch(),
+         base_branch <- Map.get(spec, :base_branch, default_base_branch),
+         branch_base <- Map.get(spec, :branch_base, base_branch),
+         :ok <- ensure_issue_feature_branch(issue, number, spec, default_base_branch),
+         {:ok, _branch_sha} <- ensure_issue_pull_request_branch(issue, number, branch, branch_base),
          {:ok, raw_pull_request} <-
            request(:post, "/pulls",
              json: %{
@@ -779,12 +788,14 @@ defmodule SymphonyElixir.GitHub.Client do
            ),
          pull_number when is_integer(pull_number) <- raw_pull_request["number"],
          pull_request_id <- "github:pr:#{pull_number}",
-         :ok <- update_issue_state(pull_request_id, "Planned") do
-      fetch_visible_issue_by_id(pull_request_id)
+         :ok <- update_issue_state(pull_request_id, Map.get(spec, :state, "Planned")) do
+      with {:ok, %Issue{} = pull_request} <- fetch_visible_issue_by_id(pull_request_id) do
+        {:ok, maybe_mark_integration_pull_request(pull_request, spec)}
+      end
     else
       {:error, {:github_api_status, 422, _body}} ->
-        case fetch_open_pull_request_for_branch(branch) do
-          {:ok, %Issue{} = pull_request} -> {:ok, pull_request}
+        case fetch_open_pull_request_for_branch(branch, Map.get(spec, :state, "Planned")) do
+          {:ok, %Issue{} = pull_request} -> {:ok, maybe_mark_integration_pull_request(pull_request, spec)}
           {:ok, nil} -> {:error, :github_pull_request_creation_failed}
           {:error, reason} -> {:error, reason}
         end
@@ -799,6 +810,16 @@ defmodule SymphonyElixir.GitHub.Client do
         {:error, :github_pull_request_creation_failed}
     end
   end
+
+  defp ensure_issue_feature_branch(issue, number, %{feature_branch: feature_branch}, base_branch)
+       when is_binary(feature_branch) do
+    case ensure_issue_pull_request_branch(issue, number, feature_branch, base_branch) do
+      {:ok, _branch_sha} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp ensure_issue_feature_branch(_issue, _number, _spec, _base_branch), do: :ok
 
   defp ensure_issue_pull_request_branch(issue, number, branch, base_branch) do
     case fetch_branch_sha(branch) do
@@ -908,11 +929,16 @@ defmodule SymphonyElixir.GitHub.Client do
     parent_number = Keyword.get(opts, :parent_number)
 
     if length(sections) >= 2 do
+      feature_branch = issue_feature_branch(number)
+
       all_specs =
         Enum.map(sections, fn section ->
           %{
             number: number,
             branch: "symphony/_#{number}-pr#{section.number}",
+            base_branch: feature_branch,
+            branch_base: feature_branch,
+            feature_branch: feature_branch,
             split?: true,
             section: section,
             followups: Enum.reject(sections, &(&1.number == section.number)),
@@ -920,11 +946,14 @@ defmodule SymphonyElixir.GitHub.Client do
           }
         end)
 
-      if parallel_pr_plan?(issue.description || "") do
-        all_specs
-      else
-        [List.first(all_specs)]
-      end
+      child_specs =
+        if parallel_pr_plan?(issue.description || "") do
+          all_specs
+        else
+          [List.first(all_specs)]
+        end
+
+      child_specs ++ [integration_pull_request_spec(number, feature_branch, sections, parent_number)]
     else
       [
         %{
@@ -940,6 +969,22 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp issue_pull_request_branch(number) when is_integer(number), do: "symphony/_#{number}"
+
+  defp issue_feature_branch(number) when is_integer(number), do: "symphony/_#{number}-feature"
+
+  defp integration_pull_request_spec(number, feature_branch, sections, parent_number) do
+    %{
+      number: number,
+      branch: feature_branch,
+      split?: true,
+      integration?: true,
+      sections: sections,
+      section: nil,
+      followups: [],
+      parent_number: parent_number,
+      state: "Human Review"
+    }
+  end
 
   defp issue_pr_sections(description) when is_binary(description) do
     regex = ~r/^###\s*PR\s*(\d+)\s*[:：.\-–—]?\s*(.*?)\s*$/im
@@ -971,6 +1016,20 @@ defmodule SymphonyElixir.GitHub.Client do
     Regex.match?(~r/(PR\s*진행\s*방식|실행\s*방식|execution\s*mode)\s*[:：-]?\s*(병렬|parallel)/iu, description)
   end
 
+  defp issue_pull_request_title(%Issue{title: title}, %{integration?: true, number: number}) do
+    title =
+      case title do
+        value when is_binary(value) ->
+          value = String.trim(value)
+          if value == "", do: "Issue #{number}", else: value
+
+        _ ->
+          "Issue #{number}"
+      end
+
+    truncate_text("Issue ##{number}: #{title} 통합", 250)
+  end
+
   defp issue_pull_request_title(%Issue{}, %{split?: true, number: number, section: section}) do
     section_title = section_title(section)
     truncate_text("Issue ##{number} PR#{section.number}: #{section_title}", 250)
@@ -990,10 +1049,31 @@ defmodule SymphonyElixir.GitHub.Client do
     truncate_text("Issue ##{number}: #{title}", 250)
   end
 
+  defp issue_pull_request_body(%Issue{} = issue, %{integration?: true, number: number, sections: sections} = spec) do
+    issue_url = issue.url || "##{number}"
+    parent_ref_text = parent_issue_ref_text(spec[:parent_number])
+    child_text = child_pr_text(sections)
+
+    """
+    ## 작업 소스
+
+    - 원본 이슈: #{issue_url}
+    - 완료 시 연결 이슈 정리: Closes ##{number}
+    #{parent_ref_text}\
+    - 이 PR은 분할 PR들이 병합되는 feature 브랜치를 `main`으로 병합하기 위한 통합 PR입니다.
+    - 모든 하위 분할 PR이 feature 브랜치에 병합된 뒤 이 PR을 `sym:merging`으로 진행합니다.
+
+    ## 하위 분할 PR
+
+    #{child_text}
+    """
+  end
+
   defp issue_pull_request_body(%Issue{} = issue, %{split?: true, number: number, section: section, followups: followups} = spec) do
     issue_url = issue.url || "##{number}"
     followup_text = followup_pr_text(followups)
     parent_ref_text = parent_issue_ref_text(spec[:parent_number])
+    feature_branch = Map.fetch!(spec, :feature_branch)
 
     """
     ## 작업 소스
@@ -1002,8 +1082,9 @@ defmodule SymphonyElixir.GitHub.Client do
     - 연결 이슈 정리: Refs ##{number}
     #{parent_ref_text}\
     - 분할 PR: PR#{section.number} / #{length(followups) + 1}
+    - 병합 대상: `#{feature_branch}` feature 브랜치
     - 이 PR은 `sym:planned` 이슈의 PR-sized 섹션에서 자동 생성되었습니다.
-    - 실제 구현은 이 PR lane의 `sym:planned` 실행에서 진행합니다.
+    - 실제 구현은 이 PR lane의 `sym:planned` 실행에서 진행하고, 완료 후 feature 브랜치로 병합합니다.
 
     ## 이번 PR 범위
 
@@ -1060,6 +1141,18 @@ defmodule SymphonyElixir.GitHub.Client do
     """
     |> String.trim()
   end
+
+  defp child_pr_text(sections) when is_list(sections) do
+    sections
+    |> Enum.map_join("\n", fn section -> "- PR#{section.number}: #{section_title(section)}" end)
+  end
+
+  defp maybe_mark_integration_pull_request(%Issue{} = pull_request, %{integration?: true}) do
+    metadata = pull_request.metadata || %{}
+    %{pull_request | metadata: Map.put(metadata, :integration_pull_request?, true)}
+  end
+
+  defp maybe_mark_integration_pull_request(%Issue{} = pull_request, _spec), do: pull_request
 
   defp truncate_text(value, max_length) when is_binary(value) and is_integer(max_length) do
     if String.length(value) > max_length do

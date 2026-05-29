@@ -331,9 +331,11 @@ Instructions:
 11. If this item is a GitHub issue in Todo, do not implement code and do not create, modify, commit, or push repository files, including `docs/draft/*`. Analyze the issue, record the plan only in the issue body or a GitHub comment, propose PR-sized work items in a GitHub comment, then move the item to Human Review.
 12. If this item is a GitHub issue in Planned, do not implement in the issue lane. Create or reuse PR-sized implementation pull request(s) without creating a source-issue worktree, label each PR Planned for implementation, then move the source issue to Human Review.
    - If the issue body has explicit `### PR1`, `### PR2`, or later PR-sized sections, do not create a single catch-all implementation PR.
-   - By default, treat split PR sections as sequential: create or reuse only the first PR section branch, for example `symphony/_84-pr1`, and leave later sections listed as follow-up PRs.
-   - If the issue explicitly says `PR 진행 방식: 병렬` or `execution mode: parallel`, create or reuse one PR per section, for example `symphony/_84-pr1` and `symphony/_84-pr2`.
-   - Split PR bodies should use `Refs #<issue>` while follow-up PR sections remain, not `Closes #<issue>`.
+   - Split PR sections must use an issue-level feature branch, for example `symphony/_84-feature`; child PR branches such as `symphony/_84-pr1` and `symphony/_84-pr2` target that feature branch, not `main`.
+   - Create or reuse a feature-to-main integration PR for the split issue. The integration PR is the only PR that closes the source issue, and it should merge only after every required child PR is merged into the feature branch.
+   - By default, treat split PR sections as sequential: create or reuse only the first PR section branch, for example `symphony/_84-pr1`, and leave later sections listed as follow-up PRs while the integration PR remains visible.
+   - If the issue explicitly says `PR 진행 방식: 병렬` or `execution mode: parallel`, create or reuse one child PR per section, for example `symphony/_84-pr1` and `symphony/_84-pr2`, plus the integration PR.
+   - Split child PR bodies should use `Refs #<issue>` while child or follow-up PR sections remain, not `Closes #<issue>`. The integration PR should use `Closes #<issue>`.
    - If the issue has native GitHub sub-issues, treat the parent as a coordination issue and create/reuse the implementation PR for the first open `sym:planned` sub-issue instead. The child PR must close only the child issue and reference the parent with `Refs #<parent>`.
    - A native GitHub parent issue may be marked Done/closed only after every sub-issue is terminal (`Done`, `Canceled`, or `Duplicate`). If any sub-issue remains non-terminal, keep or reopen the parent in Human Review.
 13. Symphony must not move a GitHub issue from Todo or Human Review to Planned by itself. Only a human-applied sym:planned label is an approval gate.
