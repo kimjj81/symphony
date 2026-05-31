@@ -67,3 +67,29 @@ If behavior/config changes, update docs in the same PR:
 - `../README.md` for project concept and goals.
 - `README.md` for Elixir implementation and run instructions.
 - `WORKFLOW.md` for workflow/config contract changes.
+
+## Graphify Maintenance
+
+These rules apply only to Symphony's Elixir-based orchestration and management
+code. Do not propagate them to implementation changes in repositories managed by
+Symphony, such as myven itself.
+
+If the `graphify` skill is unavailable in the current session, ignore this
+section and continue the work.
+
+When `graphify` is available, update the graph with `/graphify . --update` or
+with the current Elixir work scope when:
+
+- Before a large structural change, the `/graphify query` result seems stale
+  before touching a new area.
+- After a large structural change affects module boundaries, major
+  functions/classes, routes, workers, APIs, or deployment scripts.
+- After adding or changing docs, ADRs, or plans that materially affect
+  architecture graph interpretation.
+- Before creating a PR, when reviewers or the next agent should start from the
+  same structure map.
+- Immediately after merging a branch, when multiple PRs changed relationships
+  significantly.
+
+Graphify updates are auxiliary context refreshes. They do not replace required
+validation such as `make all`, `mix specs.check`, or PR body checks.
