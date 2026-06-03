@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Rebase Update"
+  short_description: "Refresh PR branches with live-state checks"
+  default_prompt: "Use $pr-rebase-update to update this PR branch against its latest base."

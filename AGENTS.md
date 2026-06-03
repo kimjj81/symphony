@@ -18,3 +18,15 @@ Repository-level operating instructions for Codex in this workspace.
   beginning of the title, for example `[1/4] Implement API contract`.
 - Apply this only to newly created sub-issues and sub-PRs; do not rename
   existing ones unless explicitly requested.
+
+## PR Rebase Hygiene
+
+- Treat PR rebase/update requests as Git history operations, not implementation
+  lanes, unless the user explicitly expands the scope.
+- Verify the live PR head and base before changing history; do not rely only on
+  local worktree names.
+- Use one writer for rebase, conflict resolution, and push operations.
+- Rebase/update branches in dependency order, resolve conflicts narrowly, and
+  avoid unrelated product or formatting changes.
+- Run the narrowest meaningful verification first, then re-check the PR diff
+  and live PR state before reporting completion.
