@@ -23,6 +23,7 @@ tracker:
     Review: sym:review
     Reviewing: sym:reviewing
     Human Review: sym:human-review
+    Waiting: sym:waiting
     Rework: sym:rework
     Merging: sym:merging
     Done: sym:done
@@ -309,7 +310,7 @@ Instructions:
 1. GitHub Todo issues are planning-only Codex runs. Implementation work belongs to pull request lanes; when a GitHub issue enters Planned, Symphony's control path may create or reuse a PR for that issue without implementing in the source issue lane.
 2. Keep changes scoped and minimal.
 3. Prefer safe, deterministic changes and record blockers in the workpad.
-4. Use the GitHub labels as the state machine: sym:todo, sym:planned, sym:in-progress, sym:review, sym:reviewing, sym:human-review, sym:rework, sym:merging, sym:done, sym:canceled, sym:duplicate.
+4. Use the GitHub labels as the state machine: sym:todo, sym:planned, sym:in-progress, sym:review, sym:reviewing, sym:human-review, sym:waiting, sym:rework, sym:merging, sym:done, sym:canceled, sym:duplicate.
 5. If Codex goal support is available, create exactly one active goal for the current tracker-state objective and keep it aligned with the label state machine. The goal is a scope guard, not permission to expand work.
    - Todo issue goal: planning-only handoff, no repository edits, then Human Review.
    - Planned issue goal: create or reuse the implementation PR, then return the source issue to Human Review.
@@ -332,7 +333,9 @@ Instructions:
 12. If this item is a GitHub issue in Planned, do not implement in the issue lane. Create or reuse PR-sized implementation pull request(s) without creating a source-issue worktree, label each PR Planned for implementation, then move the source issue to Human Review.
    - If the issue body has explicit `### PR1`, `### PR2`, or later PR-sized sections, do not create a single catch-all implementation PR.
    - Split PR sections must use an issue-level feature branch, for example `symphony/_84-feature`; child PR branches such as `symphony/_84-pr1` and `symphony/_84-pr2` target that feature branch, not `main`.
-   - Create or reuse a feature-to-main integration PR for the split issue. The integration PR is the only PR that closes the source issue, and it should merge only after every required child PR is merged into the feature branch.
+   - Create or reuse a feature-to-main integration PR for the split issue before creating child PRs so GitHub PR numbers reflect the integration PR first, followed by PR1, PR2, and later child PRs. The integration PR is the only PR that closes the source issue, and it should merge only after every required child PR is merged into the feature branch.
+   - The feature-to-main integration PR must stay in `sym:waiting` while any required child PR remains unmerged. `Waiting` is not an active state and must not dispatch implementation, review, rework, or merge work. After every required child PR is merged into the feature branch, a human may move the integration PR to `sym:merging`.
+   - For sequential split issues, a human may request the next child PR from the source issue by commenting `PR<N> 구현` or `PR<N> 구현 시작` and moving the source issue to `sym:planned`. A waiting feature-to-main integration PR does not count as an open implementation PR that blocks this source issue lane; create or reuse the requested child PR, or the first missing/unmerged child PR if no explicit PR number is requested.
    - By default, treat split PR sections as sequential: create or reuse only the first PR section branch, for example `symphony/_84-pr1`, and leave later sections listed as follow-up PRs while the integration PR remains visible.
    - If the issue explicitly says `PR 진행 방식: 병렬` or `execution mode: parallel`, create or reuse one child PR per section, for example `symphony/_84-pr1` and `symphony/_84-pr2`, plus the integration PR.
    - Split child PR bodies should use `Refs #<issue>` while child or follow-up PR sections remain, not `Closes #<issue>`. The integration PR should use `Closes #<issue>`.
@@ -340,7 +343,7 @@ Instructions:
    - A native GitHub parent issue may be marked Done/closed only after every sub-issue is terminal (`Done`, `Canceled`, or `Duplicate`). If any sub-issue remains non-terminal, keep or reopen the parent in Human Review.
 13. Symphony must not move a GitHub issue from Todo or Human Review to Planned by itself. Only a human-applied sym:planned label is an approval gate.
 14. If a Planned issue is explicitly a planning/splitting issue, create the requested PR-sized follow-up issues instead of changing product code. Label follow-up implementation issues sym:planned only when the parent issue explicitly asks for immediate execution; otherwise label them sym:todo for human review. If a direct implementation PR is needed, create the PR and let the PR lane do the work.
-15. If this item is a GitHub issue with an open linked pull request, keep or move the source issue to Human Review, update only the issue summary/comment and the linked PR body/comment with current PR status, then stop; PR execution belongs to the linked pull request.
+15. If this item is a GitHub issue with an open linked pull request, keep or move the source issue to Human Review, update only the issue summary/comment and the linked PR body/comment with current PR status, then stop; PR execution belongs to the linked pull request. Exception: for split issues, an open feature-to-main integration PR in `sym:waiting` is only a coordination/finalization PR and must not block creation of the next requested child PR from a `sym:planned` source issue.
 16. If this item is a GitHub issue in In Progress and it does not have an open linked pull request, create or update a PR-sized implementation PR and keep the issue comment trail current. After opening or updating the implementation PR, move only the PR to Review and keep the source issue in Human Review while updating the source issue summary/comment with the PR status.
 17. If implementation becomes too large, stop before committing and comment: "이 PR은 너무 커졌으므로 여기까지 commit하지 않고 분할 제안". Move the item to Human Review with the split proposal.
 18. If this item is a pull request in Todo, improve the PR description, implementation plan, and validation plan, then move it to Human Review.

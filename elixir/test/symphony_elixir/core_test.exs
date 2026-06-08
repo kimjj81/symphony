@@ -294,6 +294,8 @@ defmodule SymphonyElixir.CoreTest do
     assert settings.codex.read_timeout_ms == 10_000
     assert settings.agent.dispatch_kinds == ["issue", "pull_request"]
     assert settings.agent.source_checkout_states == ["todo"]
+    refute "Waiting" in settings.tracker.active_states
+    assert settings.tracker.state_labels["Waiting"] == "sym:waiting"
     assert settings.hooks.after_sync_local_files == "pnpm run worktree:copy-env\n"
     refute settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
     assert String.trim(prompt) != ""
@@ -307,6 +309,8 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "do not create a single catch-all implementation PR"
     assert prompt =~ "issue-level feature branch"
     assert prompt =~ "feature-to-main integration PR"
+    assert prompt =~ "sym:waiting"
+    assert prompt =~ "Waiting` is not an active state"
     assert prompt =~ "PR 진행 방식: 병렬"
     assert prompt =~ "prefix the child PR title with the parent PR number"
     assert prompt =~ "PR #<parent>: <child PR title>"

@@ -15,6 +15,7 @@ defmodule SymphonyElixir.GitHub.Client do
     "Review" => "sym:review",
     "Reviewing" => "sym:reviewing",
     "Human Review" => "sym:human-review",
+    "Waiting" => "sym:waiting",
     "Rework" => "sym:rework",
     "Merging" => "sym:merging",
     "Done" => "sym:done",
@@ -28,6 +29,7 @@ defmodule SymphonyElixir.GitHub.Client do
     "sym:review" => {"0969da", "Ready for Symphony automated review."},
     "sym:reviewing" => {"1f883d", "Symphony automated review is running."},
     "sym:human-review" => {"2da44e", "Waiting for human review or approval."},
+    "sym:waiting" => {"6e7781", "Blocked until prerequisite Symphony work is complete."},
     "sym:rework" => {"fb8f44", "Review requested changes for Symphony to address."},
     "sym:merging" => {"d4c5f9", "Approved work is being merged or finalized."},
     "sym:done" => {"8250df", "Completed successfully."},
@@ -679,6 +681,24 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  defp fetch_pull_request_status_for_branch(branch) when is_binary(branch) do
+    with {:ok, tracker} <- github_tracker_config(),
+         {:ok, pulls} <-
+           request(:get, "/pulls", params: %{state: "all", head: "#{tracker.owner}:#{branch}", per_page: 1}) do
+      case pulls do
+        [%{"number" => number} = pull | _] when is_integer(number) ->
+          pull_data = fetch_pull(number)
+          {:ok, %{state: pull["state"], merged?: pull_merged?(pull_data)}}
+
+        [] ->
+          {:ok, nil}
+
+        _ ->
+          {:error, :github_unexpected_pulls_payload}
+      end
+    end
+  end
+
   defp fetch_visible_or_plan_pull_request(issue_id, desired_state) do
     case fetch_issue_by_id(issue_id) do
       {:ok, %Issue{} = issue} ->
@@ -704,10 +724,9 @@ defmodule SymphonyElixir.GitHub.Client do
        when is_list(sub_issues) and sub_issues != [] do
     case first_planned_sub_issue(sub_issues) do
       {:ok, %Issue{} = sub_issue, sub_issue_number} ->
-        create_issue_pull_requests(
-          sub_issue,
-          issue_pull_request_specs(sub_issue_number, sub_issue, parent_number: parent_number)
-        )
+        with {:ok, specs} <- issue_pull_request_specs(sub_issue_number, sub_issue, parent_number: parent_number) do
+          create_issue_pull_requests(sub_issue, specs)
+        end
 
       :none ->
         {:error, {:github_no_planned_sub_issue, parent_number}}
@@ -716,10 +735,9 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp create_pull_request_for_issue_sub_issues(%Issue{} = issue, number, []) do
     with {:ok, parent_number} <- fetch_parent_issue_number(number) do
-      create_issue_pull_requests(
-        issue,
-        issue_pull_request_specs(number, issue, parent_number: parent_number)
-      )
+      with {:ok, specs} <- issue_pull_request_specs(number, issue, parent_number: parent_number) do
+        create_issue_pull_requests(issue, specs)
+      end
     end
   end
 
@@ -948,29 +966,106 @@ defmodule SymphonyElixir.GitHub.Client do
 
       child_specs =
         if parallel_pr_plan?(issue.description || "") do
-          all_specs
+          {:ok, all_specs}
         else
-          [List.first(all_specs)]
+          sequential_split_child_specs(number, all_specs)
         end
 
-      child_specs ++ [integration_pull_request_spec(number, feature_branch, sections, parent_number)]
+      case child_specs do
+        {:ok, child_specs} ->
+          {:ok, [integration_pull_request_spec(number, feature_branch, sections, parent_number)] ++ child_specs}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     else
-      [
-        %{
-          number: number,
-          branch: issue_pull_request_branch(number),
-          split?: false,
-          section: nil,
-          followups: [],
-          parent_number: parent_number
-        }
-      ]
+      {:ok,
+       [
+         %{
+           number: number,
+           branch: issue_pull_request_branch(number),
+           split?: false,
+           section: nil,
+           followups: [],
+           parent_number: parent_number
+         }
+       ]}
     end
   end
 
   defp issue_pull_request_branch(number) when is_integer(number), do: "symphony/_#{number}"
 
   defp issue_feature_branch(number) when is_integer(number), do: "symphony/_#{number}-feature"
+
+  defp sequential_split_child_specs(number, all_specs) do
+    case requested_split_child_spec(number, all_specs) do
+      {:ok, %{} = spec} -> {:ok, [spec]}
+      {:error, reason} -> {:error, reason}
+      :none -> first_unmerged_split_child_specs(all_specs)
+    end
+  end
+
+  defp requested_split_child_spec(number, all_specs) do
+    case requested_split_pr_number(number) do
+      pr_number when is_integer(pr_number) ->
+        case Enum.find(all_specs, &(&1.section.number == pr_number)) do
+          nil ->
+            :none
+
+          spec ->
+            case split_child_merged?(spec) do
+              {:ok, true} -> :none
+              {:ok, false} -> {:ok, spec}
+              {:error, reason} -> {:error, reason}
+            end
+        end
+
+      nil ->
+        :none
+    end
+  end
+
+  defp requested_split_pr_number(number) when is_integer(number) do
+    case request(:get, "/issues/#{number}/comments", params: %{per_page: 100}) do
+      {:ok, comments} when is_list(comments) ->
+        comments
+        |> Enum.reverse()
+        |> Enum.find_value(&requested_split_pr_number_from_comment/1)
+
+      {:ok, _payload} ->
+        nil
+
+      {:error, _reason} ->
+        nil
+    end
+  end
+
+  defp requested_split_pr_number_from_comment(%{"body" => body}) when is_binary(body) do
+    case Regex.run(~r/PR\s*(\d+)\s*구현/iu, body) do
+      [_match, number] -> String.to_integer(number)
+      _ -> nil
+    end
+  end
+
+  defp requested_split_pr_number_from_comment(_comment), do: nil
+
+  defp first_unmerged_split_child_specs(all_specs) do
+    Enum.reduce_while(all_specs, {:ok, []}, fn spec, _acc ->
+      case split_child_merged?(spec) do
+        {:ok, true} -> {:cont, {:ok, []}}
+        {:ok, false} -> {:halt, {:ok, [spec]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp split_child_merged?(%{branch: branch}) when is_binary(branch) do
+    case fetch_pull_request_status_for_branch(branch) do
+      {:ok, %{merged?: true}} -> {:ok, true}
+      {:ok, _status} -> {:ok, false}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp integration_pull_request_spec(number, feature_branch, sections, parent_number) do
     %{
@@ -982,7 +1077,7 @@ defmodule SymphonyElixir.GitHub.Client do
       section: nil,
       followups: [],
       parent_number: parent_number,
-      state: "Human Review"
+      state: "Waiting"
     }
   end
 
@@ -1061,7 +1156,9 @@ defmodule SymphonyElixir.GitHub.Client do
     - 완료 시 연결 이슈 정리: Closes ##{number}
     #{parent_ref_text}\
     - 이 PR은 분할 PR들이 병합되는 feature 브랜치를 `main`으로 병합하기 위한 통합 PR입니다.
-    - 모든 하위 분할 PR이 feature 브랜치에 병합된 뒤 이 PR을 `sym:merging`으로 진행합니다.
+    - 모든 하위 분할 PR이 feature 브랜치에 병합될 때까지 이 PR은 `sym:waiting` 상태로 유지합니다.
+    - 하위 분할 PR이 남아 있으면 이 PR을 implementation/review/rework/merge lane으로 실행하지 않습니다.
+    - 모든 하위 분할 PR이 feature 브랜치에 병합된 뒤 사람이 이 PR을 `sym:merging`으로 진행합니다.
 
     ## 하위 분할 PR
 

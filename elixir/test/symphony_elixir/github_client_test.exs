@@ -232,9 +232,14 @@ defmodule SymphonyElixir.GitHubClientTest do
         {:get, "/repos/studiojin-dev/myven/issues/84/parent"} ->
           github_response(404, %{"message" => "Not Found"})
 
+        {:get, "/repos/studiojin-dev/myven/issues/84/comments"} ->
+          assert params == %{per_page: 100}
+          github_response(200, [])
+
         {:get, "/repos/studiojin-dev/myven/pulls"} ->
           assert params in [
                    %{state: "open", head: "studiojin-dev:symphony/_84-pr1", per_page: 1},
+                   %{state: "all", head: "studiojin-dev:symphony/_84-pr1", per_page: 1},
                    %{state: "open", head: "studiojin-dev:symphony/_84-feature", per_page: 1}
                  ]
 
@@ -273,6 +278,9 @@ defmodule SymphonyElixir.GitHubClientTest do
           github_response(201, %{"ref" => json.ref, "object" => %{"sha" => json.sha}})
 
         {:post, "/repos/studiojin-dev/myven/pulls"} ->
+          pull_order = Process.get(:github_client_test_84_pull_order, [])
+          Process.put(:github_client_test_84_pull_order, [json.head | pull_order])
+
           case json.head do
             "symphony/_84-pr1" ->
               assert json.base == "symphony/_84-feature"
@@ -285,16 +293,18 @@ defmodule SymphonyElixir.GitHubClientTest do
               assert json.body =~ "- PR2: operator 비밀번호 찾기 상태 조회"
               refute json.body =~ "operator 목록과 API를 추가한다."
 
-              github_response(201, %{"number" => 89})
+              github_response(201, %{"number" => 90})
 
             "symphony/_84-feature" ->
               assert json.base == "main"
               assert json.title == "Issue #84: 비밀번호 재설정 흐름 완성 통합"
               assert json.body =~ "Closes #84"
+              assert json.body =~ "`sym:waiting` 상태로 유지"
+              assert json.body =~ "implementation/review/rework/merge lane"
               assert json.body =~ "- PR1: 사용자 비밀번호 재설정 흐름 완성"
               assert json.body =~ "- PR2: operator 비밀번호 찾기 상태 조회"
 
-              github_response(201, %{"number" => 90})
+              github_response(201, %{"number" => 89})
           end
 
         {:get, "/repos/studiojin-dev/myven/issues/" <> pull_number_text} ->
@@ -306,7 +316,13 @@ defmodule SymphonyElixir.GitHubClientTest do
             if issue_fetch_count == 1 do
               []
             else
-              [%{"name" => "sym:planned"}]
+              label =
+                case pull_number do
+                  89 -> "sym:waiting"
+                  90 -> "sym:planned"
+                end
+
+              [%{"name" => label}]
             end
 
           github_response(200, raw_pull_request_issue(pull_number, labels))
@@ -316,13 +332,13 @@ defmodule SymphonyElixir.GitHubClientTest do
 
         {:post, "/repos/studiojin-dev/myven/issues/" <> label_path} ->
           assert String.ends_with?(label_path, "/labels")
-          assert json in [%{labels: ["sym:planned"]}, %{labels: ["sym:human-review"]}]
+          assert json in [%{labels: ["sym:planned"]}, %{labels: ["sym:waiting"]}]
           github_response(200, Enum.map(json.labels, &%{"name" => &1}))
 
-        {:get, "/repos/studiojin-dev/myven/pulls/89"} ->
+        {:get, "/repos/studiojin-dev/myven/pulls/90"} ->
           github_response(200, %{"head" => %{"ref" => "symphony/_84-pr1"}, "merged" => false})
 
-        {:get, "/repos/studiojin-dev/myven/pulls/90"} ->
+        {:get, "/repos/studiojin-dev/myven/pulls/89"} ->
           github_response(200, %{"head" => %{"ref" => "symphony/_84-feature"}, "merged" => false})
       end
     end)
@@ -348,11 +364,147 @@ defmodule SymphonyElixir.GitHubClientTest do
     }
 
     assert {:ok, pull_request} = Client.create_pull_request_for_issue(issue)
-    assert pull_request.id == "github:pr:89"
+    assert pull_request.id == "github:pr:90"
     assert pull_request.branch_name == "symphony/_84-pr1"
+
+    assert Enum.reverse(Process.get(:github_client_test_84_pull_order, [])) == [
+             "symphony/_84-feature",
+             "symphony/_84-pr1"
+           ]
 
     refute_receive {:github_request, :get, "/repos/studiojin-dev/myven/git/ref/heads/symphony/_84-pr2", _, _}
     assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/pulls", nil, %{head: "symphony/_84-feature", base: "main"}}
+  end
+
+  test "creates the requested next split child pull request while integration PR waits" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil,
+      workspace_base_ref: "origin/main"
+    )
+
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      params = Keyword.get(opts, :params)
+      json = Keyword.get(opts, :json)
+
+      send(test_pid, {:github_request, method, path, params, json})
+
+      case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/issues/245/sub_issues"} ->
+          github_response(200, [])
+
+        {:get, "/repos/studiojin-dev/myven/issues/245/parent"} ->
+          github_response(404, %{"message" => "Not Found"})
+
+        {:get, "/repos/studiojin-dev/myven/issues/245/comments"} ->
+          assert params == %{per_page: 100}
+          github_response(200, [%{"body" => "pr2 구현 시작."}])
+
+        {:get, "/repos/studiojin-dev/myven/pulls"} ->
+          case params do
+            %{state: "all", head: "studiojin-dev:symphony/_245-pr2", per_page: 1} ->
+              github_response(200, [])
+
+            %{state: "open", head: "studiojin-dev:symphony/_245-feature", per_page: 1} ->
+              github_response(200, [%{"number" => 247, "state" => "open"}])
+
+            %{state: "open", head: "studiojin-dev:symphony/_245-pr2", per_page: 1} ->
+              github_response(200, [])
+          end
+
+        {:get, "/repos/studiojin-dev/myven/issues/247"} ->
+          github_response(200, raw_pull_request_issue(247, [%{"name" => "sym:waiting"}]))
+
+        {:get, "/repos/studiojin-dev/myven/pulls/247"} ->
+          github_response(200, %{"head" => %{"ref" => "symphony/_245-feature"}, "merged" => false})
+
+        {:get, "/repos/studiojin-dev/myven/git/ref/heads/symphony/_245-feature"} ->
+          github_response(200, %{"object" => %{"sha" => "feature-sha"}})
+
+        {:get, "/repos/studiojin-dev/myven/git/ref/heads/symphony/_245-pr2"} ->
+          github_response(404, %{"message" => "Not Found"})
+
+        {:get, "/repos/studiojin-dev/myven/git/commits/feature-sha"} ->
+          github_response(200, %{"tree" => %{"sha" => "tree-sha"}})
+
+        {:post, "/repos/studiojin-dev/myven/git/commits"} ->
+          github_response(201, %{"sha" => "child-sha"})
+
+        {:post, "/repos/studiojin-dev/myven/git/refs"} ->
+          assert json == %{ref: "refs/heads/symphony/_245-pr2", sha: "child-sha"}
+          github_response(201, %{"ref" => json.ref, "object" => %{"sha" => json.sha}})
+
+        {:post, "/repos/studiojin-dev/myven/pulls"} ->
+          assert json.head == "symphony/_245-pr2"
+          assert json.base == "symphony/_245-feature"
+          assert json.title == "Issue #245 PR2: Terraform-managed Lambda cron과 staging 배포"
+          assert json.body =~ "Refs #245"
+          refute json.body =~ "Closes #245"
+          github_response(201, %{"number" => 248})
+
+        {:get, "/repos/studiojin-dev/myven/issues/248"} ->
+          issue_fetch_count = Process.get(:github_client_test_248_fetch_count, 0) + 1
+          Process.put(:github_client_test_248_fetch_count, issue_fetch_count)
+
+          labels =
+            if issue_fetch_count == 1 do
+              []
+            else
+              [%{"name" => "sym:planned"}]
+            end
+
+          github_response(200, raw_pull_request_issue(248, labels))
+
+        {:get, "/repos/studiojin-dev/myven/labels/sym%3Aplanned"} ->
+          github_response(200, %{"name" => "sym:planned"})
+
+        {:post, "/repos/studiojin-dev/myven/issues/248/labels"} ->
+          assert json == %{labels: ["sym:planned"]}
+          github_response(200, [%{"name" => "sym:planned"}])
+
+        {:get, "/repos/studiojin-dev/myven/pulls/248"} ->
+          github_response(200, %{"head" => %{"ref" => "symphony/_245-pr2"}, "merged" => false})
+      end
+    end)
+
+    issue = %Issue{
+      id: "github:issue:245",
+      identifier: "#245",
+      title: "analytics aggregation 워크플로 부활",
+      description: """
+      ## PR 진행 계획
+
+      ### PR1: web-api internal drain endpoint와 bounded 처리 계약
+
+      endpoint를 추가한다.
+
+      ### PR2: Terraform-managed Lambda cron과 staging 배포
+
+      Lambda cron을 추가한다.
+
+      ### PR3: production 적용과 운영 문서화
+
+      production에 적용한다.
+      """,
+      state: "Planned",
+      kind: :issue,
+      url: "https://github.com/studiojin-dev/myven/issues/245"
+    }
+
+    assert {:ok, pull_request} = Client.create_pull_request_for_issue(issue)
+    assert pull_request.id == "github:pr:248"
+    assert pull_request.branch_name == "symphony/_245-pr2"
+
+    refute_receive {:github_request, :post, "/repos/studiojin-dev/myven/pulls", nil, %{head: "symphony/_245-feature"}}
+    refute_receive {:github_request, :post, "/repos/studiojin-dev/myven/pulls", nil, %{head: "symphony/_245-pr1"}}
   end
 
   test "creates all split pull requests when the planned GitHub issue explicitly marks parallel execution" do
@@ -437,25 +589,30 @@ defmodule SymphonyElixir.GitHubClientTest do
           github_response(201, %{"ref" => json.ref, "object" => %{"sha" => json.sha}})
 
         {:post, "/repos/studiojin-dev/myven/pulls"} ->
+          pull_order = Process.get(:github_client_test_91_pull_order, [])
+          Process.put(:github_client_test_91_pull_order, [json.head | pull_order])
+
           pull_number =
             case json.head do
               "symphony/_91-pr1" ->
                 assert json.base == "symphony/_91-feature"
                 assert json.title == "Issue #91 PR1: 독립 API 테스트"
-                90
+                91
 
               "symphony/_91-pr2" ->
                 assert json.base == "symphony/_91-feature"
                 assert json.title == "Issue #91 PR2: 독립 UI 스모크"
-                91
+                92
 
               "symphony/_91-feature" ->
                 assert json.base == "main"
                 assert json.title == "Issue #91: 병렬 분할 작업 통합"
                 assert json.body =~ "Closes #91"
+                assert json.body =~ "`sym:waiting` 상태로 유지"
+                assert json.body =~ "implementation/review/rework/merge lane"
                 assert json.body =~ "- PR1: 독립 API 테스트"
                 assert json.body =~ "- PR2: 독립 UI 스모크"
-                92
+                90
             end
 
           if json.head != "symphony/_91-feature" do
@@ -467,7 +624,25 @@ defmodule SymphonyElixir.GitHubClientTest do
           github_response(201, %{"number" => pull_number})
 
         {:get, "/repos/studiojin-dev/myven/issues/" <> pull_number_text} ->
-          github_response(200, raw_pull_request_issue(String.to_integer(pull_number_text), [%{"name" => "sym:planned"}]))
+          pull_number = String.to_integer(pull_number_text)
+          issue_fetch_count = Process.get({:github_client_test_91_issue_fetch_count, pull_number}, 0) + 1
+          Process.put({:github_client_test_91_issue_fetch_count, pull_number}, issue_fetch_count)
+
+          labels =
+            if issue_fetch_count == 1 do
+              []
+            else
+              label =
+                case pull_number do
+                  90 -> "sym:waiting"
+                  91 -> "sym:planned"
+                  92 -> "sym:planned"
+                end
+
+              [%{"name" => label}]
+            end
+
+          github_response(200, raw_pull_request_issue(pull_number, labels))
 
         {:get, "/repos/studiojin-dev/myven/labels/" <> encoded_label} ->
           github_response(200, %{"name" => URI.decode_www_form(encoded_label)})
@@ -478,17 +653,17 @@ defmodule SymphonyElixir.GitHubClientTest do
 
         {:post, "/repos/studiojin-dev/myven/issues/" <> pull_label_path} ->
           assert String.ends_with?(pull_label_path, "/labels")
-          assert json in [%{labels: ["sym:planned"]}, %{labels: ["sym:human-review"]}]
+          assert json in [%{labels: ["sym:planned"]}, %{labels: ["sym:waiting"]}]
           github_response(200, Enum.map(json.labels, &%{"name" => &1}))
 
         {:get, "/repos/studiojin-dev/myven/pulls/90"} ->
-          github_response(200, %{"head" => %{"ref" => "symphony/_91-pr1"}, "merged" => false})
+          github_response(200, %{"head" => %{"ref" => "symphony/_91-feature"}, "merged" => false})
 
         {:get, "/repos/studiojin-dev/myven/pulls/91"} ->
-          github_response(200, %{"head" => %{"ref" => "symphony/_91-pr2"}, "merged" => false})
+          github_response(200, %{"head" => %{"ref" => "symphony/_91-pr1"}, "merged" => false})
 
         {:get, "/repos/studiojin-dev/myven/pulls/92"} ->
-          github_response(200, %{"head" => %{"ref" => "symphony/_91-feature"}, "merged" => false})
+          github_response(200, %{"head" => %{"ref" => "symphony/_91-pr2"}, "merged" => false})
       end
     end)
 
@@ -513,7 +688,13 @@ defmodule SymphonyElixir.GitHubClientTest do
     }
 
     assert {:ok, pull_request} = Client.create_pull_request_for_issue(issue)
-    assert pull_request.id == "github:pr:90"
+    assert pull_request.id == "github:pr:91"
+
+    assert Enum.reverse(Process.get(:github_client_test_91_pull_order, [])) == [
+             "symphony/_91-feature",
+             "symphony/_91-pr1",
+             "symphony/_91-pr2"
+           ]
 
     assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/pulls", nil, %{head: "symphony/_91-pr1"}}
     assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/pulls", nil, %{head: "symphony/_91-pr2"}}
