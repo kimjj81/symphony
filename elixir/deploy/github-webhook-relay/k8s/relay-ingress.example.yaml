@@ -1,0 +1,31 @@
+# Example ingress for a cluster where Cloudflare Tunnel routes to Kubernetes Ingress.
+# Host is the intended Cloudflare Tunnel public hostname.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: github-webhook-relay
+  namespace: webhook-relay
+  annotations:
+    # If TLS is terminated by Cloudflare Tunnel, no cert-manager annotation is needed here.
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "25m"
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: ghook.windroamer.com
+      http:
+        paths:
+          - path: /github
+            pathType: Exact
+            backend:
+              service:
+                name: github-webhook-relay
+                port:
+                  name: http
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: github-webhook-relay
+                port:
+                  name: http

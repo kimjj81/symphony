@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: github-webhook-relay
+  namespace: webhook-relay
+  labels:
+    app.kubernetes.io/name: github-webhook-relay
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: github-webhook-relay
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

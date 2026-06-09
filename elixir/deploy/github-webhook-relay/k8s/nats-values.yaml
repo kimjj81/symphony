@@ -1,0 +1,42 @@
+# Helm values for the official nats/nats chart.
+# Install example:
+#   helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+#   helm upgrade --install nats nats/nats \
+#     --namespace webhook-relay \
+#     --values deploy/github-webhook-relay/k8s/nats-values.yaml
+
+config:
+  cluster:
+    enabled: false
+  jetstream:
+    enabled: true
+    fileStore:
+      enabled: true
+      pvc:
+        enabled: true
+        size: 5Gi
+    memoryStore:
+      enabled: true
+      maxSize: 256Mi
+  nats:
+    port: 4222
+  websocket:
+    enabled: false
+
+container:
+  merge:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+natsBox:
+  enabled: true
+
+service:
+  merge:
+    spec:
+      type: ClusterIP

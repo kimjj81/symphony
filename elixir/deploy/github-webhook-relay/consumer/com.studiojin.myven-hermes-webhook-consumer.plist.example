@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.studiojin.myven-hermes-webhook-consumer</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/kimjeongjin/Repo/apps/symphony/elixir/deploy/github-webhook-relay/consumer/.venv/bin/python</string>
+    <string>/Users/kimjeongjin/Repo/apps/symphony/elixir/deploy/github-webhook-relay/consumer/myven_hermes_consumer.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/kimjeongjin/Repo/apps/symphony/elixir/deploy/github-webhook-relay/consumer</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NATS_URL</key>
+    <string>nats://example.invalid:4222</string>
+    <key>NATS_AUTH_TOKEN</key>
+    <string>replace-with-private-token</string>
+    <key>NATS_STREAM</key>
+    <string>GITHUB_WEBHOOKS</string>
+    <key>NATS_SUBJECT</key>
+    <string>github.webhook.*</string>
+    <key>NATS_DURABLE</key>
+    <string>myven-hermes-kanban</string>
+    <key>HERMES_KANBAN_BOARD</key>
+    <string>myven</string>
+    <key>MYVEN_WORKDIR</key>
+    <string>/Users/kimjeongjin/Repo/active/myven</string>
+    <key>GITHUB_REPOSITORY</key>
+    <string>studiojin-dev/myven</string>
+    <key>DRY_RUN</key>
+    <string>true</string>
+    <key>LOG_LEVEL</key>
+    <string>INFO</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/kimjeongjin/Library/Logs/myven-hermes-webhook-consumer.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/kimjeongjin/Library/Logs/myven-hermes-webhook-consumer.err.log</string>
+</dict>
+</plist>

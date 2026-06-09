@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-webhook-relay
+  namespace: webhook-relay
+  labels:
+    app.kubernetes.io/name: github-webhook-relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: github-webhook-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: github-webhook-relay
+    spec:
+      containers:
+        - name: relay
+          image: ghcr.io/studiojin-dev/github-webhook-relay:replace-with-tag
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              value: INFO
+            - name: NATS_URL
+              value: nats://nats.webhook-relay.svc.cluster.local:4222
+            - name: NATS_STREAM
+              value: GITHUB_WEBHOOKS
+            - name: NATS_SUBJECT_PREFIX
+              value: github.webhook
+            - name: NATS_MAX_AGE_SECONDS
+              value: "1209600"
+            - name: NATS_DUPLICATE_WINDOW_SECONDS
+              value: "86400"
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: github-webhook-relay-secrets
+                  key: github-webhook-secret
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
