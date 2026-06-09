@@ -35,6 +35,10 @@ erl_crash.dump
 *.swo
 *~
 
+# Python helper artifacts.
+__pycache__/
+*.py[cod]
+
 # IDE folders.
 .idea/
 .vscode/
