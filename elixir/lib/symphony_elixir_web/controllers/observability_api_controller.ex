@@ -5,15 +5,10 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   use Phoenix.Controller, formats: [:json]
 
-  require Logger
-
   alias Plug.Conn
-  alias SymphonyElixir.Config
-  alias SymphonyElixir.GitHub.Adapter, as: GitHubAdapter
+  alias SymphonyElixir.GitHub.WebhookProcessor
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
-  @github_webhook_events ~w(issues pull_request pull_request_review issue_comment)
-  @github_webhook_actions ~w(labeled unlabeled closed reopened synchronize submitted created)
   @github_webhook_secret_env "SYMPHONY_GITHUB_WEBHOOK_SECRET"
   @github_webhook_follow_up_refresh_ms 2_000
 
@@ -51,17 +46,23 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     with {:ok, secret} <- github_webhook_secret(),
          :ok <- verify_github_signature(conn, secret) do
       event = conn |> header_value("x-github-event") |> to_string()
-      action = params |> Map.get("action") |> to_string()
-      issue_id = github_webhook_issue_id(event, params)
 
-      sync_github_webhook_state(event, action, params, issue_id)
+      case WebhookProcessor.handle_event(event, params,
+             orchestrator: orchestrator(),
+             follow_up_delay_ms: github_webhook_follow_up_refresh_ms()
+           ) do
+        {:ok, payload} ->
+          conn
+          |> put_status(202)
+          |> json(payload)
 
-      if github_webhook_refresh_event?(event, action) do
-        github_webhook_refresh_response(conn, event, action, issue_id)
-      else
-        conn
-        |> put_status(202)
-        |> json(%{ignored: true, event: event, action: action})
+        {:ignored, payload} ->
+          conn
+          |> put_status(202)
+          |> json(Map.put(payload, :ignored, true))
+
+        {:error, :unavailable} ->
+          error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
       end
     else
       {:error, :missing_secret} ->
@@ -86,45 +87,6 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     conn
     |> put_status(status)
     |> json(%{error: %{code: code, message: message}})
-  end
-
-  defp github_webhook_refresh_response(conn, event, action, issue_id) do
-    case Presenter.webhook_refresh_payload(orchestrator(), github_webhook_follow_up_refresh_ms(), issue_id) do
-      {:ok, payload} ->
-        conn
-        |> put_status(202)
-        |> json(Map.merge(payload, github_webhook_response_metadata(event, action, issue_id)))
-
-      {:error, :unavailable} ->
-        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
-    end
-  end
-
-  defp github_webhook_response_metadata(event, action, issue_id) when is_binary(issue_id) do
-    %{event: event, action: action, issue_id: issue_id}
-  end
-
-  defp github_webhook_response_metadata(event, action, _issue_id), do: %{event: event, action: action}
-
-  defp sync_github_webhook_state(event, action, params, issue_id) do
-    case Config.settings() do
-      {:ok, %{tracker: %{kind: "github"}}} ->
-        do_sync_github_webhook_state(event, action, params, issue_id)
-
-      _ ->
-        :ok
-    end
-  end
-
-  defp do_sync_github_webhook_state(event, action, params, issue_id) do
-    case GitHubAdapter.sync_webhook_state(event, action, params) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning("GitHub webhook state sync failed event=#{event} action=#{action} issue_id=#{inspect(issue_id)} reason=#{inspect(reason)}")
-        :ok
-    end
   end
 
   defp orchestrator do
@@ -188,56 +150,4 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     |> get_req_header(header)
     |> List.first()
   end
-
-  defp github_webhook_refresh_event?(event, action) do
-    event in @github_webhook_events and action in @github_webhook_actions
-  end
-
-  defp github_webhook_issue_id("pull_request", %{"pull_request" => %{"number" => number}}) do
-    github_issue_id(:pull_request, number)
-  end
-
-  defp github_webhook_issue_id("pull_request", %{"number" => number}) do
-    github_issue_id(:pull_request, number)
-  end
-
-  defp github_webhook_issue_id("pull_request_review", %{"pull_request" => %{"number" => number}}) do
-    github_issue_id(:pull_request, number)
-  end
-
-  defp github_webhook_issue_id("issue_comment", %{"issue" => issue}) when is_map(issue) do
-    github_issue_id(github_issue_kind(issue), Map.get(issue, "number"))
-  end
-
-  defp github_webhook_issue_id("issues", %{"issue" => issue}) when is_map(issue) do
-    github_issue_id(github_issue_kind(issue), Map.get(issue, "number"))
-  end
-
-  defp github_webhook_issue_id("issues", %{"number" => number}) do
-    github_issue_id(:issue, number)
-  end
-
-  defp github_webhook_issue_id(_event, _params), do: nil
-
-  defp github_issue_kind(%{"pull_request" => pull_request}) when is_map(pull_request), do: :pull_request
-  defp github_issue_kind(_issue), do: :issue
-
-  defp github_issue_id(kind, number) when kind in [:issue, :pull_request] do
-    case normalize_github_issue_number(number) do
-      number when is_integer(number) and kind == :pull_request -> "github:pr:#{number}"
-      number when is_integer(number) -> "github:issue:#{number}"
-      nil -> nil
-    end
-  end
-
-  defp normalize_github_issue_number(number) when is_integer(number) and number > 0, do: number
-
-  defp normalize_github_issue_number(number) when is_binary(number) do
-    case Integer.parse(number) do
-      {parsed, ""} when parsed > 0 -> parsed
-      _ -> nil
-    end
-  end
-
-  defp normalize_github_issue_number(_number), do: nil
 end

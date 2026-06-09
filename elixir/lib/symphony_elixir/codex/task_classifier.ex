@@ -24,6 +24,8 @@ defmodule SymphonyElixir.Codex.TaskClassifier do
     [
       {"feature_without_tests", feature_without_tests?(context)},
       {"multi_file_refactor", multi_file_refactor?(context)},
+      {"planning", planning_task?(context.combined_text)},
+      {"review", review_task?(context.combined_text)},
       {"unknown_bug", unknown_bug_task?(context)},
       {"bug_with_test_log", bug_with_test_log?(context)},
       {"unknown_bug", bug_task?(context.combined_text)},
@@ -98,6 +100,16 @@ defmodule SymphonyElixir.Codex.TaskClassifier do
   defp multi_file_task?(text) do
     regex_match?(text, ~r/\b(multi[- ]file|multifile|multiple files|several files|many files)\b/u) or
       String.contains?(text, ["여러 파일", "다중 파일"])
+  end
+
+  defp planning_task?(text) do
+    regex_match?(text, ~r/\b(plan|planning|roadmap|spec|specification|design|architecture)\b/u) or
+      String.contains?(text, ["계획", "기획", "요구사항", "설계", "PR 진행 방식"])
+  end
+
+  defp review_task?(text) do
+    regex_match?(text, ~r/\b(review|reviewing|rework|feedback|inspect|inspection)\b/u) or
+      String.contains?(text, ["리뷰", "검토"])
   end
 
   defp bug_task?(text) do

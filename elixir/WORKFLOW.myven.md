@@ -221,6 +221,10 @@ agent:
 codex:
   command: codex app-server
   task_profiles:
+    planning:
+      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
+      model: gpt-5.5
+      effort: xhigh
     single_file_edit:
       command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=low app-server
       model: gpt-5.5
@@ -234,6 +238,10 @@ codex:
       model: gpt-5.5
       effort: high
     multi_file_refactor:
+      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=high app-server
+      model: gpt-5.5
+      effort: high
+    review:
       command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=high app-server
       model: gpt-5.5
       effort: high
@@ -301,6 +309,8 @@ Reasoning profile policy:
 | 작업 유형 | 기본 정책 |
 | --- | --- |
 | 명확한 단일 파일 수정 | 짧은 reasoning: `gpt-5.5` + `low` effort |
+| 계획/기획 | 강한 reasoning: `gpt-5.5` + `xhigh` effort |
+| 리뷰/검토 | 긴 reasoning: `gpt-5.5` + `high` effort |
 | 테스트 실패 로그가 있는 버그 | 중간 reasoning: `gpt-5.5` + `medium` effort, 테스트 로그 포함 |
 | 원인 불명 버그 | 긴 reasoning: `gpt-5.5` + `high` effort, 먼저 진단 계획 |
 | 다중 파일 리팩터 | 긴 reasoning: `gpt-5.5` + `high` effort, plan 먼저 + patch 나중 |

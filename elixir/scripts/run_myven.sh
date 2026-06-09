@@ -13,6 +13,7 @@ fi
 
 export SYMPHONY_CODEX_NETWORK_ACCESS="${SYMPHONY_CODEX_NETWORK_ACCESS:-true}"
 export SYMPHONY_PORT="${SYMPHONY_PORT:-4000}"
+export SYMPHONY_GITHUB_WEBHOOK_URL="${SYMPHONY_GITHUB_WEBHOOK_URL:-https://ghook.windroamer.com/github}"
 
 ngrok_pid=""
 webhook_registration_pid=""
@@ -37,7 +38,7 @@ cleanup() {
 require_command() {
   command_name="$1"
   if ! command -v "$command_name" >/dev/null 2>&1; then
-    printf 'ERROR: %s is required for SYMPHONY_GITHUB_WEBHOOK_MODE=ngrok\n' "$command_name" >&2
+    printf 'ERROR: %s is required for GitHub webhook registration\n' "$command_name" >&2
     exit 1
   fi
 }
@@ -125,6 +126,8 @@ register_github_webhook() {
     -F events[]=issues
     -F events[]=pull_request
     -F events[]=pull_request_review
+    -F events[]=pull_request_review_comment
+    -F events[]=pull_request_review_thread
     -F events[]=issue_comment
     -f "config[url]=$webhook_url"
     -f "config[content_type]=json"
@@ -149,13 +152,30 @@ register_github_webhook_after_symphony_starts() {
   register_github_webhook "${NGROK_URL}/api/v1/github/webhook"
 }
 
+register_fixed_github_webhook() {
+  ensure_github_webhook_secret
+  register_github_webhook "$SYMPHONY_GITHUB_WEBHOOK_URL"
+}
+
 mise trust
 mise install
 mise exec -- mix build
 
-if [ "${SYMPHONY_GITHUB_WEBHOOK_MODE:-}" != "ngrok" ]; then
-  exec mise exec -- ./bin/symphony ./WORKFLOW.myven.md --port "$SYMPHONY_PORT" --i-understand-that-this-will-be-running-without-the-usual-guardrails
-fi
+case "${SYMPHONY_GITHUB_WEBHOOK_MODE:-}" in
+  ""|none)
+    exec mise exec -- ./bin/symphony ./WORKFLOW.myven.md --port "$SYMPHONY_PORT" --i-understand-that-this-will-be-running-without-the-usual-guardrails
+    ;;
+  fixed|ghook|relay)
+    register_fixed_github_webhook
+    exec mise exec -- ./bin/symphony ./WORKFLOW.myven.md --port "$SYMPHONY_PORT" --i-understand-that-this-will-be-running-without-the-usual-guardrails
+    ;;
+  ngrok)
+    ;;
+  *)
+    printf 'ERROR: unsupported SYMPHONY_GITHUB_WEBHOOK_MODE=%s; use none, fixed, ghook, relay, or ngrok\n' "$SYMPHONY_GITHUB_WEBHOOK_MODE" >&2
+    exit 1
+    ;;
+esac
 
 trap cleanup INT TERM EXIT
 

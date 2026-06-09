@@ -218,17 +218,35 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 
-For the Myven workflow, `scripts/run_myven.sh` can optionally expose the local Phoenix API through
-ngrok and register the GitHub webhook:
+For the Myven workflow, `scripts/run_myven.sh` can register GitHub webhooks against the fixed
+Oracle relay endpoint used by the local consumers:
 
 ```bash
-SYMPHONY_GITHUB_WEBHOOK_MODE=ngrok ./scripts/run_myven.sh
+SYMPHONY_GITHUB_WEBHOOK_MODE=ghook \
+SYMPHONY_GITHUB_WEBHOOK_URL=https://ghook.windroamer.com/github \
+./scripts/run_myven.sh
 ```
 
 The script stores the reusable webhook secret under
 `$HOME/.config/symphony/myven-github-webhook-secret` and the GitHub hook id under
-`$HOME/.cache/symphony/myven-github-webhook-id`. Without `SYMPHONY_GITHUB_WEBHOOK_MODE=ngrok`, it
-keeps the normal local polling path.
+`$HOME/.cache/symphony/myven-github-webhook-id`. Without `SYMPHONY_GITHUB_WEBHOOK_MODE`, it keeps the
+normal local polling path. `SYMPHONY_GITHUB_WEBHOOK_MODE=ngrok` remains available for local direct
+Phoenix API experiments, but should not be used for Myven's fixed relay setup.
+
+The fixed relay publishes GitHub deliveries to NATS for local consumers such as Hermes Kanban and
+Symphony itself. Enable Symphony's opt-in NATS consumer with its own durable consumer name so it does
+not compete with Hermes Kanban:
+
+```bash
+SYMPHONY_NATS_WEBHOOK_ENABLED=true
+SYMPHONY_NATS_URL=nats://100.77.171.83:24222
+SYMPHONY_NATS_STREAM=GITHUB_WEBHOOKS
+SYMPHONY_NATS_DURABLE=symphony-webhook
+SYMPHONY_NATS_SUBJECT=github.webhook.*
+```
+
+NATS messages are fed through the same GitHub webhook processor used by `/api/v1/github/webhook`, so
+labels/comments/reviews trigger the same GitHub state sync and targeted orchestrator refreshes.
 
 ## Project Layout
 

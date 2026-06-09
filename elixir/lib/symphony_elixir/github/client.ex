@@ -1007,21 +1007,24 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp requested_split_child_spec(number, all_specs) do
     case requested_split_pr_number(number) do
-      pr_number when is_integer(pr_number) ->
-        case Enum.find(all_specs, &(&1.section.number == pr_number)) do
-          nil ->
-            :none
+      pr_number when is_integer(pr_number) -> requested_split_child_spec_for_pr(pr_number, all_specs)
+      nil -> :none
+    end
+  end
 
-          spec ->
-            case split_child_merged?(spec) do
-              {:ok, true} -> :none
-              {:ok, false} -> {:ok, spec}
-              {:error, reason} -> {:error, reason}
-            end
-        end
+  defp requested_split_child_spec_for_pr(pr_number, all_specs) do
+    all_specs
+    |> Enum.find(&(&1.section.number == pr_number))
+    |> maybe_requested_split_child_spec()
+  end
 
-      nil ->
-        :none
+  defp maybe_requested_split_child_spec(nil), do: :none
+
+  defp maybe_requested_split_child_spec(spec) do
+    case split_child_merged?(spec) do
+      {:ok, true} -> :none
+      {:ok, false} -> {:ok, spec}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -1245,8 +1248,7 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp maybe_mark_integration_pull_request(%Issue{} = pull_request, %{integration?: true}) do
-    metadata = pull_request.metadata || %{}
-    %{pull_request | metadata: Map.put(metadata, :integration_pull_request?, true)}
+    %{pull_request | metadata: Map.put(pull_request.metadata, :integration_pull_request?, true)}
   end
 
   defp maybe_mark_integration_pull_request(%Issue{} = pull_request, _spec), do: pull_request

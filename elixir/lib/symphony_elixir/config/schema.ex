@@ -188,6 +188,8 @@ defmodule SymphonyElixir.Config.Schema do
     @default_model "gpt-5.5"
     @default_command "codex app-server"
     @task_profile_defaults %{
+      "planning" => %{"model" => @default_model, "effort" => "xhigh"},
+      "review" => %{"model" => @default_model, "effort" => "high"},
       "single_file_edit" => %{"model" => @default_model, "effort" => "low"},
       "bug_with_test_log" => %{"model" => @default_model, "effort" => "medium"},
       "unknown_bug" => %{"model" => @default_model, "effort" => "high"},

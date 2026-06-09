@@ -19,18 +19,21 @@ defmodule SymphonyElixir.Application do
 
   use Application
 
+  alias SymphonyElixir.GitHub.NatsWebhookConsumer
+
   @impl true
   def start(_type, _args) do
     :ok = SymphonyElixir.LogFile.configure()
 
-    children = [
-      {Phoenix.PubSub, name: SymphonyElixir.PubSub},
-      {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
-      SymphonyElixir.WorkflowStore,
-      SymphonyElixir.Orchestrator,
-      SymphonyElixir.HttpServer,
-      SymphonyElixir.StatusDashboard
-    ]
+    children =
+      [
+        {Phoenix.PubSub, name: SymphonyElixir.PubSub},
+        {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
+        SymphonyElixir.WorkflowStore,
+        SymphonyElixir.Orchestrator,
+        SymphonyElixir.HttpServer,
+        SymphonyElixir.StatusDashboard
+      ] ++ NatsWebhookConsumer.child_specs_from_env()
 
     Supervisor.start_link(
       children,

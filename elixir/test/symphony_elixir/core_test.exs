@@ -93,6 +93,18 @@ defmodule SymphonyElixir.CoreTest do
              "effort" => "low"
            }
 
+    assert config.codex.task_profiles["planning"] == %{
+             "command" => "codex app-server",
+             "model" => "gpt-5.5",
+             "effort" => "xhigh"
+           }
+
+    assert config.codex.task_profiles["review"] == %{
+             "command" => "codex app-server",
+             "model" => "gpt-5.5",
+             "effort" => "high"
+           }
+
     assert config.codex.task_profiles["default"]["effort"] == "medium"
 
     assert CodexConfig.default_task_profiles()["feature_without_tests"] == %{
@@ -244,6 +256,10 @@ defmodule SymphonyElixir.CoreTest do
              "model" => "gpt-5.5",
              "effort" => "low"
            }
+
+    assert settings.codex.task_profiles["planning"]["effort"] == "xhigh"
+
+    assert settings.codex.task_profiles["review"]["effort"] == "high"
 
     assert settings.codex.task_profiles["bug_with_test_log"]["effort"] == "medium"
     assert settings.codex.task_profiles["unknown_bug"]["effort"] == "high"
