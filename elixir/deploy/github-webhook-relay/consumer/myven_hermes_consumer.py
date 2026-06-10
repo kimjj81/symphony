@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import Any
@@ -273,6 +274,35 @@ def run_command(command: list[str], cwd: str, dry_run: bool) -> subprocess.Compl
     return subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=True)
 
 
+def hermes_binary() -> str:
+    """Return a launchd-safe Hermes executable path."""
+
+    configured = os.getenv("HERMES_BIN")
+    if configured:
+        return configured
+    user_local = os.path.expanduser("~/.local/bin/hermes")
+    if os.path.exists(user_local):
+        return user_local
+    return shutil.which("hermes") or "hermes"
+
+
+def created_task_id(result: subprocess.CompletedProcess[str] | None) -> str | None:
+    """Extract the task id from `hermes kanban create --json` output."""
+
+    if result is None or not result.stdout:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict):
+        for key in ("id", "task_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
 def reconcile_item(item: TrackerItem, dry_run: bool) -> None:
     """Create or reuse a Kanban task for the GitHub item.
 
@@ -286,7 +316,7 @@ def reconcile_item(item: TrackerItem, dry_run: bool) -> None:
     body = build_task_body(item)
 
     command = [
-        "hermes",
+        hermes_binary(),
         "kanban",
         "--board",
         os.getenv("HERMES_KANBAN_BOARD", "myven"),
@@ -300,14 +330,36 @@ def reconcile_item(item: TrackerItem, dry_run: bool) -> None:
         "myven-hermes-webhook-consumer",
         "--body",
         body,
+        "--json",
     ]
 
     if status == "blocked":
         body += "\nInitial state: blocked/human gate or terminal relay notice."
-        command[-1] = body
+        command[command.index("--body") + 1] = body
         command.extend(["--initial-status", "blocked"])
 
-    run_command(command, cwd=workdir, dry_run=dry_run)
+    result = run_command(command, cwd=workdir, dry_run=dry_run)
+    task_id = created_task_id(result)
+    if task_id and item.comment is not None:
+        comment_body = "\n".join(
+            [
+                "GitHub webhook comment/review context appended to the idempotent task.",
+                *comment_context_lines(item.comment),
+            ]
+        )
+        run_command(
+            [
+                hermes_binary(),
+                "kanban",
+                "--board",
+                os.getenv("HERMES_KANBAN_BOARD", "myven"),
+                "comment",
+                task_id,
+                comment_body,
+            ],
+            cwd=workdir,
+            dry_run=dry_run,
+        )
 
 
 def decode_message(data: bytes) -> dict[str, Any]:
