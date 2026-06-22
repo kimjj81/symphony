@@ -34,6 +34,12 @@ Keep `DRY_RUN=true` until the NATS event flow is verified. Set `DRY_RUN=false` o
 
 The consumer includes GitHub comment context in Kanban task bodies when webhook payloads contain `comment`, including `issue_comment` and `pull_request_review_comment` deliveries. Inline review comments include URL, author, body, path, line/original line, and diff hunk when GitHub supplies those fields.
 
+It also auto-subscribes created Kanban tasks to the Telegram home channel when `TELEGRAM_HOME_CHANNEL` is set, and it syncs blocked items back to GitHub with the `hermes:human-review` label plus a Korean comment so the human gate is visible on the PR/issue itself.
+
+GitHub CLI auth:
+- `gh` must already be authenticated for label/comment sync to work.
+- If `gh` is missing or unauthenticated, the consumer will raise on the GitHub sync step and JetStream will redeliver until the auth issue is fixed.
+
 Logs:
 
 ```bash

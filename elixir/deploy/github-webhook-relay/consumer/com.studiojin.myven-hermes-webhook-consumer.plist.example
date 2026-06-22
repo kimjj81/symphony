@@ -32,6 +32,10 @@
     <string>/Users/kimjeongjin/Repo/active/myven</string>
     <key>GITHUB_REPOSITORY</key>
     <string>studiojin-dev/myven</string>
+    <key>TELEGRAM_HOME_CHANNEL</key>
+    <string>45656502</string>
+    <key>TELEGRAM_HOME_CHANNEL_THREAD_ID</key>
+    <string></string>
     <key>DRY_RUN</key>
     <string>true</string>
     <key>LOG_LEVEL</key>
