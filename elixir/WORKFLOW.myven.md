@@ -222,36 +222,40 @@ codex:
   command: codex app-server
   task_profiles:
     planning:
-      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
-      model: gpt-5.5
-      effort: xhigh
-    single_file_edit:
-      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=low app-server
-      model: gpt-5.5
-      effort: low
-    bug_with_test_log:
-      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=medium app-server
-      model: gpt-5.5
+      command: codex --config 'model="gpt-5.6-sol"' --config model_reasoning_effort=high app-server
+      model: gpt-5.6-sol
+      effort: high
+    exploration:
+      command: codex --config 'model="gpt-5.6-terra"' --config model_reasoning_effort=medium app-server
+      model: gpt-5.6-terra
       effort: medium
+    single_file_edit:
+      command: codex --config 'model="gpt-5.6-terra"' --config model_reasoning_effort=high app-server
+      model: gpt-5.6-terra
+      effort: high
+    bug_with_test_log:
+      command: codex --config 'model="gpt-5.6-terra"' --config model_reasoning_effort=high app-server
+      model: gpt-5.6-terra
+      effort: high
     unknown_bug:
-      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=high app-server
-      model: gpt-5.5
+      command: codex --config 'model="gpt-5.6-terra"' --config model_reasoning_effort=high app-server
+      model: gpt-5.6-terra
       effort: high
     multi_file_refactor:
-      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=high app-server
-      model: gpt-5.5
+      command: codex --config 'model="gpt-5.6-terra"' --config model_reasoning_effort=high app-server
+      model: gpt-5.6-terra
       effort: high
     review:
-      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=high app-server
-      model: gpt-5.5
-      effort: high
-    feature_without_tests:
-      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
-      model: gpt-5.5
+      command: codex --config 'model="gpt-5.6-sol"' --config model_reasoning_effort=xhigh app-server
+      model: gpt-5.6-sol
       effort: xhigh
+    feature_without_tests:
+      command: codex --config 'model="gpt-5.6-terra"' --config model_reasoning_effort=high app-server
+      model: gpt-5.6-terra
+      effort: high
     default:
-      command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=medium app-server
-      model: gpt-5.5
+      command: codex --config 'model="gpt-5.6-terra"' --config model_reasoning_effort=medium app-server
+      model: gpt-5.6-terra
       effort: medium
   approval_policy: on-request
   auto_approve_command_patterns:
@@ -308,13 +312,10 @@ Description:
 Reasoning profile policy:
 | 작업 유형 | 기본 정책 |
 | --- | --- |
-| 명확한 단일 파일 수정 | 짧은 reasoning: `gpt-5.5` + `low` effort |
-| 계획/기획 | 강한 reasoning: `gpt-5.5` + `xhigh` effort |
-| 리뷰/검토 | 긴 reasoning: `gpt-5.5` + `high` effort |
-| 테스트 실패 로그가 있는 버그 | 중간 reasoning: `gpt-5.5` + `medium` effort, 테스트 로그 포함 |
-| 원인 불명 버그 | 긴 reasoning: `gpt-5.5` + `high` effort, 먼저 진단 계획 |
-| 다중 파일 리팩터 | 긴 reasoning: `gpt-5.5` + `high` effort, plan 먼저 + patch 나중 |
-| 테스트가 없는 기능 추가 | 강한 reasoning: `gpt-5.5` + `xhigh` effort, 테스트 설계 먼저 |
+| 계획/기획 | `gpt-5.6-sol` + `high` effort |
+| 리뷰/검토 | `gpt-5.6-sol` + `xhigh` effort |
+| 탐색/조사/분석 | `gpt-5.6-terra` + `medium` effort |
+| 구현(단일 파일, 버그 수정, 리팩터, 기능 추가) | `gpt-5.6-terra` + `high` effort |
 
 Instructions:
 1. GitHub Todo issues are planning-only Codex runs. Implementation work belongs to pull request lanes; when a GitHub issue enters Planned, Symphony's control path may create or reuse a PR for that issue without implementing in the source issue lane.

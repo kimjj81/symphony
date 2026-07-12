@@ -255,7 +255,7 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Validate selected turn profile", issue, model: "gpt-5.5", effort: "low")
+      assert {:ok, _result} = AppServer.run(workspace, "Validate selected turn profile", issue, model: "gpt-5.6-terra", effort: "high")
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
@@ -267,8 +267,8 @@ defmodule SymphonyElixir.AppServerTest do
                  |> Jason.decode!()
                  |> then(fn payload ->
                    payload["method"] == "turn/start" &&
-                     get_in(payload, ["params", "model"]) == "gpt-5.5" &&
-                     get_in(payload, ["params", "effort"]) == "low"
+                     get_in(payload, ["params", "model"]) == "gpt-5.6-terra" &&
+                     get_in(payload, ["params", "effort"]) == "high"
                  end)
                else
                  false

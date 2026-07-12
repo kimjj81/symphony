@@ -26,6 +26,7 @@ defmodule SymphonyElixir.Codex.TaskClassifier do
       {"multi_file_refactor", multi_file_refactor?(context)},
       {"planning", planning_task?(context.combined_text)},
       {"review", review_task?(context.combined_text)},
+      {"exploration", exploration_task?(context.combined_text)},
       {"unknown_bug", unknown_bug_task?(context)},
       {"bug_with_test_log", bug_with_test_log?(context)},
       {"unknown_bug", bug_task?(context.combined_text)},
@@ -110,6 +111,11 @@ defmodule SymphonyElixir.Codex.TaskClassifier do
   defp review_task?(text) do
     regex_match?(text, ~r/\b(review|reviewing|rework|feedback|inspect|inspection)\b/u) or
       String.contains?(text, ["리뷰", "검토"])
+  end
+
+  defp exploration_task?(text) do
+    regex_match?(text, ~r/\b(explore|exploration|investigate|investigation|research|analyze|analysis)\b/u) or
+      String.contains?(text, ["탐색", "조사", "분석"])
   end
 
   defp bug_task?(text) do

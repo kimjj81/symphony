@@ -89,28 +89,34 @@ defmodule SymphonyElixir.CoreTest do
 
     assert config.codex.task_profiles["single_file_edit"] == %{
              "command" => "codex app-server",
-             "model" => "gpt-5.5",
-             "effort" => "low"
+             "model" => "gpt-5.6-terra",
+             "effort" => "high"
            }
 
     assert config.codex.task_profiles["planning"] == %{
              "command" => "codex app-server",
-             "model" => "gpt-5.5",
-             "effort" => "xhigh"
+             "model" => "gpt-5.6-sol",
+             "effort" => "high"
            }
 
     assert config.codex.task_profiles["review"] == %{
              "command" => "codex app-server",
-             "model" => "gpt-5.5",
-             "effort" => "high"
+             "model" => "gpt-5.6-sol",
+             "effort" => "xhigh"
            }
 
-    assert config.codex.task_profiles["default"]["effort"] == "medium"
+    assert config.codex.task_profiles["exploration"] == %{
+             "command" => "codex app-server",
+             "model" => "gpt-5.6-terra",
+             "effort" => "medium"
+           }
+
+    assert config.codex.task_profiles["default"] == config.codex.task_profiles["exploration"]
 
     assert CodexConfig.default_task_profiles()["feature_without_tests"] == %{
              "command" => "codex app-server",
-             "model" => "gpt-5.5",
-             "effort" => "xhigh"
+             "model" => "gpt-5.6-terra",
+             "effort" => "high"
            }
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
@@ -208,7 +214,7 @@ defmodule SymphonyElixir.CoreTest do
     assert message =~ "codex.auto_approve_command_patterns"
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      codex_task_profiles: %{default: %{model: "gpt-5.5", effort: "extreme"}}
+      codex_task_profiles: %{default: %{model: "gpt-5.6-terra", effort: "extreme"}}
     )
 
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -221,18 +227,18 @@ defmodule SymphonyElixir.CoreTest do
 
     assert Config.settings!().codex.task_profiles["default"] == %{
              "command" => "codex app-server",
-             "model" => "gpt-5.5",
+             "model" => "gpt-5.6-terra",
              "effort" => "medium"
            }
 
     invalid_task_profile_cases = [
-      {%{unsupported: %{model: "gpt-5.5", effort: "medium"}}, "contains unsupported profile unsupported"},
+      {%{unsupported: %{model: "gpt-5.6-terra", effort: "medium"}}, "contains unsupported profile unsupported"},
       {%{default: "bad"}, "profile default must be a map"},
-      {%{default: %{command: " ", model: "gpt-5.5", effort: "medium"}}, "profile default command can't be blank"},
-      {%{default: %{command: 123, model: "gpt-5.5", effort: "medium"}}, "profile default command must be a string"},
-      {%{default: %{model: "gpt-4.1", effort: "medium"}}, "profile default model must be gpt-5.5"},
+      {%{default: %{command: " ", model: "gpt-5.6-terra", effort: "medium"}}, "profile default command can't be blank"},
+      {%{default: %{command: 123, model: "gpt-5.6-terra", effort: "medium"}}, "profile default command must be a string"},
+      {%{default: %{model: "gpt-4.1", effort: "medium"}}, "profile default model must be one of gpt-5.6-terra|gpt-5.6-sol"},
       {%{default: %{model: 123, effort: "medium"}}, "profile default model must be a string"},
-      {%{default: %{model: "gpt-5.5", effort: 123}}, "profile default effort must be a string"}
+      {%{default: %{model: "gpt-5.6-terra", effort: 123}}, "profile default effort must be a string"}
     ]
 
     Enum.each(invalid_task_profile_cases, fn {task_profiles, expected_message} ->
@@ -252,22 +258,27 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, settings} = Config.Schema.parse(config)
 
     assert settings.codex.task_profiles["single_file_edit"] == %{
-             "command" => "codex --config 'model=\"gpt-5.5\"' --config model_reasoning_effort=low app-server",
-             "model" => "gpt-5.5",
-             "effort" => "low"
+             "command" => "codex --config 'model=\"gpt-5.6-terra\"' --config model_reasoning_effort=high app-server",
+             "model" => "gpt-5.6-terra",
+             "effort" => "high"
            }
 
-    assert settings.codex.task_profiles["planning"]["effort"] == "xhigh"
+    assert settings.codex.task_profiles["planning"] == %{
+             "command" => "codex --config 'model=\"gpt-5.6-sol\"' --config model_reasoning_effort=high app-server",
+             "model" => "gpt-5.6-sol",
+             "effort" => "high"
+           }
 
-    assert settings.codex.task_profiles["review"]["effort"] == "high"
-
-    assert settings.codex.task_profiles["bug_with_test_log"]["effort"] == "medium"
+    assert settings.codex.task_profiles["review"]["model"] == "gpt-5.6-sol"
+    assert settings.codex.task_profiles["review"]["effort"] == "xhigh"
+    assert settings.codex.task_profiles["exploration"]["effort"] == "medium"
+    assert settings.codex.task_profiles["bug_with_test_log"]["effort"] == "high"
     assert settings.codex.task_profiles["unknown_bug"]["effort"] == "high"
     assert settings.codex.task_profiles["multi_file_refactor"]["effort"] == "high"
-    assert settings.codex.task_profiles["feature_without_tests"]["effort"] == "xhigh"
+    assert settings.codex.task_profiles["feature_without_tests"]["effort"] == "high"
     assert settings.codex.task_profiles["default"]["effort"] == "medium"
     assert prompt =~ "Reasoning profile policy:"
-    assert prompt =~ "| 테스트가 없는 기능 추가 | 강한 reasoning"
+    assert prompt =~ "| 탐색/조사/분석 | `gpt-5.6-terra` + `medium` effort |"
   end
 
   test "current WORKFLOW.md file is valid and complete" do
@@ -2372,7 +2383,7 @@ defmodule SymphonyElixir.CoreTest do
         end)
 
       assert Enum.all?(turn_payloads, fn payload ->
-               get_in(payload, ["params", "model"]) == "gpt-5.5" &&
+               get_in(payload, ["params", "model"]) == "gpt-5.6-terra" &&
                  get_in(payload, ["params", "effort"]) == "medium"
              end)
 
@@ -2442,12 +2453,12 @@ defmodule SymphonyElixir.CoreTest do
         codex_task_profiles: %{
           single_file_edit: %{
             command: "#{codex_binary} --config model_reasoning_effort=low app-server",
-            model: "gpt-5.5",
+            model: "gpt-5.6-terra",
             effort: "low"
           },
           default: %{
             command: "#{codex_binary} --config model_reasoning_effort=medium app-server",
-            model: "gpt-5.5",
+            model: "gpt-5.6-terra",
             effort: "medium"
           }
         }
@@ -2478,7 +2489,7 @@ defmodule SymphonyElixir.CoreTest do
                  |> Jason.decode!()
                  |> then(fn payload ->
                    payload["method"] == "turn/start" &&
-                     get_in(payload, ["params", "model"]) == "gpt-5.5" &&
+                     get_in(payload, ["params", "model"]) == "gpt-5.6-terra" &&
                      get_in(payload, ["params", "effort"]) == "low"
                  end)
                else
@@ -2792,7 +2803,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        codex_command: "#{codex_binary} --config 'model=\"gpt-5.5\"' app-server"
+        codex_command: "#{codex_binary} --config 'model=\"gpt-5.6-terra\"' app-server"
       )
 
       issue = %Issue{
@@ -2811,7 +2822,7 @@ defmodule SymphonyElixir.CoreTest do
       lines = String.split(trace, "\n", trim: true)
 
       assert argv_line = Enum.find(lines, fn line -> String.starts_with?(line, "ARGV:") end)
-      assert String.contains?(argv_line, "--config model=\"gpt-5.5\" app-server")
+      assert String.contains?(argv_line, "--config model=\"gpt-5.6-terra\" app-server")
       refute String.contains?(argv_line, "--ask-for-approval never")
       refute String.contains?(argv_line, "--sandbox danger-full-access")
     after

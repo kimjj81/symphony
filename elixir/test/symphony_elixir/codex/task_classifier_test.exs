@@ -17,6 +17,13 @@ defmodule SymphonyElixir.Codex.TaskClassifierTest do
            }) == "review"
   end
 
+  test "classifies exploration tasks as exploration" do
+    assert TaskClassifier.classify(%{
+             "title" => "인증 흐름 조사",
+             "description" => "현재 동작을 탐색하고 관련 코드를 분석해 주세요"
+           }) == "exploration"
+  end
+
   test "keeps ordinary work in default profile" do
     assert TaskClassifier.classify(%{
              "title" => "문서 정리",

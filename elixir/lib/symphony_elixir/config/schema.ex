@@ -185,17 +185,20 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
-    @default_model "gpt-5.5"
+    @implementation_model "gpt-5.6-terra"
+    @reasoning_model "gpt-5.6-sol"
+    @allowed_models [@implementation_model, @reasoning_model]
     @default_command "codex app-server"
     @task_profile_defaults %{
-      "planning" => %{"model" => @default_model, "effort" => "xhigh"},
-      "review" => %{"model" => @default_model, "effort" => "high"},
-      "single_file_edit" => %{"model" => @default_model, "effort" => "low"},
-      "bug_with_test_log" => %{"model" => @default_model, "effort" => "medium"},
-      "unknown_bug" => %{"model" => @default_model, "effort" => "high"},
-      "multi_file_refactor" => %{"model" => @default_model, "effort" => "high"},
-      "feature_without_tests" => %{"model" => @default_model, "effort" => "xhigh"},
-      "default" => %{"model" => @default_model, "effort" => "medium"}
+      "planning" => %{"model" => @reasoning_model, "effort" => "high"},
+      "review" => %{"model" => @reasoning_model, "effort" => "xhigh"},
+      "exploration" => %{"model" => @implementation_model, "effort" => "medium"},
+      "single_file_edit" => %{"model" => @implementation_model, "effort" => "high"},
+      "bug_with_test_log" => %{"model" => @implementation_model, "effort" => "high"},
+      "unknown_bug" => %{"model" => @implementation_model, "effort" => "high"},
+      "multi_file_refactor" => %{"model" => @implementation_model, "effort" => "high"},
+      "feature_without_tests" => %{"model" => @implementation_model, "effort" => "high"},
+      "default" => %{"model" => @implementation_model, "effort" => "medium"}
     }
     @task_profile_keys Map.keys(@task_profile_defaults)
     @reasoning_efforts ~w(none minimal low medium high xhigh)
@@ -318,10 +321,12 @@ defmodule SymphonyElixir.Config.Schema do
 
     defp validate_profile_model(errors, _profile_key, nil), do: errors
 
-    defp validate_profile_model(errors, _profile_key, @default_model), do: errors
-
     defp validate_profile_model(errors, profile_key, model) when is_binary(model) do
-      [{:task_profiles, "profile #{profile_key} model must be #{@default_model}, got #{model}"} | errors]
+      if model in @allowed_models do
+        errors
+      else
+        [{:task_profiles, "profile #{profile_key} model must be one of #{Enum.join(@allowed_models, "|")}, got #{model}"} | errors]
+      end
     end
 
     defp validate_profile_model(errors, profile_key, _model) do
