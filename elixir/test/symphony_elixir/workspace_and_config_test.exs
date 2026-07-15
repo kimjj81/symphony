@@ -56,6 +56,52 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Path.basename(first_workspace) == "MT_Det"
   end
 
+  test "pull request workspace uses a detached checkout of the remote head branch" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-pr-worktree-#{System.unique_integer([:positive])}")
+
+    try do
+      remote = Path.join(test_root, "remote.git")
+      source = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(test_root)
+      System.cmd("git", ["init", "--bare", remote])
+      System.cmd("git", ["init", "-b", "main", source])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      File.write!(Path.join(source, "README.md"), "main\n")
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "initial"])
+      System.cmd("git", ["-C", source, "remote", "add", "origin", remote])
+      System.cmd("git", ["-C", source, "push", "-u", "origin", "main"])
+      System.cmd("git", ["-C", source, "checkout", "-b", "review-head"])
+      File.write!(Path.join(source, "README.md"), "review head\n")
+      System.cmd("git", ["-C", source, "commit", "-am", "review head"])
+      System.cmd("git", ["-C", source, "push", "-u", "origin", "review-head"])
+      System.cmd("git", ["-C", source, "checkout", "main"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "git_worktree",
+        workspace_source: source,
+        workspace_base_ref: "origin/main"
+      )
+
+      issue = %SymphonyElixir.Tracker.Issue{
+        id: "github:pr:90",
+        identifier: "PR #90",
+        kind: :pull_request,
+        branch_name: "review-head"
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.read!(Path.join(workspace, "README.md")) == "review head\n"
+      assert {"HEAD\n", 0} = System.cmd("git", ["-C", workspace, "rev-parse", "--abbrev-ref", "HEAD"])
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace reuses existing issue directory without deleting local changes" do
     workspace_root =
       Path.join(

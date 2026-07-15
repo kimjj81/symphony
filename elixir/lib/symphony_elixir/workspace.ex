@@ -128,6 +128,10 @@ defmodule SymphonyElixir.Workspace do
       File.dir?(workspace) ->
         {:ok, workspace, false}
 
+      is_binary(Map.get(issue_context, :pull_request_branch)) and
+          String.trim(issue_context.pull_request_branch) != "" ->
+        ensure_pull_request_worktree(workspace, settings.source, issue_context.pull_request_branch)
+
       true ->
         File.rm_rf!(workspace)
         branch = worktree_branch(issue_context)
@@ -137,6 +141,23 @@ defmodule SymphonyElixir.Workspace do
           {_output, 0} -> {:ok, workspace, true}
           {output, status} -> {:error, {:git_worktree_add_failed, status, output}}
         end
+    end
+  end
+
+  defp ensure_pull_request_worktree(workspace, source, pull_request_branch) do
+    File.rm_rf!(workspace)
+
+    with {_output, 0} <-
+           System.cmd("git", ["-C", source, "fetch", "origin", pull_request_branch], stderr_to_stdout: true),
+         {_output, 0} <-
+           System.cmd(
+             "git",
+             ["-C", source, "worktree", "add", "--detach", workspace, "FETCH_HEAD"],
+             stderr_to_stdout: true
+           ) do
+      {:ok, workspace, true}
+    else
+      {output, status} -> {:error, {:git_pull_request_worktree_add_failed, status, output}}
     end
   end
 
@@ -688,6 +709,7 @@ defmodule SymphonyElixir.Workspace do
       {"SYMPHONY_ISSUE_ID", to_string(issue_context.issue_id || "")},
       {"SYMPHONY_ISSUE_IDENTIFIER", to_string(issue_context.issue_identifier || "")},
       {"SYMPHONY_ISSUE_KIND", to_string(Map.get(issue_context, :issue_kind) || "")},
+      {"SYMPHONY_PR_HEAD_REF", to_string(Map.get(issue_context, :pull_request_branch) || "")},
       {"SYMPHONY_WORKSPACE", workspace},
       {"SYMPHONY_WORKTREE_BRANCH", worktree_branch(issue_context)}
     ]
@@ -705,7 +727,8 @@ defmodule SymphonyElixir.Workspace do
     %{
       issue_id: issue_id,
       issue_identifier: identifier || "issue",
-      issue_kind: Map.get(issue, :kind)
+      issue_kind: Map.get(issue, :kind),
+      pull_request_branch: Map.get(issue, :branch_name)
     }
   end
 

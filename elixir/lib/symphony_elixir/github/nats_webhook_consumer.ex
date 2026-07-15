@@ -140,7 +140,16 @@ defmodule SymphonyElixir.GitHub.NatsWebhookConsumer do
   end
 
   defp invoke_processor(processor_fun, event, payload, opts) when is_function(processor_fun, 3) do
-    processor_opts = Keyword.take(opts, [:orchestrator, :follow_up_delay_ms, :tracker_kind, :sync_fun, :refresh_fun])
+    processor_opts =
+      Keyword.take(opts, [
+        :orchestrator,
+        :follow_up_delay_ms,
+        :tracker_kind,
+        :sync_fun,
+        :queue_rework_fun,
+        :refresh_fun
+      ])
+
     processor_fun.(event, payload, processor_opts)
   end
 

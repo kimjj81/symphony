@@ -36,6 +36,12 @@ defmodule SymphonyElixir.GitHub.Client do
     "sym:canceled" => {"8c959f", "Closed without completion."},
     "sym:duplicate" => {"8c959f", "Duplicate work item."}
   }
+  @default_codex_review_bot_logins [
+    "chatgpt-codex-connector",
+    "chatgpt-codex-connector[bot]",
+    "codex",
+    "codex[bot]"
+  ]
 
   @spec default_state_labels() :: map()
   def default_state_labels, do: @default_state_labels
@@ -93,6 +99,32 @@ defmodule SymphonyElixir.GitHub.Client do
       _ -> :ok
     end
   end
+
+  @doc """
+  Adds an open PR to Symphony Rework when a configured Codex review bot creates
+  an inline review comment.
+
+  The webhook is intentionally only a dispatch signal. The Rework agent must
+  reread the live review threads and decide whether code changes or a justified
+  reply are actually required.
+  """
+  @spec queue_rework_from_review_comment(String.t(), String.t(), map()) :: :ok | {:error, term()}
+  def queue_rework_from_review_comment("pull_request_review_comment", "created", payload)
+      when is_map(payload) do
+    with {:ok, number} <- pull_request_number(payload),
+         true <- codex_review_comment?(payload),
+         {:ok, raw_issue} <- request(:get, "/issues/#{number}"),
+         true <- eligible_pull_request_for_rework?(raw_issue),
+         :ok <- update_issue_state(github_issue_id(:pull_request, number), "Rework") do
+      Logger.info("Queued Codex inline-review follow-up for GitHub PR ##{number}")
+      :ok
+    else
+      false -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def queue_rework_from_review_comment(_event, _action, _payload), do: :ok
 
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) when is_binary(issue_id) and is_binary(state_name) do
@@ -256,6 +288,45 @@ defmodule SymphonyElixir.GitHub.Client do
       {:error, _reason} -> nil
     end
   end
+
+  defp pull_request_number(%{"pull_request" => %{"number" => number}}),
+    do: normalize_github_number(number)
+
+  defp pull_request_number(_payload), do: {:error, :github_pull_request_number_missing}
+
+  defp codex_review_comment?(%{"comment" => comment} = payload) when is_map(comment) do
+    login =
+      comment
+      |> Map.get("user", Map.get(payload, "sender", %{}))
+      |> Map.get("login")
+      |> to_string()
+      |> String.downcase()
+
+    login in codex_review_bot_logins()
+  end
+
+  defp codex_review_comment?(_payload), do: false
+
+  @spec codex_review_bot_logins() :: [String.t()]
+  defp codex_review_bot_logins do
+    case System.get_env("SYMPHONY_CODEX_REVIEW_BOT_LOGINS") do
+      nil ->
+        @default_codex_review_bot_logins
+
+      logins ->
+        logins
+        |> String.split(",", trim: true)
+        |> Enum.map(&(String.trim(&1) |> String.downcase()))
+    end
+  end
+
+  defp eligible_pull_request_for_rework?(raw_issue) when is_map(raw_issue) do
+    Map.get(raw_issue, "state") == "open" and
+      issue_kind(raw_issue) == :pull_request and
+      not label_present?(extract_labels(raw_issue), label_for_state("Rework"))
+  end
+
+  defp eligible_pull_request_for_rework?(_raw_issue), do: false
 
   defp normalize_issue(raw_issue, pull_data \\ nil) when is_map(raw_issue) do
     labels = extract_labels(raw_issue)

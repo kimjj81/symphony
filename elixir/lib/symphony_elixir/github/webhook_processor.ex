@@ -21,6 +21,7 @@ defmodule SymphonyElixir.GitHub.WebhookProcessor do
     issue_id = issue_id(event, payload)
 
     sync_webhook_state(event, action, payload, issue_id, opts)
+    queue_rework_from_review_comment(event, action, payload, issue_id, opts)
 
     if refresh_event?(event, action) do
       refresh(event, action, issue_id, opts)
@@ -75,6 +76,24 @@ defmodule SymphonyElixir.GitHub.WebhookProcessor do
 
         {:error, reason} ->
           Logger.warning("GitHub webhook state sync failed event=#{event} action=#{action} issue_id=#{inspect(issue_id)} reason=#{inspect(reason)}")
+
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp queue_rework_from_review_comment(event, action, payload, issue_id, opts) do
+    if github_tracker?(opts) do
+      queue_fun = Keyword.get(opts, :queue_rework_fun, &GitHubAdapter.queue_rework_from_review_comment/3)
+
+      case queue_fun.(event, action, payload) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("GitHub inline-review rework queue failed event=#{event} action=#{action} issue_id=#{inspect(issue_id)} reason=#{inspect(reason)}")
 
           :ok
       end

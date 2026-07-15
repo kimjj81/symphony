@@ -853,6 +853,52 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert_github_responses_consumed()
   end
 
+  test "queues a Codex inline review comment on an unlabeled pull request for rework" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    raw_pr = raw_pull_request_issue(90, [])
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/90", github_response(200, raw_pr)},
+      {:get, "/repos/studiojin-dev/myven/issues/90", github_response(200, raw_pr)},
+      {:get, "/repos/studiojin-dev/myven/labels/sym%3Arework", github_response(200, %{"name" => "sym:rework"})},
+      {:post, "/repos/studiojin-dev/myven/issues/90/labels", github_response(200, [%{"name" => "sym:rework"}])}
+    ])
+
+    assert :ok =
+             Client.queue_rework_from_review_comment("pull_request_review_comment", "created", %{
+               "pull_request" => %{"number" => 90},
+               "comment" => %{"user" => %{"login" => "chatgpt-codex-connector"}}
+             })
+
+    assert_receive {:github_request, :post, "/repos/studiojin-dev/myven/issues/90/labels", nil, %{labels: ["sym:rework"]}}
+    assert_github_responses_consumed()
+  end
+
+  test "does not queue inline comments from other review bots" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    assert :ok =
+             Client.queue_rework_from_review_comment("pull_request_review_comment", "created", %{
+               "pull_request" => %{"number" => 91},
+               "comment" => %{"user" => %{"login" => "dependabot[bot]"}}
+             })
+
+    refute_receive {:github_request, _, _, _, _}
+  end
+
   test "ignores stale labeled issue webhook when payload label is no longer present" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",

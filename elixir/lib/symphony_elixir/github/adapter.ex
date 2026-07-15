@@ -25,6 +25,10 @@ defmodule SymphonyElixir.GitHub.Adapter do
   @spec sync_webhook_state(String.t(), String.t(), map()) :: :ok | {:error, term()}
   def sync_webhook_state(event, action, payload), do: client_module().sync_webhook_state(event, action, payload)
 
+  @spec queue_rework_from_review_comment(String.t(), String.t(), map()) :: :ok | {:error, term()}
+  def queue_rework_from_review_comment(event, action, payload),
+    do: client_module().queue_rework_from_review_comment(event, action, payload)
+
   @spec create_pull_request_for_issue(term()) :: {:ok, term()} | {:error, term()}
   def create_pull_request_for_issue(issue), do: client_module().create_pull_request_for_issue(issue)
 
