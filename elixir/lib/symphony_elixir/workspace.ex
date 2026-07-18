@@ -229,7 +229,7 @@ defmodule SymphonyElixir.Workspace do
     if File.exists?(workspace) do
       remove_existing_local_workspace(workspace)
     else
-      remove_local_workspace(workspace)
+      {:ok, []}
     end
   end
 

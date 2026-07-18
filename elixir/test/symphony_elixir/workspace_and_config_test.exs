@@ -358,6 +358,31 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "git worktree cleanup succeeds when the workspace is already absent" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-absent-worktree-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(source)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "git_worktree",
+        workspace_source: source
+      )
+
+      assert :ok = Workspace.remove_issue_workspaces("MT-ABSENT")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace cleanup handles missing workspace root" do
     missing_root =
       Path.join(
