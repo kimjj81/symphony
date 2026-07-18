@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
-  test "extracts the final agent message from a completed turn payload" do
+  test "extracts final agent messages from completed turn and item payloads" do
     payload = %{
       "params" => %{
         "turn" => %{
@@ -15,7 +15,73 @@ defmodule SymphonyElixir.AppServerTest do
     }
 
     assert AppServer.final_agent_message(payload) == "final"
+
+    assert AppServer.final_agent_message(%{
+             "method" => "item/completed",
+             "params" => %{"item" => %{"type" => "agentMessage", "text" => "streamed"}}
+           }) == "streamed"
+
     assert AppServer.final_agent_message(%{}) == nil
+  end
+
+  test "run_turn returns the last streamed agent message when completed turn items are empty" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-streamed-agent-message-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-STREAM")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-stream"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-stream"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"first"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"final"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-stream","items":[],"status":"completed"}}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-streamed-agent-message",
+        identifier: "MT-STREAM",
+        title: "Capture streamed agent message",
+        description: "Exercise current app-server completion events",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-STREAM",
+        labels: ["backend"]
+      }
+
+      assert {:ok,
+              %{
+                final_agent_message: "final",
+                result: %{"method" => "turn/completed"}
+              }} = AppServer.run(workspace, "Return the final message", issue)
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "app server rejects the workspace root and paths outside workspace root" do

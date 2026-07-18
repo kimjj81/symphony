@@ -38,6 +38,7 @@ defmodule SymphonyElixir.Orchestrator do
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
+      cleanup_retries: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -65,7 +66,7 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
+    state = run_terminal_workspace_cleanup(state)
     state = schedule_tick(state, 0)
 
     {:ok, state}
@@ -273,6 +274,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
+
+  def handle_info({:retry_cleanup, issue_id, retry_token}, state) when is_binary(issue_id) do
+    state =
+      case pop_cleanup_retry_state(state, issue_id, retry_token) do
+        {:ok, retry_entry, state} -> handle_cleanup_retry(state, issue_id, retry_entry)
+        :missing -> state
+      end
+
+    notify_dashboard()
+    {:noreply, state}
+  end
 
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
@@ -520,8 +532,9 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Targeted issue refresh found terminal issue: #{issue_context(issue)} state=#{issue.state}; removing associated workspace")
 
-        cleanup_issue_workspace(issue.identifier)
-        release_issue_claim(state, issue.id)
+        state
+        |> attempt_terminal_workspace_cleanup(issue.id, issue.identifier, nil, 1)
+        |> release_issue_claim(issue.id)
 
       should_prepare_pull_request_for_issue?(issue, state, active_states, terminal_states) ->
         prepare_pull_request_for_issue(state, issue)
@@ -634,10 +647,6 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         worker_host = Map.get(running_entry, :worker_host)
 
-        if cleanup_workspace do
-          cleanup_issue_workspace(identifier, worker_host)
-        end
-
         if is_pid(pid) do
           terminate_task(pid)
         end
@@ -646,12 +655,18 @@ defmodule SymphonyElixir.Orchestrator do
           Process.demonitor(ref, [:flush])
         end
 
-        %{
+        state = %{
           state
           | running: Map.delete(state.running, issue_id),
             claimed: MapSet.delete(state.claimed, issue_id),
             retry_attempts: Map.delete(state.retry_attempts, issue_id)
         }
+
+        if cleanup_workspace do
+          attempt_terminal_workspace_cleanup(state, issue_id, identifier, worker_host, 1)
+        else
+          state
+        end
 
       _ ->
         release_issue_claim(state, issue_id)
@@ -1288,8 +1303,12 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
-        cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
-        {:noreply, release_issue_claim(state, issue_id)}
+        state =
+          state
+          |> attempt_terminal_workspace_cleanup(issue_id, issue.identifier, metadata[:worker_host], 1)
+          |> release_issue_claim(issue_id)
+
+        {:noreply, state}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -1306,28 +1325,140 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host \\ nil)
-
   defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
     Workspace.remove_issue_workspaces(identifier, worker_host)
   end
 
-  defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
+  defp attempt_terminal_workspace_cleanup(
+         %State{} = state,
+         issue_id,
+         identifier,
+         worker_host,
+         retry_attempt
+       )
+       when is_binary(issue_id) and is_binary(identifier) do
+    state = cancel_cleanup_retry(state, issue_id)
 
-  defp run_terminal_workspace_cleanup do
+    case cleanup_issue_workspace(identifier, worker_host) do
+      :ok ->
+        Logger.info("Removed terminal issue workspace issue_id=#{issue_id} issue_identifier=#{identifier} worker_host=#{worker_host_for_log(worker_host)}")
+        state
+
+      {:error, reason} ->
+        schedule_cleanup_retry(state, issue_id, retry_attempt, %{
+          identifier: identifier,
+          worker_host: worker_host,
+          error: reason
+        })
+    end
+  end
+
+  defp attempt_terminal_workspace_cleanup(state, _issue_id, _identifier, _worker_host, _retry_attempt),
+    do: state
+
+  defp schedule_cleanup_retry(%State{} = state, issue_id, attempt, metadata)
+       when is_binary(issue_id) and is_integer(attempt) and attempt > 0 and is_map(metadata) do
+    previous_retry = Map.get(state.cleanup_retries, issue_id, %{})
+    old_timer = Map.get(previous_retry, :timer_ref)
+
+    if is_reference(old_timer) do
+      Process.cancel_timer(old_timer)
+    end
+
+    delay_ms = failure_retry_delay(attempt)
+    retry_token = make_ref()
+    due_at_ms = System.monotonic_time(:millisecond) + delay_ms
+    timer_ref = Process.send_after(self(), {:retry_cleanup, issue_id, retry_token}, delay_ms)
+    identifier = Map.fetch!(metadata, :identifier)
+    worker_host = Map.get(metadata, :worker_host)
+    error = Map.get(metadata, :error)
+
+    Logger.warning(
+      "Retrying terminal workspace cleanup issue_id=#{issue_id} issue_identifier=#{identifier} worker_host=#{worker_host_for_log(worker_host)} in #{delay_ms}ms (attempt #{attempt}) error=#{inspect(error)}"
+    )
+
+    retry_entry = %{
+      attempt: attempt,
+      timer_ref: timer_ref,
+      retry_token: retry_token,
+      due_at_ms: due_at_ms,
+      identifier: identifier,
+      worker_host: worker_host,
+      error: error
+    }
+
+    %{state | cleanup_retries: Map.put(state.cleanup_retries, issue_id, retry_entry)}
+  end
+
+  defp pop_cleanup_retry_state(%State{} = state, issue_id, retry_token) do
+    case Map.get(state.cleanup_retries, issue_id) do
+      %{retry_token: ^retry_token} = retry_entry ->
+        {:ok, retry_entry, %{state | cleanup_retries: Map.delete(state.cleanup_retries, issue_id)}}
+
+      _ ->
+        :missing
+    end
+  end
+
+  defp handle_cleanup_retry(%State{} = state, issue_id, retry_entry) do
+    identifier = retry_entry.identifier
+    worker_host = retry_entry.worker_host
+    next_attempt = retry_entry.attempt + 1
+
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{} = issue | _]} ->
+        if terminal_issue_state?(issue.state, terminal_state_set()) do
+          attempt_terminal_workspace_cleanup(state, issue_id, identifier, worker_host, next_attempt)
+        else
+          Logger.info("Canceled terminal workspace cleanup retry because issue is no longer terminal issue_id=#{issue_id} issue_identifier=#{identifier} state=#{inspect(issue.state)}")
+          state
+        end
+
+      {:ok, []} ->
+        schedule_cleanup_retry(state, issue_id, next_attempt, %{
+          identifier: identifier,
+          worker_host: worker_host,
+          error: :tracker_issue_not_visible
+        })
+
+      {:error, reason} ->
+        schedule_cleanup_retry(state, issue_id, next_attempt, %{
+          identifier: identifier,
+          worker_host: worker_host,
+          error: {:tracker_fetch_failed, reason}
+        })
+    end
+  end
+
+  defp cancel_cleanup_retry(%State{} = state, issue_id) do
+    case Map.pop(state.cleanup_retries, issue_id) do
+      {nil, _cleanup_retries} ->
+        state
+
+      {%{timer_ref: timer_ref}, cleanup_retries} ->
+        if is_reference(timer_ref) do
+          Process.cancel_timer(timer_ref)
+        end
+
+        %{state | cleanup_retries: cleanup_retries}
+    end
+  end
+
+  defp run_terminal_workspace_cleanup(%State{} = state) do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{identifier: identifier} when is_binary(identifier) ->
-            cleanup_issue_workspace(identifier)
+        Enum.reduce(issues, state, fn
+          %Issue{id: issue_id, identifier: identifier}, state_acc
+          when is_binary(issue_id) and is_binary(identifier) ->
+            attempt_terminal_workspace_cleanup(state_acc, issue_id, identifier, nil, 1)
 
-          _ ->
-            :ok
+          _issue, state_acc ->
+            state_acc
         end)
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+        state
     end
   end
 
@@ -1492,6 +1623,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
+
+  defp worker_host_for_log(nil), do: "local"
+  defp worker_host_for_log(worker_host), do: worker_host
 
   defp available_slots(%State{} = state) do
     max(

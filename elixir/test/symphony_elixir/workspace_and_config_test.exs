@@ -325,6 +325,39 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "git worktree removal failure preserves workspace and returns the git error" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-worktree-remove-failure-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source = Path.join(test_root, "not-a-git-repository")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-GIT-REMOVE-FAIL")
+
+      File.mkdir_p!(source)
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "marker.txt"), "preserve")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "git_worktree",
+        workspace_source: source
+      )
+
+      assert {:error, {:git_worktree_remove_failed, status, output}} =
+               Workspace.remove_issue_workspaces("MT-GIT-REMOVE-FAIL")
+
+      assert status != 0
+      assert output != ""
+      assert File.read!(Path.join(workspace, "marker.txt")) == "preserve"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace cleanup handles missing workspace root" do
     missing_root =
       Path.join(
@@ -717,7 +750,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "workspace remove continues when before_remove hook fails" do
+  test "workspace remove preserves workspace when before_remove hook fails" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -735,14 +768,18 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-FAIL")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-FAIL")
-      refute File.exists?(workspace)
+
+      assert {:error, {:workspace_hook_failed, "before_remove", 17, output}} =
+               Workspace.remove_issue_workspaces("MT-HOOKS-FAIL")
+
+      assert output =~ "failure"
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook fails with large output" do
+  test "workspace remove preserves workspace when before_remove hook fails with large output" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -760,26 +797,18 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-LARGE-FAIL")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-LARGE-FAIL")
-      refute File.exists?(workspace)
+
+      assert {:error, {:workspace_hook_failed, "before_remove", 17, output}} =
+               Workspace.remove_issue_workspaces("MT-HOOKS-LARGE-FAIL")
+
+      assert byte_size(output) == 3_000
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook times out" do
-    previous_timeout = Application.get_env(:symphony_elixir, :workspace_hook_timeout_ms)
-
-    on_exit(fn ->
-      if is_nil(previous_timeout) do
-        Application.delete_env(:symphony_elixir, :workspace_hook_timeout_ms)
-      else
-        Application.put_env(:symphony_elixir, :workspace_hook_timeout_ms, previous_timeout)
-      end
-    end)
-
-    Application.put_env(:symphony_elixir, :workspace_hook_timeout_ms, 10)
-
+  test "workspace remove preserves workspace when before_remove hook times out" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -793,12 +822,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_before_remove: "sleep 1"
+        hook_before_remove: "sleep 1",
+        hook_timeout_ms: 10
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-TIMEOUT")
-      assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-TIMEOUT")
-      refute File.exists?(workspace)
+
+      assert {:error, {:workspace_hook_timeout, "before_remove", 10}} =
+               Workspace.remove_issue_workspaces("MT-HOOKS-TIMEOUT")
+
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
@@ -1459,6 +1492,65 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ "echo after-run"
       assert trace =~ "echo before-remove"
       assert trace =~ "rm -rf"
+      assert trace =~ workspace_path
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "remote workspace removal stops when before_remove hook fails" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-remote-remove-failure-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+    end)
+
+    try do
+      trace_file = Path.join(test_root, "ssh.trace")
+      fake_ssh = Path.join(test_root, "ssh")
+      workspace_path = "/remote/workspaces/MT-SSH-FAIL"
+
+      File.mkdir_p!(test_root)
+      System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+      File.write!(fake_ssh, """
+      #!/bin/sh
+      printf 'ARGV:%s\\n' "$*" >> "$SYMP_TEST_SSH_TRACE"
+
+      case "$*" in
+        *"before-remove"*)
+          printf 'cleanup failed\\n'
+          exit 17
+          ;;
+      esac
+
+      exit 0
+      """)
+
+      File.chmod!(fake_ssh, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: "/remote/workspaces",
+        worker_ssh_hosts: ["worker-01"],
+        hook_before_remove: "echo before-remove && exit 17"
+      )
+
+      assert {:error, {:workspace_hook_failed, "before_remove", 17, output}} =
+               Workspace.remove_issue_workspaces("MT-SSH-FAIL", "worker-01")
+
+      assert output =~ "cleanup failed"
+      trace = File.read!(trace_file)
+      assert trace =~ "before-remove"
+      refute trace =~ "rm -rf"
       assert trace =~ workspace_path
     after
       File.rm_rf(test_root)

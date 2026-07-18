@@ -360,7 +360,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "PR #<parent>: <child PR title>"
   end
 
-  test "current WORKFLOW.myven.md before_remove cleans env and label compose projects" do
+  test "current WORKFLOW.myven.md before_remove runs local down before workspace compose cleanup" do
     workflow_path = Path.expand("../../WORKFLOW.myven.md", __DIR__)
 
     assert {:ok, %{config: config}} = Workflow.load(workflow_path)
@@ -383,6 +383,13 @@ defmodule SymphonyElixir.CoreTest do
       File.write!(docker_log, "")
 
       docker_path = Path.join(bin_dir, "docker")
+      pnpm_path = Path.join(bin_dir, "pnpm")
+
+      File.write!(pnpm_path, """
+      #!/bin/sh
+      printf 'pnpm %s\\n' "$*" >> "$DOCKER_LOG"
+      exit 0
+      """)
 
       File.write!(docker_path, """
       #!/bin/sh
@@ -401,6 +408,7 @@ defmodule SymphonyElixir.CoreTest do
       exit 99
       """)
 
+      File.chmod!(pnpm_path, 0o755)
       File.chmod!(docker_path, 0o755)
 
       original_path = System.get_env("PATH") || ""
@@ -422,10 +430,13 @@ defmodule SymphonyElixir.CoreTest do
       assert output =~ "INFO: removing Myven compose project myven_from_label"
 
       log = File.read!(docker_log)
+      log_lines = String.split(log, "\n", trim: true)
       {physical_workspace_output, 0} = System.cmd("pwd", ["-P"], cd: workspace)
       physical_workspace = String.trim(physical_workspace_output)
       physical_env_file = Path.join(physical_workspace, ".env.local")
       physical_compose_file = Path.join(physical_workspace, "infra/local/docker-compose.yml")
+
+      assert hd(log_lines) == "pnpm local:down"
 
       assert log =~
                "compose --profile tools --env-file #{physical_env_file} -p myven_from_env -f #{physical_compose_file} down -v --remove-orphans"
@@ -434,6 +445,59 @@ defmodule SymphonyElixir.CoreTest do
                "compose --profile tools --env-file #{physical_env_file} -p myven_from_label -f #{physical_compose_file} down -v --remove-orphans"
 
       refute log =~ "myven_other"
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
+  test "current WORKFLOW.myven.md before_remove stops when local down fails" do
+    workflow_path = Path.expand("../../WORKFLOW.myven.md", __DIR__)
+
+    assert {:ok, %{config: config}} = Workflow.load(workflow_path)
+    assert {:ok, settings} = Config.Schema.parse(config)
+
+    test_root = Path.join(System.tmp_dir!(), "myven-before-remove-failure-#{System.unique_integer([:positive])}")
+    workspace = Path.join(test_root, "workspace")
+    bin_dir = Path.join(test_root, "bin")
+    compose_dir = Path.join(workspace, "infra/local")
+    command_log = Path.join(test_root, "commands.log")
+
+    try do
+      File.mkdir_p!(bin_dir)
+      File.mkdir_p!(compose_dir)
+      File.write!(Path.join(compose_dir, "docker-compose.yml"), "services: {}\n")
+      File.write!(Path.join(workspace, ".env.local"), "COMPOSE_PROJECT_NAME=myven_failure\n")
+      File.write!(command_log, "")
+
+      File.write!(Path.join(bin_dir, "pnpm"), """
+      #!/bin/sh
+      printf 'pnpm %s\\n' "$*" >> "$COMMAND_LOG"
+      exit 17
+      """)
+
+      File.write!(Path.join(bin_dir, "docker"), """
+      #!/bin/sh
+      printf 'docker %s\\n' "$*" >> "$COMMAND_LOG"
+      exit 0
+      """)
+
+      File.chmod!(Path.join(bin_dir, "pnpm"), 0o755)
+      File.chmod!(Path.join(bin_dir, "docker"), 0o755)
+
+      {_output, status} =
+        System.cmd("sh", ["-c", settings.hooks.before_remove],
+          cd: workspace,
+          stderr_to_stdout: true,
+          env: [
+            {"COMMAND_LOG", command_log},
+            {"PATH", bin_dir <> ":" <> (System.get_env("PATH") || "")},
+            {"SYMPHONY_WORKSPACE", workspace},
+            {"TMPDIR", test_root}
+          ]
+        )
+
+      assert status != 0
+      assert File.read!(command_log) == "pnpm local:down\n"
     after
       File.rm_rf!(test_root)
     end
@@ -904,6 +968,157 @@ defmodule SymphonyElixir.CoreTest do
       refute MapSet.member?(updated_state.claimed, issue_id)
       refute Process.alive?(agent_pid)
       refute File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "terminal workspace cleanup failure stops agent and retries cleanup without redispatch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-terminal-cleanup-retry-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-cleanup-retry"
+    issue_identifier = "MT-CLEANUP-RETRY"
+    workspace = Path.join(test_root, issue_identifier)
+    allow_cleanup = Path.join(test_root, "allow-cleanup")
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_identifier,
+      state: "Done",
+      title: "Merged",
+      labels: []
+    }
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_kind: "memory",
+        tracker_active_states: ["Merging"],
+        tracker_terminal_states: ["Done"],
+        hook_before_remove: "test -f \"#{allow_cleanup}\""
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      File.mkdir_p!(workspace)
+
+      agent_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            issue: %Issue{id: issue_id, state: "Merging", identifier: issue_identifier},
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      retry_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      refute Process.alive?(agent_pid)
+      assert File.exists?(workspace)
+      refute Map.has_key?(retry_state.running, issue_id)
+      refute Map.has_key?(retry_state.retry_attempts, issue_id)
+
+      assert %{attempt: 1, retry_token: retry_token, timer_ref: timer_ref} =
+               retry_state.cleanup_retries[issue_id]
+
+      Process.cancel_timer(timer_ref)
+      File.write!(allow_cleanup, "ok")
+
+      assert {:noreply, completed_state} =
+               Orchestrator.handle_info({:retry_cleanup, issue_id, retry_token}, retry_state)
+
+      refute File.exists?(workspace)
+      refute Map.has_key?(completed_state.cleanup_retries, issue_id)
+      refute Map.has_key?(completed_state.retry_attempts, issue_id)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "terminal workspace cleanup retry continues while issue is invisible and cancels when reopened" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-terminal-cleanup-cancel-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-cleanup-cancel"
+    issue_identifier = "MT-CLEANUP-CANCEL"
+    workspace = Path.join(test_root, issue_identifier)
+    terminal_issue = %Issue{id: issue_id, identifier: issue_identifier, state: "Done", labels: []}
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_kind: "memory",
+        tracker_active_states: ["Merging"],
+        tracker_terminal_states: ["Done"],
+        hook_before_remove: "exit 17"
+      )
+
+      File.mkdir_p!(workspace)
+
+      agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            issue: %Issue{id: issue_id, state: "Merging", identifier: issue_identifier},
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      retry_state = Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+      %{retry_token: retry_token, timer_ref: timer_ref} = retry_state.cleanup_retries[issue_id]
+      Process.cancel_timer(timer_ref)
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+      assert {:noreply, invisible_state} =
+               Orchestrator.handle_info({:retry_cleanup, issue_id, retry_token}, retry_state)
+
+      assert File.exists?(workspace)
+
+      assert %{attempt: 2, retry_token: next_retry_token, timer_ref: next_timer_ref} =
+               invisible_state.cleanup_retries[issue_id]
+
+      Process.cancel_timer(next_timer_ref)
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %{terminal_issue | state: "Merging"}
+      ])
+
+      assert {:noreply, canceled_state} =
+               Orchestrator.handle_info(
+                 {:retry_cleanup, issue_id, next_retry_token},
+                 invisible_state
+               )
+
+      assert File.exists?(workspace)
+      refute Map.has_key?(canceled_state.cleanup_retries, issue_id)
     after
       File.rm_rf(test_root)
     end

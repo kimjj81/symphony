@@ -226,57 +226,34 @@ defmodule SymphonyElixir.Workspace do
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace, nil) do
-    case File.exists?(workspace) do
-      true ->
-        case validate_workspace_path(workspace, nil) do
-          :ok ->
-            maybe_run_before_remove_hook(workspace, nil)
-            remove_local_workspace(workspace)
-
-          {:error, reason} ->
-            {:error, reason, ""}
-        end
-
-      false ->
-        remove_local_workspace(workspace)
+    if File.exists?(workspace) do
+      remove_existing_local_workspace(workspace)
+    else
+      remove_local_workspace(workspace)
     end
   end
 
   def remove(workspace, worker_host) when is_binary(worker_host) do
-    maybe_run_before_remove_hook(workspace, worker_host)
-
-    script =
-      [
-        remote_shell_assign("workspace", workspace),
-        "rm -rf \"$workspace\""
-      ]
-      |> Enum.join("\n")
-
-    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-      {:ok, {_output, 0}} ->
-        {:ok, []}
-
-      {:ok, {output, status}} ->
-        {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+    case maybe_run_before_remove_hook(workspace, worker_host) do
+      :ok ->
+        remove_remote_workspace(workspace, worker_host)
 
       {:error, reason} ->
         {:error, reason, ""}
     end
   end
 
-  @spec remove_issue_workspaces(term()) :: :ok
+  @spec remove_issue_workspaces(term()) :: :ok | {:error, term()}
   def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil)
 
-  @spec remove_issue_workspaces(term(), worker_host()) :: :ok
+  @spec remove_issue_workspaces(term(), worker_host()) :: :ok | {:error, term()}
   def remove_issue_workspaces(identifier, worker_host) when is_binary(identifier) and is_binary(worker_host) do
     safe_id = safe_identifier(identifier)
 
     case workspace_path_for_issue(safe_id, worker_host) do
-      {:ok, workspace} -> remove(workspace, worker_host)
-      {:error, _reason} -> :ok
+      {:ok, workspace} -> normalize_remove_result(remove(workspace, worker_host))
+      {:error, reason} -> {:error, reason}
     end
-
-    :ok
   end
 
   def remove_issue_workspaces(identifier, nil) when is_binary(identifier) do
@@ -285,20 +262,57 @@ defmodule SymphonyElixir.Workspace do
     case Config.settings!().worker.ssh_hosts do
       [] ->
         case workspace_path_for_issue(safe_id, nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
+          {:ok, workspace} -> normalize_remove_result(remove(workspace, nil))
+          {:error, reason} -> {:error, reason}
         end
 
       worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1))
+        remove_issue_workspaces_from_hosts(identifier, worker_hosts)
     end
-
-    :ok
   end
 
   def remove_issue_workspaces(_identifier, _worker_host) do
     :ok
   end
+
+  defp normalize_remove_result({:ok, _removed_paths}), do: :ok
+  defp normalize_remove_result({:error, reason, _output}), do: {:error, reason}
+
+  defp remove_existing_local_workspace(workspace) do
+    with :ok <- validate_workspace_path(workspace, nil),
+         :ok <- maybe_run_before_remove_hook(workspace, nil) do
+      remove_local_workspace(workspace)
+    else
+      {:error, reason} -> {:error, reason, ""}
+    end
+  end
+
+  defp remove_remote_workspace(workspace, worker_host) do
+    script =
+      [
+        remote_shell_assign("workspace", workspace),
+        "rm -rf \"$workspace\""
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> {:ok, []}
+      {:ok, {output, status}} -> {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+      {:error, reason} -> {:error, reason, ""}
+    end
+  end
+
+  defp remove_issue_workspaces_from_hosts(identifier, worker_hosts) do
+    Enum.reduce(worker_hosts, :ok, fn worker_host, accumulated_result ->
+      merge_worker_workspace_removal(
+        accumulated_result,
+        remove_issue_workspaces(identifier, worker_host)
+      )
+    end)
+  end
+
+  defp merge_worker_workspace_removal(:ok, next_result), do: next_result
+  defp merge_worker_workspace_removal({:error, _reason} = first_error, _next_result), do: first_error
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}
@@ -391,7 +405,6 @@ defmodule SymphonyElixir.Workspace do
               "before_remove",
               nil
             )
-            |> ignore_hook_failure()
         end
 
       false ->
@@ -433,7 +446,6 @@ defmodule SymphonyElixir.Workspace do
           {:error, reason} ->
             {:error, reason}
         end
-        |> ignore_hook_failure()
     end
   end
 
@@ -446,7 +458,7 @@ defmodule SymphonyElixir.Workspace do
     if settings.strategy == "git_worktree" and is_binary(settings.source) and String.trim(settings.source) != "" do
       case System.cmd("git", ["-C", settings.source, "worktree", "remove", "--force", workspace], stderr_to_stdout: true) do
         {_output, 0} -> {:ok, []}
-        {_output, _status} -> File.rm_rf(workspace)
+        {output, status} -> {:error, {:git_worktree_remove_failed, status, output}, ""}
       end
     else
       File.rm_rf(workspace)
