@@ -5,6 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.Codex.OrchestrationBrief
   alias SymphonyElixir.Codex.TaskClassifier
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
@@ -88,6 +89,81 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp codex_message_handler(recipient, issue, metrics) do
+    fn message ->
+      record_turn_metrics(message, metrics)
+      send_codex_update(recipient, issue, message)
+    end
+  end
+
+  defp command_started?(%{event: :notification} = message) do
+    method = message |> notification_payload() |> then(&(Map.get(&1, "method") || Map.get(&1, :method)))
+    method in ["item/commandExecution/started", "codex/event/exec_command_begin"]
+  end
+
+  defp command_started?(_message), do: false
+
+  defp record_turn_metrics(message, metrics) do
+    if command_started?(message), do: :atomics.add(metrics, 1, 1)
+
+    case token_usage_from_message(message) do
+      %{} = usage ->
+        :atomics.put(metrics, 2, token_value(usage, "input_tokens"))
+        :atomics.put(metrics, 3, token_value(usage, "cached_input_tokens"))
+        :atomics.put(metrics, 4, token_value(usage, "total_tokens"))
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp token_usage_from_message(%{event: :notification} = message) do
+    payload = notification_payload(message)
+
+    [
+      ["params", "msg", "payload", "info", "total_token_usage"],
+      [:params, :msg, :payload, :info, :total_token_usage],
+      ["params", "msg", "info", "total_token_usage"],
+      [:params, :msg, :info, :total_token_usage],
+      ["params", "tokenUsage", "total"],
+      [:params, :tokenUsage, :total],
+      ["tokenUsage", "total"],
+      [:tokenUsage, :total]
+    ]
+    |> Enum.find_value(&map_at_path(payload, &1))
+  end
+
+  defp token_usage_from_message(_message), do: nil
+
+  defp notification_payload(message) do
+    envelope = Map.get(message, :payload) || Map.get(message, "payload") || %{}
+    Map.get(envelope, :payload) || Map.get(envelope, "payload") || envelope
+  end
+
+  defp token_value(usage, key) do
+    keys =
+      case key do
+        "input_tokens" -> ["input_tokens", :input_tokens, "inputTokens", :inputTokens]
+        "cached_input_tokens" -> ["cached_input_tokens", :cached_input_tokens, "cachedInputTokens", :cachedInputTokens]
+        "total_tokens" -> ["total_tokens", :total_tokens, "totalTokens", :totalTokens]
+      end
+
+    case Enum.find_value(keys, &Map.get(usage, &1)) do
+      value when is_integer(value) and value >= 0 -> value
+      _ -> 0
+    end
+  end
+
+  defp map_at_path(map, []), do: if(is_map(map), do: map)
+
+  defp map_at_path(map, [key | rest]) when is_map(map) do
+    map
+    |> Map.get(key)
+    |> map_at_path(rest)
+  end
+
+  defp map_at_path(_map, _path), do: nil
+
   defp send_codex_update(recipient, %Issue{id: issue_id}, message)
        when is_binary(issue_id) and is_pid(recipient) do
     send(recipient, {:codex_worker_update, issue_id, message})
@@ -95,6 +171,19 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
+
+  defp send_runtime_observation(recipient, %Issue{id: issue_id}, event, payload)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {
+      :codex_worker_update,
+      issue_id,
+      %{event: event, payload: payload, timestamp: System.system_time(:millisecond)}
+    })
+
+    :ok
+  end
+
+  defp send_runtime_observation(_recipient, _issue, _event, _payload), do: :ok
 
   defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
@@ -129,6 +218,14 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, app_server_opts) do
+    if Config.settings!().agent.orchestration_brief_enabled do
+      run_briefed_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, app_server_opts)
+    else
+      run_legacy_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, app_server_opts)
+    end
+  end
+
+  defp run_legacy_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, app_server_opts) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
     task_profile = select_codex_task_profile(issue)
@@ -153,6 +250,164 @@ defmodule SymphonyElixir.AgentRunner do
       after
         AppServer.stop_session(session)
       end
+    end
+  end
+
+  defp run_briefed_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, app_server_opts) do
+    settings = Config.settings!()
+    max_turns = Keyword.get(opts, :max_turns, settings.agent.max_turns)
+    max_review_verdicts = Keyword.get(opts, :max_review_verdicts, settings.agent.max_review_verdicts)
+    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    lane_issue = restore_dispatch_state(issue)
+
+    brief_opts =
+      opts
+      |> Keyword.put(:worker_host, worker_host)
+      |> Keyword.put(:on_message, codex_message_handler(codex_update_recipient, lane_issue))
+
+    {brief, brief_meta} =
+      case OrchestrationBrief.generate(workspace, lane_issue, brief_opts) do
+        {:ok, generated, metadata} ->
+          {generated, metadata}
+
+        {:error, reason} ->
+          fallback = OrchestrationBrief.fallback(lane_issue)
+          Logger.warning("Orchestration brief generation failed for #{issue_context(lane_issue)}; using deterministic fallback reason=#{inspect(reason)}")
+          {fallback, %{source: :fallback, bytes: byte_size(fallback), lane: lane_issue.state}}
+      end
+
+    Logger.info([
+      "Prepared orchestration brief for #{issue_context(lane_issue)}",
+      " source=#{brief_meta.source}",
+      " bytes=#{brief_meta.bytes}",
+      " lane=#{brief_meta.lane}"
+    ])
+
+    send_runtime_observation(codex_update_recipient, lane_issue, :orchestration_brief, brief_meta)
+
+    context = %{
+      workspace: workspace,
+      recipient: codex_update_recipient,
+      opts: opts,
+      issue_state_fetcher: issue_state_fetcher,
+      app_server_opts: app_server_opts,
+      brief: brief,
+      worker_host: worker_host,
+      max_turns: max_turns,
+      max_review_verdicts: max_review_verdicts
+    }
+
+    do_run_briefed_turns(context, lane_issue, 1, 0)
+  end
+
+  defp restore_dispatch_state(%Issue{metadata: metadata} = issue) when is_map(metadata) do
+    case Map.get(metadata, "symphony_dispatch_state") || Map.get(metadata, :symphony_dispatch_state) do
+      state when is_binary(state) and state != "" -> %{issue | state: state}
+      _ -> issue
+    end
+  end
+
+  defp restore_dispatch_state(issue), do: issue
+
+  defp do_run_briefed_turns(context, issue, turn_number, review_verdicts) do
+    %{max_turns: max_turns, max_review_verdicts: max_review_verdicts} = context
+    task_profile = select_briefed_task_profile(issue)
+    verification_tier = verification_tier(issue.state)
+    review_attempt = if review_state?(issue.state), do: review_verdicts + 1, else: review_verdicts
+    prompt = build_briefed_turn_prompt(issue, context.brief, verification_tier, review_attempt, max_review_verdicts)
+    metrics = :atomics.new(4, signed: false)
+
+    Logger.info([
+      "Starting briefed worker for #{issue_context(issue)}",
+      " turn=#{turn_number}/#{max_turns}",
+      " task_type=#{task_profile.task_type}",
+      " model=#{task_profile.model}",
+      " effort=#{task_profile.effort}",
+      " verification_tier=#{verification_tier}",
+      " review_verdict=#{review_attempt}/#{max_review_verdicts}",
+      " prompt_bytes=#{byte_size(prompt)}"
+    ])
+
+    session_opts =
+      context.app_server_opts
+      |> Keyword.put(:worker_host, context.worker_host)
+      |> Keyword.put(:codex_command, task_profile.command)
+
+    with {:ok, session} <- AppServer.start_session(context.workspace, session_opts) do
+      turn_result =
+        try do
+          AppServer.run_turn(
+            session,
+            prompt,
+            issue,
+            on_message: codex_message_handler(context.recipient, issue, metrics),
+            model: task_profile.model,
+            effort: task_profile.effort
+          )
+        after
+          AppServer.stop_session(session)
+        end
+
+      with {:ok, turn_session} <- turn_result,
+           {:ok, refreshed_issue} <- refresh_issue(issue, context.issue_state_fetcher) do
+        completed_review_verdicts = completed_review_verdicts(issue, review_verdicts)
+
+        Logger.info([
+          "Completed briefed worker for #{issue_context(issue)}",
+          " session_id=#{turn_session[:session_id]}",
+          " turn=#{turn_number}/#{max_turns}",
+          " commands=#{:atomics.get(metrics, 1)}",
+          " input_tokens=#{:atomics.get(metrics, 2)}",
+          " cached_input_tokens=#{:atomics.get(metrics, 3)}",
+          " verification_tier=#{verification_tier}",
+          " transition=#{issue.state}->#{refreshed_issue.state}"
+        ])
+
+        send_runtime_observation(context.recipient, issue, :briefed_worker_metrics, %{
+          commands: :atomics.get(metrics, 1),
+          input_tokens: :atomics.get(metrics, 2),
+          cached_input_tokens: :atomics.get(metrics, 3),
+          total_tokens: :atomics.get(metrics, 4),
+          verification_tier: verification_tier,
+          review_verdict: review_attempt,
+          prompt_bytes: byte_size(prompt),
+          transition: "#{issue.state}->#{refreshed_issue.state}"
+        })
+
+        handle_briefed_transition(
+          context,
+          issue,
+          refreshed_issue,
+          turn_number,
+          completed_review_verdicts
+        )
+      end
+    end
+  end
+
+  defp completed_review_verdicts(issue, review_verdicts) do
+    if review_state?(issue.state), do: review_verdicts + 1, else: review_verdicts
+  end
+
+  defp handle_briefed_transition(context, issue, refreshed_issue, turn_number, review_verdicts) do
+    case briefed_transition(issue, refreshed_issue, review_verdicts, context.max_review_verdicts) do
+      {:done, reason} ->
+        Logger.info("Briefed run completed for #{issue_context(refreshed_issue)} reason=#{reason}")
+        :ok
+
+      {:continue, reason} when turn_number < context.max_turns ->
+        Logger.info("Continuing briefed run for #{issue_context(refreshed_issue)} reason=#{reason}")
+        do_run_briefed_turns(context, refreshed_issue, turn_number + 1, review_verdicts)
+
+      {:continue, _reason} ->
+        handoff_to_human_review(
+          refreshed_issue,
+          "안전 turn 한도(#{context.max_turns}회)에 도달해 자동 실행을 중단합니다.",
+          context.opts
+        )
+
+      {:handoff, reason} ->
+        handoff_to_human_review(refreshed_issue, reason, context.opts)
     end
   end
 
@@ -222,6 +477,182 @@ defmodule SymphonyElixir.AgentRunner do
       effort: Map.fetch!(profile, "effort")
     }
   end
+
+  defp select_briefed_task_profile(issue) do
+    task_type =
+      cond do
+        review_state?(issue.state) -> "review"
+        rework_state?(issue.state) -> "single_file_edit"
+        true -> TaskClassifier.classify(issue)
+      end
+
+    profiles = Config.settings!().codex.task_profiles
+    profile = Map.get(profiles, task_type) || Map.fetch!(profiles, "default")
+
+    %{
+      task_type: task_type,
+      command: Map.fetch!(profile, "command"),
+      model: Map.fetch!(profile, "model"),
+      effort: Map.fetch!(profile, "effort")
+    }
+  end
+
+  defp build_briefed_turn_prompt(issue, brief, verification_tier, review_attempt, max_review_verdicts) do
+    review_guidance =
+      cond do
+        review_state?(issue.state) and review_attempt >= max_review_verdicts ->
+          "This is review verdict #{review_attempt} of #{max_review_verdicts}. If any finding remains, post the Korean blocker summary and move the item to Human Review, not Rework. A clean review also moves directly to Human Review."
+
+        review_state?(issue.state) ->
+          "This is review verdict #{review_attempt} of #{max_review_verdicts}. Move a clean review directly to Human Review. Move to Rework only for actionable findings."
+
+        true ->
+          "Complete only the current lane. Implementation or Rework completion moves to Review."
+      end
+
+    verification_guidance =
+      if verification_tier == :full do
+        "Run the repository-defined full verification bundle and wait for required CI checks before merge completion."
+      else
+        "Run only focused verification directly covering changed files. Check CI once without polling. Do not run full API/Web/OpenAPI/Astro suites or Compose/seed unless the exact finding cannot be verified more narrowly. Retry browser or environment failures at most once, then report partial coverage."
+      end
+
+    """
+    Symphony worker execution contract
+
+    Tracker: #{issue.identifier} | #{issue.title}
+    State: #{issue.state}
+    URL: #{issue.url}
+    Verification tier: #{verification_tier}
+
+    ORCHESTRATION BRIEF
+    #{brief}
+
+    The orchestration preflight already read and applied the long conductor, review, GitHub-review
+    skills and their reference documents. Do not reopen those documents. Read a repository skill or
+    reference only if this brief names it explicitly and the current live state cannot be handled
+    without it. Re-check the live head once before writes and keep the change literal to the brief.
+    If this lane started after the preflight, read only the new live review feedback added since the
+    brief; do not repeat the complete historical sweep.
+
+    #{review_guidance}
+    #{verification_guidance}
+
+    Finish by synchronizing the required Korean tracker comment and label transition. Do not leave
+    the item in the same active state. Stop immediately after reaching Human Review or another
+    non-active state.
+    """
+  end
+
+  defp verification_tier(state_name) do
+    normalized_state = normalize_issue_state(state_name)
+
+    if Enum.any?(Config.settings!().verification.full_states, &(normalize_issue_state(&1) == normalized_state)) do
+      :full
+    else
+      :focused
+    end
+  end
+
+  defp review_state?(state_name) do
+    normalized_state = normalize_issue_state(state_name)
+    Enum.any?(Config.settings!().agent.review_states, &(normalize_issue_state(&1) == normalized_state))
+  end
+
+  defp rework_state?(state_name) do
+    normalize_issue_state(state_name) == normalize_issue_state(Config.settings!().agent.rework_state)
+  end
+
+  defp human_review_state?(state_name) do
+    normalize_issue_state(state_name) == normalize_issue_state(Config.settings!().agent.human_review_state)
+  end
+
+  defp briefed_transition(previous_issue, refreshed_issue, review_verdicts, max_review_verdicts) do
+    previous_state = previous_issue.state
+    refreshed_state = refreshed_issue.state
+
+    cond do
+      human_review_state?(refreshed_state) ->
+        {:done, :human_review}
+
+      full_verification_state?(previous_state) and not active_issue_state?(refreshed_state) ->
+        {:done, :non_active_state}
+
+      not active_issue_state?(refreshed_state) ->
+        {:handoff, "Symphony 실행 계약과 다른 종료 상태 전이(#{previous_state} -> #{refreshed_state})가 발생해 자동 실행을 중단합니다."}
+
+      true ->
+        active_briefed_transition(previous_state, refreshed_state, review_verdicts, max_review_verdicts)
+    end
+  end
+
+  defp active_briefed_transition(previous_state, refreshed_state, review_verdicts, max_review_verdicts) do
+    cond do
+      review_state?(previous_state) ->
+        review_briefed_transition(previous_state, refreshed_state, review_verdicts, max_review_verdicts)
+
+      review_state?(refreshed_state) ->
+        if rework_state?(previous_state), do: {:continue, :rework_completed}, else: {:continue, :review_requested}
+
+      true ->
+        invalid_active_transition(previous_state, refreshed_state)
+    end
+  end
+
+  defp review_briefed_transition(previous_state, refreshed_state, review_verdicts, max_review_verdicts) do
+    cond do
+      not rework_state?(refreshed_state) ->
+        invalid_active_transition(previous_state, refreshed_state)
+
+      review_verdicts >= max_review_verdicts ->
+        {:handoff, "자동 리뷰 판정 한도(#{max_review_verdicts}회)에 도달했지만 해결되지 않은 finding이 남아 Human Review로 전환합니다."}
+
+      true ->
+        {:continue, :review_findings}
+    end
+  end
+
+  defp invalid_active_transition(previous_state, refreshed_state) do
+    {:handoff, "Symphony 실행 계약과 다른 active 상태 전이(#{previous_state} -> #{refreshed_state})가 발생해 자동 반복을 중단합니다."}
+  end
+
+  defp full_verification_state?(state_name) do
+    normalized_state = normalize_issue_state(state_name)
+    Enum.any?(Config.settings!().verification.full_states, &(normalize_issue_state(&1) == normalized_state))
+  end
+
+  defp refresh_issue(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+    case issue_state_fetcher.([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} -> {:ok, refreshed_issue}
+      {:ok, []} -> {:ok, issue}
+      {:error, reason} -> {:error, {:issue_state_refresh_failed, reason}}
+    end
+  end
+
+  defp refresh_issue(issue, _issue_state_fetcher), do: {:ok, issue}
+
+  defp handoff_to_human_review(%Issue{id: issue_id} = issue, reason, opts) when is_binary(issue_id) do
+    commenter = Keyword.get(opts, :tracker_commenter, &Tracker.create_comment/2)
+    state_updater = Keyword.get(opts, :tracker_state_updater, &Tracker.update_issue_state/2)
+    target_state = Config.settings!().agent.human_review_state
+    body = "Symphony 자동 실행 중단\n\n#{reason}"
+
+    with :ok <- normalize_handoff_comment(commenter.(issue_id, body)),
+         :ok <- normalize_handoff_state_update(state_updater.(issue_id, target_state)) do
+      Logger.info("Moved #{issue_context(issue)} to #{target_state} after briefed-run handoff")
+      :ok
+    end
+  end
+
+  defp handoff_to_human_review(_issue, reason, _opts), do: {:error, {:human_review_handoff_failed, reason}}
+
+  defp normalize_handoff_comment(:ok), do: :ok
+  defp normalize_handoff_comment({:error, reason}), do: {:error, {:human_review_comment_failed, reason}}
+  defp normalize_handoff_comment(other), do: {:error, {:human_review_comment_failed, other}}
+
+  defp normalize_handoff_state_update(:ok), do: :ok
+  defp normalize_handoff_state_update({:error, reason}), do: {:error, {:human_review_handoff_failed, reason}}
+  defp normalize_handoff_state_update(other), do: {:error, {:human_review_handoff_failed, other}}
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 

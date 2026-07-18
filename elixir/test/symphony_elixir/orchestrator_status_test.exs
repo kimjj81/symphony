@@ -713,6 +713,60 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_total_tokens == 0
   end
 
+  test "orchestrator resets absolute token baselines for each fresh worker thread" do
+    issue_id = "issue-fresh-thread-token-usage"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "PR #fresh",
+      title: "Fresh worker token accounting",
+      state: "Review"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :FreshThreadTokenOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      turn_count: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:codex_worker_update, issue_id, session_started_update("session-one")})
+    send(pid, {:codex_worker_update, issue_id, token_usage_update(100, 10, 110)})
+    send(pid, {:codex_worker_update, issue_id, session_started_update("session-two")})
+    send(pid, {:codex_worker_update, issue_id, token_usage_update(50, 5, 55)})
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_input_tokens == 150
+    assert snapshot_entry.codex_output_tokens == 15
+    assert snapshot_entry.codex_total_tokens == 165
+    assert snapshot_entry.turn_count == 2
+  end
+
   test "orchestrator snapshot includes retry backoff entries" do
     orchestrator_name = Module.concat(__MODULE__, :RetryOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -1555,6 +1609,33 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
+  end
+
+  defp session_started_update(session_id) do
+    %{
+      event: :session_started,
+      session_id: session_id,
+      timestamp: DateTime.utc_now()
+    }
+  end
+
+  defp token_usage_update(input_tokens, output_tokens, total_tokens) do
+    %{
+      event: :notification,
+      payload: %{
+        "method" => "thread/tokenUsage/updated",
+        "params" => %{
+          "tokenUsage" => %{
+            "total" => %{
+              "input_tokens" => input_tokens,
+              "output_tokens" => output_tokens,
+              "total_tokens" => total_tokens
+            }
+          }
+        }
+      },
+      timestamp: DateTime.utc_now()
+    }
   end
 
   defp do_wait_for_snapshot(pid, predicate, deadline_ms) do

@@ -1181,7 +1181,13 @@ defmodule SymphonyElixir.Orchestrator do
       case Tracker.update_issue_state(issue.id, target_state) do
         :ok ->
           Logger.info("Marked issue for dispatch: #{issue_context(issue)} previous_state=#{inspect(state_name)} state=#{target_state}")
-          {:ok, %{issue | state: target_state}}
+
+          metadata =
+            issue.metadata
+            |> Kernel.||(%{})
+            |> Map.put("symphony_dispatch_state", state_name)
+
+          {:ok, %{issue | state: target_state, metadata: metadata}}
 
         {:error, reason} ->
           {:error, reason}
@@ -1646,6 +1652,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
+    running_entry = reset_token_baseline_for_new_session(running_entry, update)
     token_delta = extract_token_delta(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
@@ -1674,6 +1681,20 @@ defmodule SymphonyElixir.Orchestrator do
       token_delta
     }
   end
+
+  defp reset_token_baseline_for_new_session(
+         %{session_id: existing_session_id} = running_entry,
+         %{event: :session_started, session_id: next_session_id}
+       )
+       when is_binary(next_session_id) and next_session_id != existing_session_id do
+    Map.merge(running_entry, %{
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0
+    })
+  end
+
+  defp reset_token_baseline_for_new_session(running_entry, _update), do: running_entry
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),

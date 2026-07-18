@@ -148,6 +148,11 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
+      field(:max_review_verdicts, :integer, default: 3)
+      field(:orchestration_brief_enabled, :boolean, default: false)
+      field(:review_states, {:array, :string}, default: ["Review", "Reviewing"])
+      field(:rework_state, :string, default: "Rework")
+      field(:human_review_state, :string, default: "Human Review")
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
       field(:dispatch_kinds, {:array, :string}, default: ["issue", "pull_request"])
@@ -162,6 +167,11 @@ defmodule SymphonyElixir.Config.Schema do
         [
           :max_concurrent_agents,
           :max_turns,
+          :max_review_verdicts,
+          :orchestration_brief_enabled,
+          :review_states,
+          :rework_state,
+          :human_review_state,
           :max_retry_backoff_ms,
           :max_concurrent_agents_by_state,
           :dispatch_kinds,
@@ -171,12 +181,15 @@ defmodule SymphonyElixir.Config.Schema do
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
+      |> validate_number(:max_review_verdicts, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
       |> update_change(:dispatch_kinds, &Schema.normalize_dispatch_kinds/1)
       |> Schema.validate_dispatch_kinds(:dispatch_kinds)
       |> update_change(:source_checkout_states, &Schema.normalize_issue_states/1)
+      |> update_change(:review_states, &Schema.normalize_issue_states/1)
+      |> validate_required([:rework_state, :human_review_state])
     end
   end
 
@@ -190,6 +203,7 @@ defmodule SymphonyElixir.Config.Schema do
     @allowed_models [@implementation_model, @reasoning_model]
     @default_command "codex app-server"
     @task_profile_defaults %{
+      "orchestration" => %{"model" => @implementation_model, "effort" => "medium"},
       "planning" => %{"model" => @reasoning_model, "effort" => "high"},
       "review" => %{"model" => @reasoning_model, "effort" => "xhigh"},
       "exploration" => %{"model" => @implementation_model, "effort" => "medium"},
@@ -397,6 +411,26 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Verification do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    alias SymphonyElixir.Config.Schema
+
+    @primary_key false
+    embedded_schema do
+      field(:full_states, {:array, :string}, default: ["Merging"])
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:full_states], empty_values: [])
+      |> update_change(:full_states, &Schema.normalize_issue_states/1)
+    end
+  end
+
   defmodule Observability do
     @moduledoc false
     use Ecto.Schema
@@ -504,6 +538,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:verification, Verification, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:notifications, Notifications, on_replace: :update, defaults_to_struct: true)
@@ -665,6 +700,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:verification, with: &Verification.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:notifications, with: &Notifications.changeset/2)
@@ -694,9 +730,29 @@ defmodule SymphonyElixir.Config.Schema do
         task_profiles: Codex.resolve_task_profiles(settings.codex.task_profiles, settings.codex.command)
     }
 
+    agent = %{
+      settings.agent
+      | review_states: normalize_issue_states(settings.agent.review_states),
+        rework_state: String.trim(settings.agent.rework_state),
+        human_review_state: String.trim(settings.agent.human_review_state)
+    }
+
+    verification = %{
+      settings.verification
+      | full_states: normalize_issue_states(settings.verification.full_states)
+    }
+
     notifications = resolve_notifications(settings.notifications)
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex, notifications: notifications}
+    %{
+      settings
+      | tracker: tracker,
+        workspace: workspace,
+        agent: agent,
+        codex: codex,
+        verification: verification,
+        notifications: notifications
+    }
   end
 
   defp resolve_notifications(%Notifications{} = notifications) do

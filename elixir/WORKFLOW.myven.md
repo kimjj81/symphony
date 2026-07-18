@@ -212,7 +212,14 @@ hooks:
     exit "$cleanup_failed"
 agent:
   max_concurrent_agents: 3
-  max_turns: 3
+  max_turns: 7
+  max_review_verdicts: 3
+  orchestration_brief_enabled: true
+  review_states:
+    - Review
+    - Reviewing
+  rework_state: Rework
+  human_review_state: Human Review
   dispatch_kinds:
     - issue
     - pull_request
@@ -221,6 +228,10 @@ agent:
 codex:
   command: codex app-server
   task_profiles:
+    orchestration:
+      command: codex --config 'model="gpt-5.6-terra"' --config model_reasoning_effort=medium app-server
+      model: gpt-5.6-terra
+      effort: medium
     planning:
       command: codex --config 'model="gpt-5.6-sol"' --config model_reasoning_effort=high app-server
       model: gpt-5.6-sol
@@ -273,6 +284,9 @@ codex:
   #   codex-ws
   #   codex-ws app
   # Symphony's codex.command path still uses stdio unless the runner is changed.
+verification:
+  full_states:
+    - Merging
 notifications:
   discord:
     enabled: true
@@ -372,3 +386,7 @@ Instructions:
 29. Before moving a Todo GitHub issue to Human Review, run `git status --short --untracked-files=all` and confirm there are no task-authored repository changes.
 30. Before moving an implementation PR to Review, record this self-review checklist in the PR body or comment: tenant/RLS, migration/backfill, idempotency/retry/replay, local/prod URL, secret/token exposure, browser-visible terminology, and fixture/local smoke preservation.
 31. Preserve `docs/draft` workpads through Human Review. Before Merging, either move durable content into `docs/architecture`, `docs/design-system`, or `docs/adr`, or remove the draft-only workpad.
+32. The Symphony orchestration preflight owns the long conductor, review, and GitHub-review skill/reference reading. Briefed workers must use the supplied compact execution contract and must not reopen those documents unless the brief explicitly names a missing, task-critical reference.
+33. A clean Review or Reviewing verdict moves the pull request directly to Human Review and stops the run. Actionable findings move it to Rework only while the configured review-verdict budget remains. On the final allowed verdict, record remaining findings and move to Human Review instead of scheduling another Rework cycle.
+34. Before Merging, run only focused verification that directly covers changed files. Check CI once without polling; do not wait for pending required checks. Do not expand into full API/Web/OpenAPI/Astro suites, Compose startup, seed, or browser setup unless the exact change cannot be verified more narrowly. Retry a plausible browser or environment failure at most once, then report partial coverage.
+35. In Merging, wait for required CI and run the repository-defined full verification bundle before completing the merge.

@@ -82,6 +82,12 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.agent.max_review_verdicts == 3
+    refute config.agent.orchestration_brief_enabled
+    assert config.agent.review_states == ["review", "reviewing"]
+    assert config.agent.rework_state == "Rework"
+    assert config.agent.human_review_state == "Human Review"
+    assert config.verification.full_states == ["merging"]
     assert config.agent.dispatch_kinds == ["issue", "pull_request"]
     assert config.agent.source_checkout_states == []
     assert config.codex.auto_approve_requests == nil
@@ -112,6 +118,7 @@ defmodule SymphonyElixir.CoreTest do
            }
 
     assert config.codex.task_profiles["default"] == config.codex.task_profiles["exploration"]
+    assert config.codex.task_profiles["orchestration"] == config.codex.task_profiles["exploration"]
 
     assert CodexConfig.default_task_profiles()["feature_without_tests"] == %{
              "command" => "codex app-server",
@@ -137,6 +144,10 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_review_verdicts: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_review_verdicts"
 
     write_workflow_file!(Workflow.workflow_file_path(), dispatch_kinds: ["pull-request", :issue])
     assert Config.settings!().agent.dispatch_kinds == ["pull_request", "issue"]
@@ -277,6 +288,12 @@ defmodule SymphonyElixir.CoreTest do
     assert settings.codex.task_profiles["multi_file_refactor"]["effort"] == "high"
     assert settings.codex.task_profiles["feature_without_tests"]["effort"] == "high"
     assert settings.codex.task_profiles["default"]["effort"] == "medium"
+    assert settings.codex.task_profiles["orchestration"]["model"] == "gpt-5.6-terra"
+    assert settings.codex.task_profiles["orchestration"]["effort"] == "medium"
+    assert settings.agent.max_turns == 7
+    assert settings.agent.max_review_verdicts == 3
+    assert settings.agent.orchestration_brief_enabled
+    assert settings.verification.full_states == ["merging"]
     assert prompt =~ "Reasoning profile policy:"
     assert prompt =~ "| 탐색/조사/분석 | `gpt-5.6-terra` + `medium` effort |"
   end
@@ -439,8 +456,10 @@ defmodule SymphonyElixir.CoreTest do
 
     issue = %Issue{id: "issue-planned", identifier: "MT-PLANNED", state: "Planned"}
 
-    assert {:ok, %Issue{state: "In Progress"}} =
+    assert {:ok, %Issue{state: "In Progress", metadata: metadata}} =
              Orchestrator.mark_issue_in_progress_for_dispatch_for_test(issue)
+
+    assert metadata["symphony_dispatch_state"] == "Planned"
 
     assert_receive {:memory_tracker_state_update, "issue-planned", "In Progress"}
     refute_receive {:discord_request, _opts}, 50
@@ -452,8 +471,10 @@ defmodule SymphonyElixir.CoreTest do
 
     issue = %Issue{id: "issue-rework", identifier: "MT-REWORK", state: "Rework"}
 
-    assert {:ok, %Issue{state: "In Progress"}} =
+    assert {:ok, %Issue{state: "In Progress", metadata: metadata}} =
              Orchestrator.mark_issue_in_progress_for_dispatch_for_test(issue)
+
+    assert metadata["symphony_dispatch_state"] == "Rework"
 
     assert_receive {:memory_tracker_state_update, "issue-rework", "In Progress"}
   end

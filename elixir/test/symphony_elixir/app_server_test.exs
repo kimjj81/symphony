@@ -1,6 +1,23 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "extracts the final agent message from a completed turn payload" do
+    payload = %{
+      "params" => %{
+        "turn" => %{
+          "items" => [
+            %{"type" => "agentMessage", "text" => "first"},
+            %{"type" => "commandExecution", "command" => "true"},
+            %{"type" => "agentMessage", "text" => "final"}
+          ]
+        }
+      }
+    }
+
+    assert AppServer.final_agent_message(payload) == "final"
+    assert AppServer.final_agent_message(%{}) == nil
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(

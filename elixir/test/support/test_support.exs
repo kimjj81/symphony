@@ -116,6 +116,11 @@ defmodule SymphonyElixir.TestSupport do
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
           max_turns: 20,
+          max_review_verdicts: 3,
+          orchestration_brief_enabled: false,
+          review_states: ["Review", "Reviewing"],
+          rework_state: "Rework",
+          human_review_state: "Human Review",
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
           dispatch_kinds: ["issue", "pull_request"],
@@ -130,6 +135,7 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          verification_full_states: ["Merging"],
           hook_after_sync_local_files: nil,
           hook_after_create: nil,
           hook_before_run: nil,
@@ -169,6 +175,11 @@ defmodule SymphonyElixir.TestSupport do
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
+    max_review_verdicts = Keyword.get(config, :max_review_verdicts)
+    orchestration_brief_enabled = Keyword.get(config, :orchestration_brief_enabled)
+    review_states = Keyword.get(config, :review_states)
+    rework_state = Keyword.get(config, :rework_state)
+    human_review_state = Keyword.get(config, :human_review_state)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     dispatch_kinds = Keyword.get(config, :dispatch_kinds)
@@ -183,6 +194,7 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    verification_full_states = Keyword.get(config, :verification_full_states)
     hook_after_sync_local_files = Keyword.get(config, :hook_after_sync_local_files)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
@@ -228,6 +240,11 @@ defmodule SymphonyElixir.TestSupport do
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
+        "  max_review_verdicts: #{yaml_value(max_review_verdicts)}",
+        "  orchestration_brief_enabled: #{yaml_value(orchestration_brief_enabled)}",
+        "  review_states: #{yaml_value(review_states)}",
+        "  rework_state: #{yaml_value(rework_state)}",
+        "  human_review_state: #{yaml_value(human_review_state)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "  dispatch_kinds: #{yaml_value(dispatch_kinds)}",
@@ -243,6 +260,8 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        "verification:",
+        "  full_states: #{yaml_value(verification_full_states)}",
         hooks_yaml(
           hook_after_sync_local_files,
           hook_after_create,

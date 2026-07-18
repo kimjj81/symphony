@@ -432,6 +432,13 @@ Fields:
   - Default: `20`
   - Limits the number of coding-agent turns within one worker session.
   - Invalid values fail configuration validation.
+- `max_review_verdicts` (positive integer)
+  - Default: `3`.
+  - Limits review verdicts, not implementation/rework turns, in a briefed worker run.
+- `orchestration_brief_enabled` (boolean)
+  - Default: `false` for backward compatibility.
+- `review_states` (list of strings), `rework_state` (string), `human_review_state` (string)
+  - Define the transition-aware review cycle without hard-coding tracker labels.
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
@@ -456,6 +463,8 @@ fields locally if they want stricter startup checks.
   - Default: `codex app-server`
   - The runtime launches this command via `bash -lc` in the workspace directory.
   - The launched process MUST speak a compatible app-server protocol over stdio.
+- `task_profiles.orchestration`
+  - Selects the model, effort, and command for the read-only preflight agent.
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
 - `thread_sandbox` (Codex `SandboxMode` value)
@@ -612,6 +621,11 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.timeout_ms`: integer, default `60000`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
+- `agent.max_review_verdicts`: integer, default `3`
+- `agent.orchestration_brief_enabled`: boolean, default `false`
+- `agent.review_states`: list of strings, default `["Review", "Reviewing"]`
+- `agent.rework_state`: string, default `Rework`
+- `agent.human_review_state`: string, default `Human Review`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
@@ -623,6 +637,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `verification.full_states`: list of strings, default `["Merging"]`
 
 ## 7. Orchestration State Machine
 
@@ -664,6 +679,23 @@ Important nuance:
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.
+
+Workflows MAY enable orchestration briefs for bounded PR review/rework cycles:
+
+- A read-only orchestration preflight runs once per worker run and condenses the rendered workflow,
+  relevant repository skills/references, live head, and unresolved feedback into an in-memory brief
+  no larger than 8 KiB.
+- If preflight generation fails or exceeds the limit, the worker uses a deterministic compact brief;
+  it MUST NOT make every worker reread the long source documents.
+- Each briefed worker turn starts a fresh coding-agent thread and receives only tracker identity,
+  the brief, the current review-verdict counter, and the verification tier.
+- Briefed continuation is transition-aware rather than based on active state alone. Implementation or
+  rework may continue to review; review findings may continue to rework while the verdict budget
+  remains; a clean review stops immediately in Human Review.
+- When the configured review-verdict budget is exhausted with findings remaining, or when a worker
+  completes in an unexpected active state, the item moves to Human Review with a handoff comment.
+- Full verification and required-CI waiting are reserved for configured full states such as Merging.
+  Earlier states run focused checks and inspect CI once without polling.
 
 ### 7.2 Run Attempt Lifecycle
 

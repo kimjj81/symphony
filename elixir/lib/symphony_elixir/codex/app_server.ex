@@ -360,6 +360,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
       |> put_optional_param("model", Keyword.get(opts, :model))
       |> put_optional_param("effort", Keyword.get(opts, :effort))
+      |> put_optional_param("outputSchema", Keyword.get(opts, :output_schema))
 
     send_message(port, %{
       "method" => "turn/start",
@@ -375,6 +376,19 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp put_optional_param(params, _key, nil), do: params
   defp put_optional_param(params, key, value), do: Map.put(params, key, value)
+
+  @doc false
+  @spec final_agent_message(map()) :: String.t() | nil
+  def final_agent_message(%{"params" => %{"turn" => %{"items" => items}}}) when is_list(items) do
+    items
+    |> Enum.reverse()
+    |> Enum.find_value(fn
+      %{"type" => "agentMessage", "text" => text} when is_binary(text) -> text
+      _ -> nil
+    end)
+  end
+
+  def final_agent_message(_payload), do: nil
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
     receive_loop(
@@ -417,7 +431,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+        {:ok, payload}
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
