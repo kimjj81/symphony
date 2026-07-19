@@ -383,6 +383,46 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "git worktree cleanup removes stale registration when the workspace path is absent" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-stale-worktree-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-STALE-WORKTREE")
+
+      File.mkdir_p!(test_root)
+      System.cmd("git", ["init", "-b", "main", source])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      File.write!(Path.join(source, "README.md"), "main\n")
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "initial"])
+
+      assert {_output, 0} =
+               System.cmd("git", ["-C", source, "worktree", "add", "-b", "stale-worktree", workspace])
+
+      File.rm_rf!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "git_worktree",
+        workspace_source: source
+      )
+
+      assert :ok = Workspace.remove_issue_workspaces("MT-STALE-WORKTREE")
+
+      assert {_output, 0} =
+               System.cmd("git", ["-C", source, "worktree", "add", workspace, "stale-worktree"])
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace cleanup handles missing workspace root" do
     missing_root =
       Path.join(

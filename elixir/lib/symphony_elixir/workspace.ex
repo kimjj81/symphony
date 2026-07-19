@@ -229,7 +229,7 @@ defmodule SymphonyElixir.Workspace do
     if File.exists?(workspace) do
       remove_existing_local_workspace(workspace)
     else
-      {:ok, []}
+      remove_missing_local_workspace(workspace)
     end
   end
 
@@ -462,6 +462,42 @@ defmodule SymphonyElixir.Workspace do
       end
     else
       File.rm_rf(workspace)
+    end
+  end
+
+  defp remove_missing_local_workspace(workspace) do
+    settings = Config.settings!().workspace
+    source = settings.source
+
+    if settings.strategy == "git_worktree" and is_binary(source) and
+         File.exists?(Path.join(source, ".git")) do
+      case git_worktree_registered?(source, workspace) do
+        {:ok, true} -> remove_local_workspace(workspace)
+        {:ok, false} -> {:ok, []}
+        {:error, reason} -> {:error, reason, ""}
+      end
+    else
+      {:ok, []}
+    end
+  end
+
+  defp git_worktree_registered?(source, workspace) do
+    case System.cmd("git", ["-C", source, "worktree", "list", "--porcelain", "-z"], stderr_to_stdout: true) do
+      {output, 0} ->
+        expanded_workspace = Path.expand(workspace)
+
+        registered? =
+          output
+          |> String.split(<<0>>, trim: true)
+          |> Enum.any?(fn
+            "worktree " <> path -> Path.expand(path) == expanded_workspace
+            _field -> false
+          end)
+
+        {:ok, registered?}
+
+      {output, status} ->
+        {:error, {:git_worktree_list_failed, status, output}}
     end
   end
 
