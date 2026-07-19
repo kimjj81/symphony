@@ -115,6 +115,11 @@ hooks:
       exit 0
     fi
 
+    if ! command -v pnpm >/dev/null 2>&1; then
+      printf "ERROR: cannot clean Myven workspace; pnpm command not found\n" >&2
+      exit 127
+    fi
+
     if ! command -v docker >/dev/null 2>&1; then
       printf "WARN: skipped Myven compose cleanup; docker command not found\n" >&2
       exit 0
@@ -122,6 +127,12 @@ hooks:
 
     export DOCKER_CONFIG="${DOCKER_CONFIG:-/tmp/myven-docker-config}"
     mkdir -p "$DOCKER_CONFIG" 2>/dev/null || true
+
+    printf "INFO: stopping Myven local stack for %s\n" "$workspace_root"
+    if ! pnpm local:down; then
+      printf "ERROR: pnpm local:down failed for %s\n" "$workspace_root" >&2
+      exit 1
+    fi
 
     projects_file="${TMPDIR:-/tmp}/myven-compose-cleanup-projects-$$"
     : > "$projects_file"

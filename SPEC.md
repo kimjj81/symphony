@@ -399,7 +399,7 @@ Fields:
   - Failure is logged but ignored.
 - `before_remove` (multiline shell script string, OPTIONAL)
   - Runs before workspace deletion if the directory exists.
-  - Failure is logged but ignored; cleanup still proceeds.
+  - Failure or timeout aborts deletion and is returned to the caller so terminal cleanup can retry.
 - `timeout_ms` (integer, OPTIONAL)
   - Default: `60000`
   - Applies to all workspace hooks.
@@ -836,6 +836,12 @@ Note:
   (including terminal transitions for currently running issues).
 - Retry handling mainly operates on active candidates and releases claims when the issue is absent,
   rather than performing terminal cleanup itself.
+- Terminal cleanup failures use a separate retry entry with the same exponential failure backoff.
+  Before each retry, the tracker state is fetched again: an explicit terminal state retries cleanup,
+  an explicit non-terminal state cancels cleanup, and an empty or failed lookup schedules another
+  retry. Retries have no attempt limit; only the delay is capped by
+  `agent.max_retry_backoff_ms`. Successful cleanup, including an already-absent workspace, clears
+  the retry entry.
 
 ### 8.5 Active Run Reconciliation
 
@@ -863,7 +869,9 @@ Part B: Tracker state refresh
 When the service starts:
 
 1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
+2. For each returned issue identifier, attempt to remove the corresponding workspace directory.
+   An already-absent workspace is successful; a hook, remote, or worktree removal failure preserves
+   the workspace and schedules terminal cleanup retry without blocking startup.
 3. If the terminal-issues fetch fails, log a warning and continue startup.
 
 This prevents stale terminal workspaces from accumulating after restarts.
@@ -942,7 +950,9 @@ Failure semantics:
 - `after_create` failure or timeout is fatal to workspace creation.
 - `before_run` failure or timeout is fatal to the current run attempt.
 - `after_run` failure or timeout is logged and ignored.
-- `before_remove` failure or timeout is logged and ignored.
+- `before_remove` failure or timeout aborts workspace deletion and is returned to the caller.
+  Terminal cleanup retains the workspace and retries with tracker revalidation and exponential
+  backoff.
 
 ### 9.5 Safety Invariants
 
@@ -1256,7 +1266,9 @@ Orchestrator behavior on tracker errors:
 
 - Candidate fetch failure: log and skip dispatch for this tick.
 - Running-state refresh failure: log and keep active workers running.
-- Startup terminal cleanup failure: log warning and continue startup.
+- Startup terminal issue fetch failure: log warning and continue startup.
+- Per-workspace startup cleanup failure: preserve the workspace, schedule cleanup retry, and continue
+  startup.
 
 ### 11.5 Tracker Writes (Important Boundary)
 
@@ -2021,7 +2033,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `after_create` hook runs only on new workspace creation
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
-- `before_remove` hook runs on cleanup and failures/timeouts are ignored
+- `before_remove` hook runs on cleanup and failures/timeouts preserve the workspace and surface an
+  error for terminal cleanup retry
 - Workspace path sanitization and root containment invariants are enforced before agent launch
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
 

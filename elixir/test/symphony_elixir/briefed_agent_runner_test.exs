@@ -94,6 +94,38 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     assert trace =~ "thread/start"
   end
 
+  test "orchestration preflight still decodes a legacy embedded agent message" do
+    test_root = test_root("preflight-legacy-success")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "preflight")
+    trace_file = Path.join(test_root, "preflight.trace")
+    File.mkdir_p!(workspace)
+
+    brief = %{
+      "live_head" => "legacy123",
+      "lane" => "Review",
+      "unresolved_feedback" => [],
+      "allowed_scope" => ["legacy app-server"],
+      "focused_verification" => ["mix test focused"],
+      "stop_conditions" => ["head drift"],
+      "transitions" => ["clean -> Human Review"]
+    }
+
+    codex_binary =
+      write_preflight_codex!(test_root, trace_file, {:completed_legacy, Jason.encode!(brief)})
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server"
+    )
+
+    assert {:ok, rendered, %{source: :agent, lane: "Review"}} =
+             OrchestrationBrief.generate(workspace, review_issue("preflight-legacy-success"))
+
+    assert rendered =~ "live_head: legacy123"
+  end
+
   test "orchestration preflight returns Codex turn failures" do
     test_root = test_root("preflight-failure")
     on_exit(fn -> File.rm_rf(test_root) end)
@@ -491,6 +523,25 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     notification =
       case outcome do
         {:completed, text} ->
+          [
+            Jason.encode!(%{
+              "method" => "item/completed",
+              "params" => %{"item" => %{"type" => "agentMessage", "text" => text}}
+            }),
+            Jason.encode!(%{
+              "method" => "turn/completed",
+              "params" => %{
+                "turn" => %{
+                  "id" => "turn-preflight",
+                  "items" => [],
+                  "status" => "completed"
+                }
+              }
+            })
+          ]
+          |> Enum.join("\n")
+
+        {:completed_legacy, text} ->
           Jason.encode!(%{
             "method" => "turn/completed",
             "params" => %{

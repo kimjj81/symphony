@@ -97,9 +97,10 @@ defmodule SymphonyElixir.Codex.OrchestrationBrief do
                output_schema: @output_schema,
                on_message: Keyword.get(opts, :on_message, fn _ -> :ok end)
              ) do
-          {:ok, %{result: payload}} ->
-            payload
-            |> AppServer.final_agent_message()
+          {:ok, %{result: payload} = turn_result} ->
+            turn_result
+            |> Map.get(:final_agent_message)
+            |> Kernel.||(AppServer.final_agent_message(payload))
             |> decode_brief(issue)
 
           {:error, reason} ->
