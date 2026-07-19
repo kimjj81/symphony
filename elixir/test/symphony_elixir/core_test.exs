@@ -450,6 +450,47 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "current WORKFLOW.myven.md before_remove skips local down when compose config is absent" do
+    workflow_path = Path.expand("../../WORKFLOW.myven.md", __DIR__)
+
+    assert {:ok, %{config: config}} = Workflow.load(workflow_path)
+    assert {:ok, settings} = Config.Schema.parse(config)
+
+    test_root = Path.join(System.tmp_dir!(), "myven-before-remove-missing-compose-#{System.unique_integer([:positive])}")
+    workspace = Path.join(test_root, "workspace")
+    bin_dir = Path.join(test_root, "bin")
+    command_log = Path.join(test_root, "commands.log")
+
+    try do
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(bin_dir)
+      File.write!(command_log, "")
+
+      File.write!(Path.join(bin_dir, "pnpm"), "#!/bin/sh\nprintf 'pnpm %s\\n' \"$*\" >> \"$COMMAND_LOG\"\nexit 99\n")
+      File.write!(Path.join(bin_dir, "docker"), "#!/bin/sh\nprintf 'docker %s\\n' \"$*\" >> \"$COMMAND_LOG\"\nexit 99\n")
+      File.chmod!(Path.join(bin_dir, "pnpm"), 0o755)
+      File.chmod!(Path.join(bin_dir, "docker"), 0o755)
+
+      {output, status} =
+        System.cmd("sh", ["-c", settings.hooks.before_remove],
+          cd: workspace,
+          stderr_to_stdout: true,
+          env: [
+            {"COMMAND_LOG", command_log},
+            {"PATH", bin_dir <> ":" <> (System.get_env("PATH") || "")},
+            {"SYMPHONY_WORKSPACE", workspace},
+            {"TMPDIR", test_root}
+          ]
+        )
+
+      assert status == 0, output
+      assert output =~ "WARN: skipped Myven compose cleanup; missing"
+      assert File.read!(command_log) == ""
+    after
+      File.rm_rf!(test_root)
+    end
+  end
+
   test "current WORKFLOW.myven.md before_remove stops when local down fails" do
     workflow_path = Path.expand("../../WORKFLOW.myven.md", __DIR__)
 

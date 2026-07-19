@@ -110,6 +110,11 @@ hooks:
     compose_file="${workspace_root}/infra/local/docker-compose.yml"
     env_file="${workspace_root}/.env.local"
 
+    if [ ! -f "$compose_file" ]; then
+      printf "WARN: skipped Myven compose cleanup; missing %s\n" "$compose_file" >&2
+      exit 0
+    fi
+
     if ! command -v pnpm >/dev/null 2>&1; then
       printf "ERROR: cannot clean Myven workspace; pnpm command not found\n" >&2
       exit 127
@@ -119,11 +124,6 @@ hooks:
     if ! pnpm local:down; then
       printf "ERROR: pnpm local:down failed for %s\n" "$workspace_root" >&2
       exit 1
-    fi
-
-    if [ ! -f "$compose_file" ]; then
-      printf "WARN: skipped Myven compose cleanup; missing %s\n" "$compose_file" >&2
-      exit 0
     fi
 
     if ! command -v docker >/dev/null 2>&1; then
