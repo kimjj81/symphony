@@ -1106,6 +1106,7 @@ defmodule SymphonyElixir.Orchestrator do
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
+        state = cancel_cleanup_retry(state, issue.id)
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
@@ -1408,7 +1409,7 @@ defmodule SymphonyElixir.Orchestrator do
     case Tracker.fetch_issue_states_by_ids([issue_id]) do
       {:ok, [%Issue{} = issue | _]} ->
         if terminal_issue_state?(issue.state, terminal_state_set()) do
-          attempt_terminal_workspace_cleanup(state, issue_id, identifier, worker_host, next_attempt)
+          handle_terminal_cleanup_retry(state, issue_id, identifier, worker_host, next_attempt)
         else
           Logger.info("Canceled terminal workspace cleanup retry because issue is no longer terminal issue_id=#{issue_id} issue_identifier=#{identifier} state=#{inspect(issue.state)}")
           state
@@ -1427,6 +1428,14 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: worker_host,
           error: {:tracker_fetch_failed, reason}
         })
+    end
+  end
+
+  defp handle_terminal_cleanup_retry(state, issue_id, identifier, worker_host, next_attempt) do
+    if Map.has_key?(state.running, issue_id) do
+      terminate_running_issue(state, issue_id, true)
+    else
+      attempt_terminal_workspace_cleanup(state, issue_id, identifier, worker_host, next_attempt)
     end
   end
 

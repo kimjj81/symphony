@@ -460,8 +460,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, payload, completed_final_agent_message(payload, stream_state)}
+        handle_completed_turn(port, on_message, payload, payload_string, stream_state)
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -657,6 +656,47 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp completed_final_agent_message(payload, stream_state) do
     final_agent_message(payload) || stream_state.last_agent_message
+  end
+
+  defp handle_completed_turn(port, on_message, payload, payload_string, stream_state) do
+    case completed_turn_result(payload, stream_state) do
+      {:ok, final_agent_message} ->
+        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+        {:ok, payload, final_agent_message}
+
+      {:error, event, reason} ->
+        emit_turn_event(
+          on_message,
+          event,
+          payload,
+          payload_string,
+          port,
+          Map.get(payload, "params")
+        )
+
+        {:error, reason}
+    end
+  end
+
+  defp completed_turn_result(payload, stream_state) do
+    params = Map.get(payload, "params")
+
+    case get_in(payload, ["params", "turn", "status"]) do
+      nil ->
+        {:ok, completed_final_agent_message(payload, stream_state)}
+
+      "completed" ->
+        {:ok, completed_final_agent_message(payload, stream_state)}
+
+      "failed" ->
+        {:error, :turn_failed, {:turn_failed, params}}
+
+      "interrupted" ->
+        {:error, :turn_cancelled, {:turn_cancelled, params}}
+
+      status ->
+        {:error, :turn_failed, {:unexpected_turn_status, status, params}}
+    end
   end
 
   defp maybe_handle_approval_request(
