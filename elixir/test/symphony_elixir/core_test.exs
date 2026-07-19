@@ -340,7 +340,7 @@ defmodule SymphonyElixir.CoreTest do
     assert settings.agent.source_checkout_states == ["todo"]
     refute "Waiting" in settings.tracker.active_states
     assert settings.tracker.state_labels["Waiting"] == "sym:waiting"
-    assert settings.hooks.after_sync_local_files == "pnpm run worktree:copy-env\n"
+    assert settings.hooks.after_sync_local_files == "bash ./scripts/worktree-bootstrap.sh copy-env\n"
     refute settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
     assert String.trim(prompt) != ""
     assert prompt =~ "sandbox_permissions=require_escalated"

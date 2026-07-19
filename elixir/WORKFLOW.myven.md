@@ -48,7 +48,7 @@ workspace:
       required: false
 hooks:
   after_sync_local_files: |
-    pnpm run worktree:copy-env
+    bash ./scripts/worktree-bootstrap.sh copy-env
   after_create: |
     : "${CODEX_WS_HOST:=127.0.0.1}"
     : "${CODEX_WS_PORT:=4500}"
