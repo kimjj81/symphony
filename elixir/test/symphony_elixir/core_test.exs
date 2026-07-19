@@ -388,6 +388,7 @@ defmodule SymphonyElixir.CoreTest do
       File.write!(pnpm_path, """
       #!/bin/sh
       printf 'pnpm %s\\n' "$*" >> "$DOCKER_LOG"
+      printf 'docker-config %s\\n' "$DOCKER_CONFIG" >> "$DOCKER_LOG"
       exit 0
       """)
 
@@ -419,6 +420,7 @@ defmodule SymphonyElixir.CoreTest do
           stderr_to_stdout: true,
           env: [
             {"DOCKER_LOG", docker_log},
+            {"DOCKER_CONFIG", ""},
             {"PATH", Enum.join([bin_dir, original_path], ":")},
             {"SYMPHONY_WORKSPACE", workspace},
             {"TMPDIR", test_root}
@@ -437,6 +439,7 @@ defmodule SymphonyElixir.CoreTest do
       physical_compose_file = Path.join(physical_workspace, "infra/local/docker-compose.yml")
 
       assert hd(log_lines) == "pnpm local:down"
+      assert Enum.at(log_lines, 1) == "docker-config /tmp/myven-docker-config"
 
       assert log =~
                "compose --profile tools --env-file #{physical_env_file} -p myven_from_env -f #{physical_compose_file} down -v --remove-orphans"

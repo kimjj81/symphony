@@ -358,6 +358,36 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "git worktree cleanup removes an existing directory with no worktree registration" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-unregistered-worktree-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-UNREGISTERED")
+
+      File.mkdir_p!(test_root)
+      System.cmd("git", ["init", "-b", "main", source])
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "marker.txt"), "stale")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_strategy: "git_worktree",
+        workspace_source: source
+      )
+
+      assert :ok = Workspace.remove_issue_workspaces("MT-UNREGISTERED")
+      refute File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "git worktree cleanup succeeds when the workspace is already absent" do
     test_root =
       Path.join(

@@ -454,14 +454,31 @@ defmodule SymphonyElixir.Workspace do
 
   defp remove_local_workspace(workspace) do
     settings = Config.settings!().workspace
+    source = settings.source
 
-    if settings.strategy == "git_worktree" and is_binary(settings.source) and String.trim(settings.source) != "" do
-      case System.cmd("git", ["-C", settings.source, "worktree", "remove", "--force", workspace], stderr_to_stdout: true) do
-        {_output, 0} -> {:ok, []}
-        {output, status} -> {:error, {:git_worktree_remove_failed, status, output}, ""}
-      end
+    if settings.strategy == "git_worktree" and is_binary(source) and String.trim(source) != "" do
+      remove_local_git_workspace(source, workspace)
     else
       File.rm_rf(workspace)
+    end
+  end
+
+  defp remove_local_git_workspace(source, workspace) do
+    if File.exists?(Path.join(source, ".git")) do
+      case git_worktree_registered?(source, workspace) do
+        {:ok, true} -> remove_registered_git_worktree(source, workspace)
+        {:ok, false} -> File.rm_rf(workspace)
+        {:error, reason} -> {:error, reason, ""}
+      end
+    else
+      remove_registered_git_worktree(source, workspace)
+    end
+  end
+
+  defp remove_registered_git_worktree(source, workspace) do
+    case System.cmd("git", ["-C", source, "worktree", "remove", "--force", workspace], stderr_to_stdout: true) do
+      {_output, 0} -> {:ok, []}
+      {output, status} -> {:error, {:git_worktree_remove_failed, status, output}, ""}
     end
   end
 
@@ -472,7 +489,7 @@ defmodule SymphonyElixir.Workspace do
     if settings.strategy == "git_worktree" and is_binary(source) and
          File.exists?(Path.join(source, ".git")) do
       case git_worktree_registered?(source, workspace) do
-        {:ok, true} -> remove_local_workspace(workspace)
+        {:ok, true} -> remove_registered_git_worktree(source, workspace)
         {:ok, false} -> {:ok, []}
         {:error, reason} -> {:error, reason, ""}
       end

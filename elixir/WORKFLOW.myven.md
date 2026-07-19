@@ -115,6 +115,9 @@ hooks:
       exit 0
     fi
 
+    export DOCKER_CONFIG="${DOCKER_CONFIG:-/tmp/myven-docker-config}"
+    mkdir -p "$DOCKER_CONFIG" 2>/dev/null || true
+
     if ! command -v pnpm >/dev/null 2>&1; then
       printf "ERROR: cannot clean Myven workspace; pnpm command not found\n" >&2
       exit 127
@@ -130,9 +133,6 @@ hooks:
       printf "WARN: skipped Myven compose cleanup; docker command not found\n" >&2
       exit 0
     fi
-
-    export DOCKER_CONFIG="${DOCKER_CONFIG:-/tmp/myven-docker-config}"
-    mkdir -p "$DOCKER_CONFIG" 2>/dev/null || true
 
     projects_file="${TMPDIR:-/tmp}/myven-compose-cleanup-projects-$$"
     : > "$projects_file"
