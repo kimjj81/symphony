@@ -6,7 +6,7 @@ defmodule SymphonyElixir.GitHub.WebhookProcessor do
   require Logger
 
   alias SymphonyElixir.Config
-  alias SymphonyElixir.GitHub.Adapter, as: GitHubAdapter
+  alias SymphonyElixir.GitHub.Client
   alias SymphonyElixirWeb.Presenter
 
   @refresh_events ~w(issues pull_request pull_request_review pull_request_review_comment issue_comment)
@@ -20,13 +20,16 @@ defmodule SymphonyElixir.GitHub.WebhookProcessor do
     action = payload |> Map.get("action") |> to_string()
     issue_id = issue_id(event, payload)
 
-    sync_webhook_state(event, action, payload, issue_id, opts)
-    queue_rework_from_review_comment(event, action, payload, issue_id, opts)
+    case ingest_webhook_intent(event, action, payload, issue_id, opts) do
+      :ok ->
+        if refresh_event?(event, action) do
+          refresh(event, action, issue_id, opts)
+        else
+          {:ignored, %{event: event, action: action}}
+        end
 
-    if refresh_event?(event, action) do
-      refresh(event, action, issue_id, opts)
-    else
-      {:ignored, %{event: event, action: action}}
+      {:error, _reason} ->
+        {:error, :unavailable}
     end
   end
 
@@ -66,39 +69,165 @@ defmodule SymphonyElixir.GitHub.WebhookProcessor do
     event in @refresh_events and action in @refresh_actions
   end
 
-  defp sync_webhook_state(event, action, payload, issue_id, opts) do
-    if github_tracker?(opts) do
-      sync_fun = Keyword.get(opts, :sync_fun, &GitHubAdapter.sync_webhook_state/3)
+  @doc """
+  Converts a GitHub delivery into an immutable tracker intent.
 
-      case sync_fun.(event, action, payload) do
+  This function deliberately performs no tracker mutation. State policy and
+  projection are owned by the orchestrator/state manager.
+  """
+  @spec normalize_intent(String.t(), String.t(), map()) :: {:ok, map()} | :ignore
+  def normalize_intent(event, action, payload)
+      when event in ["issues", "pull_request"] and action in ["labeled", "unlabeled"] and is_map(payload) do
+    event
+    |> intent_base(action, payload)
+    |> normalize_label_intent(payload)
+  end
+
+  def normalize_intent("issues" = event, "closed" = action, payload) when is_map(payload) do
+    {:ok,
+     Map.merge(intent_base(event, action, payload), %{
+       kind: :issue_closed,
+       state_reason: get_in(payload, ["issue", "state_reason"])
+     })}
+  end
+
+  def normalize_intent("issues" = event, "reopened" = action, payload) when is_map(payload),
+    do: {:ok, Map.put(intent_base(event, action, payload), :kind, :item_reopened)}
+
+  def normalize_intent("pull_request" = event, "closed" = action, payload) when is_map(payload) do
+    {:ok,
+     Map.merge(intent_base(event, action, payload), %{
+       kind: :pull_request_closed,
+       merged: get_in(payload, ["pull_request", "merged"]) == true
+     })}
+  end
+
+  def normalize_intent("pull_request" = event, "reopened" = action, payload) when is_map(payload),
+    do: {:ok, Map.put(intent_base(event, action, payload), :kind, :item_reopened)}
+
+  def normalize_intent("pull_request" = event, "synchronize" = action, payload) when is_map(payload) do
+    {:ok,
+     Map.merge(intent_base(event, action, payload), %{
+       kind: :head_updated,
+       head_oid: get_in(payload, ["pull_request", "head", "sha"])
+     })}
+  end
+
+  def normalize_intent("pull_request_review" = event, "submitted" = action, payload) when is_map(payload) do
+    {:ok,
+     Map.merge(intent_base(event, action, payload), %{
+       kind: :review_submitted,
+       review_state: get_in(payload, ["review", "state"])
+     })}
+  end
+
+  def normalize_intent("pull_request_review_comment" = event, "created" = action, payload) when is_map(payload),
+    do: {:ok, Map.put(intent_base(event, action, payload), :kind, :review_feedback_detected)}
+
+  def normalize_intent(_event, _action, _payload), do: :ignore
+
+  defp intent_base(event, action, payload) do
+    %{
+      source: :github_webhook,
+      event: event,
+      action: action,
+      issue_id: issue_id(event, payload),
+      actor: webhook_actor(payload)
+    }
+  end
+
+  defp ingest_webhook_intent(event, action, payload, issue_id, opts) do
+    with true <- github_tracker?(opts),
+         {:ok, intent} <- normalize_intent(event, action, payload) do
+      intent_fun = Keyword.get(opts, :intent_fun)
+
+      result =
+        if is_function(intent_fun, 1) do
+          intent_fun.(intent)
+        else
+          :ok
+        end
+
+      case result do
         :ok ->
           :ok
 
-        {:error, reason} ->
-          Logger.warning("GitHub webhook state sync failed event=#{event} action=#{action} issue_id=#{inspect(issue_id)} reason=#{inspect(reason)}")
+        {:ok, _} ->
+          :ok
 
+        {:error, reason} ->
+          Logger.warning("GitHub webhook intent ingestion failed event=#{event} action=#{action} issue_id=#{inspect(issue_id)} reason=#{inspect(reason)}")
+
+          {:error, reason}
+
+        :unavailable ->
+          {:error, :unavailable}
+
+        _ ->
           :ok
       end
     else
-      :ok
+      _ -> :ok
     end
   end
 
-  defp queue_rework_from_review_comment(event, action, payload, issue_id, opts) do
-    if github_tracker?(opts) do
-      queue_fun = Keyword.get(opts, :queue_rework_fun, &GitHubAdapter.queue_rework_from_review_comment/3)
+  defp normalize_label_intent(base, payload) do
+    label = get_in(payload, ["label", "name"])
 
-      case queue_fun.(event, action, payload) do
-        :ok ->
-          :ok
+    case Client.classify_managed_label(label) do
+      {:request, requested_state} when base.action == "labeled" ->
+        {:ok,
+         Map.merge(base, %{
+           kind: :operator_transition_requested,
+           label: label,
+           request: request_key(label),
+           requested_state: requested_state,
+           request_action: base.action
+         })}
 
-        {:error, reason} ->
-          Logger.warning("GitHub inline-review rework queue failed event=#{event} action=#{action} issue_id=#{inspect(issue_id)} reason=#{inspect(reason)}")
+      {:request, _requested_state} ->
+        :ignore
 
-          :ok
-      end
-    else
-      :ok
+      {:state, observed_state} ->
+        kind = if self_write?(payload), do: :projection_echo, else: :state_projection_drift
+
+        observed_state =
+          if base.action == "unlabeled",
+            do: nil,
+            else: observed_state
+
+        {:ok, Map.merge(base, %{kind: kind, label: label, observed_state: observed_state})}
+
+      :unmanaged ->
+        :ignore
+    end
+  end
+
+  defp self_write?(payload) do
+    expected_login = System.get_env("SYMPHONY_GITHUB_BOT_LOGIN") || "symphony[bot]"
+
+    case Map.get(payload, "sender", %{}) do
+      %{"login" => login} when is_binary(login) ->
+        String.downcase(login) == String.downcase(expected_login)
+
+      _ ->
+        false
+    end
+  end
+
+  defp request_key("sym:request-planned"), do: :planned
+  defp request_key("sym:request-rework"), do: :rework
+  defp request_key("sym:request-merging"), do: :merging
+  defp request_key("sym:request-human-review"), do: :human_review
+  defp request_key("sym:request-canceled"), do: :canceled
+  defp request_key("sym:request-duplicate"), do: :duplicate
+  defp request_key("sym:request-reopen"), do: :reopen
+  defp request_key(_label), do: :unknown
+
+  defp webhook_actor(payload) do
+    case Map.get(payload, "sender", %{}) do
+      %{"login" => login} when is_binary(login) -> login
+      _ -> nil
     end
   end
 

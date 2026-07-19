@@ -78,7 +78,7 @@ defmodule SymphonyElixir.CoreTest do
 
     config = Config.settings!()
     assert config.polling.interval_ms == 30_000
-    assert config.tracker.active_states == ["Todo", "In Progress"]
+    assert config.tracker.active_states == ["Todo", "In Progress", "Reworking"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
@@ -344,20 +344,18 @@ defmodule SymphonyElixir.CoreTest do
     refute settings.hooks.after_create =~ "pnpm run worktree:bootstrap"
     assert String.trim(prompt) != ""
     assert prompt =~ "sandbox_permissions=require_escalated"
-    assert prompt =~ "GitHub Todo issues are planning-only Codex runs"
+    assert prompt =~ "Todo issues are planning-only"
     assert prompt =~ "create exactly one active goal for the current tracker-state objective"
     assert prompt =~ "The goal is a scope guard, not permission to expand work"
-    assert prompt =~ "Planned or Rework PR goal"
-    assert prompt =~ "do not create, modify, commit, or push repository files"
-    assert prompt =~ "Create or reuse PR-sized implementation pull request(s)"
-    assert prompt =~ "do not create a single catch-all implementation PR"
-    assert prompt =~ "issue-level feature branch"
+    assert prompt =~ "Planned pull requests run after Symphony projects `In Progress`"
+    assert prompt =~ "Rework pull requests run after Symphony projects `Reworking`"
+    assert prompt =~ "Return exactly one structured object"
+    assert prompt =~ "MUST NOT add or remove any `sym:*` label"
+    assert prompt =~ "Do not create, modify, commit, or push repository files"
     assert prompt =~ "feature-to-main integration PR"
     assert prompt =~ "sym:waiting"
-    assert prompt =~ "Waiting` is not an active state"
-    assert prompt =~ "PR 진행 방식: 병렬"
-    assert prompt =~ "prefix the child PR title with the parent PR number"
-    assert prompt =~ "PR #<parent>: <child PR title>"
+    assert prompt =~ "sym:request-*"
+    assert prompt =~ "sym:reworking"
   end
 
   test "current WORKFLOW.myven.md before_remove runs local down before workspace compose cleanup" do
@@ -439,7 +437,7 @@ defmodule SymphonyElixir.CoreTest do
       physical_compose_file = Path.join(physical_workspace, "infra/local/docker-compose.yml")
 
       assert hd(log_lines) == "pnpm local:down"
-      assert Enum.at(log_lines, 1) == "docker-config /tmp/myven-docker-config"
+      assert Enum.at(log_lines, 1) == "docker-config "
 
       assert log =~
                "compose --profile tools --env-file #{physical_env_file} -p myven_from_env -f #{physical_compose_file} down -v --remove-orphans"
@@ -656,18 +654,18 @@ defmodule SymphonyElixir.CoreTest do
     refute_receive {:discord_request, _opts}, 50
   end
 
-  test "rework issue is marked in progress before dispatch" do
+  test "rework issue is marked reworking before dispatch" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
 
     issue = %Issue{id: "issue-rework", identifier: "MT-REWORK", state: "Rework"}
 
-    assert {:ok, %Issue{state: "In Progress", metadata: metadata}} =
+    assert {:ok, %Issue{state: "Reworking", metadata: metadata}} =
              Orchestrator.mark_issue_in_progress_for_dispatch_for_test(issue)
 
     assert metadata["symphony_dispatch_state"] == "Rework"
 
-    assert_receive {:memory_tracker_state_update, "issue-rework", "In Progress"}
+    assert_receive {:memory_tracker_state_update, "issue-rework", "Reworking"}
   end
 
   test "review pull request is marked reviewing before dispatch" do

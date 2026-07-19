@@ -22,7 +22,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_sandbox_policy: map(),
           thread_id: String.t(),
           workspace: Path.t(),
-          worker_host: String.t() | nil
+          worker_host: String.t() | nil,
+          gh_config_dir: Path.t() | nil
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -42,7 +43,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     codex_command = Keyword.get(opts, :codex_command) || Config.settings!().codex.command
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host, codex_command) do
+         {:ok, port, gh_config_dir} <- start_port(expanded_workspace, worker_host, codex_command) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
@@ -57,11 +58,13 @@ defmodule SymphonyElixir.Codex.AppServer do
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
            workspace: expanded_workspace,
-           worker_host: worker_host
+           worker_host: worker_host,
+           gh_config_dir: gh_config_dir
          }}
       else
         {:error, reason} ->
           stop_port(port)
+          remove_worker_gh_config_dir(gh_config_dir)
           {:error, reason}
       end
     end
@@ -142,8 +145,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
+  def stop_session(%{port: port, gh_config_dir: gh_config_dir}) when is_port(port) do
     stop_port(port)
+    remove_worker_gh_config_dir(gh_config_dir)
   end
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
@@ -210,6 +214,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
+      gh_config_dir = worker_gh_config_dir()
+      :ok = File.mkdir_p(gh_config_dir)
+      :ok = File.chmod(gh_config_dir, 0o700)
+
       port =
         Port.open(
           {:spawn_executable, String.to_charlist(executable)},
@@ -219,26 +227,83 @@ defmodule SymphonyElixir.Codex.AppServer do
             :stderr_to_stdout,
             args: [~c"-lc", String.to_charlist(codex_command)],
             cd: String.to_charlist(workspace),
+            env: worker_environment(gh_config_dir),
             line: @port_line_bytes
           ]
         )
 
-      {:ok, port}
+      {:ok, port, gh_config_dir}
     end
   end
 
   defp start_port(workspace, worker_host, codex_command) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace, codex_command)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+    gh_config_dir = worker_gh_config_dir("/tmp")
+    remote_command = remote_launch_command(workspace, codex_command, gh_config_dir)
+
+    case SSH.start_port(worker_host, remote_command, line: @port_line_bytes) do
+      {:ok, port} -> {:ok, port, nil}
+      error -> error
+    end
   end
 
-  defp remote_launch_command(workspace, codex_command) when is_binary(workspace) do
+  defp remote_launch_command(workspace, codex_command, gh_config_dir) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      "exec #{codex_command}"
+      "umask 077",
+      "mkdir -p #{shell_escape(gh_config_dir)}",
+      "trap 'rm -rf -- #{gh_config_dir}' EXIT",
+      "#{remote_worker_environment(gh_config_dir)} #{codex_command}"
     ]
     |> Enum.join(" && ")
   end
+
+  defp worker_environment(gh_config_dir) do
+    scrubbed =
+      ~w(GITHUB_TOKEN GH_TOKEN SYMPHONY_TRACKER_WRITE_TOKEN LINEAR_API_KEY)
+      |> Enum.map(&{String.to_charlist(&1), false})
+
+    base =
+      [
+        {~c"GH_CONFIG_DIR", String.to_charlist(gh_config_dir)},
+        {~c"GIT_TERMINAL_PROMPT", ~c"0"},
+        {~c"GIT_CONFIG_COUNT", ~c"1"},
+        {~c"GIT_CONFIG_KEY_0", ~c"credential.helper"},
+        {~c"GIT_CONFIG_VALUE_0", ~c""}
+      ] ++ scrubbed
+
+    case Config.settings!().tracker do
+      %{kind: "github", read_api_key: token} when is_binary(token) and token != "" ->
+        base
+        |> Enum.reject(fn {name, _value} -> name == ~c"GH_TOKEN" end)
+        |> then(&[{~c"GH_TOKEN", String.to_charlist(token)} | &1])
+
+      _ ->
+        base
+    end
+  end
+
+  defp remote_worker_environment(gh_config_dir) do
+    unset = "env -u GITHUB_TOKEN -u GH_TOKEN -u SYMPHONY_TRACKER_WRITE_TOKEN -u LINEAR_API_KEY"
+    config_dir = "GH_CONFIG_DIR=#{shell_escape(gh_config_dir)}"
+
+    git_credentials =
+      "GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=''"
+
+    case Config.settings!().tracker do
+      %{kind: "github", read_api_key: token} when is_binary(token) and token != "" ->
+        Enum.join([unset, config_dir, git_credentials, "GH_TOKEN=#{shell_escape(token)}"], " ")
+
+      _ ->
+        Enum.join([unset, config_dir, git_credentials], " ")
+    end
+  end
+
+  defp worker_gh_config_dir(root \\ System.tmp_dir!()) do
+    Path.join(root, "symphony-worker-gh-config-#{System.unique_integer([:positive, :monotonic])}")
+  end
+
+  defp remove_worker_gh_config_dir(path) when is_binary(path), do: File.rm_rf(path) |> then(fn _ -> :ok end)
+  defp remove_worker_gh_config_dir(_path), do: :ok
 
   defp port_metadata(port, worker_host) when is_port(port) do
     base_metadata =

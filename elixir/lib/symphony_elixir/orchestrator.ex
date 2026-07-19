@@ -7,12 +7,26 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    AppliedTransition,
+    Config,
+    StatusDashboard,
+    Tracker,
+    TransitionIntent,
+    TransitionJournal,
+    TransitionPlan,
+    WorkflowStatePolicy,
+    Workspace
+  }
+
   alias SymphonyElixir.Notifications.{Cmux, Discord}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @max_failure_retry_attempts 5
+  @transition_effect_retry_ms 2_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -39,6 +53,8 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       retry_attempts: %{},
       cleanup_retries: %{},
+      last_transition: nil,
+      transition_conflicts: 0,
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -69,7 +85,17 @@ defmodule SymphonyElixir.Orchestrator do
     state = run_terminal_workspace_cleanup(state)
     state = schedule_tick(state, 0)
 
-    {:ok, state}
+    if config.state_manager.mode in ["shadow", "authoritative"] do
+      {:ok, state, {:continue, :replay_transition_journal}}
+    else
+      {:ok, state}
+    end
+  end
+
+  @impl true
+  def handle_continue(:replay_transition_journal, state) do
+    :ok = fence_inherited_worker_tasks()
+    {:noreply, replay_pending_transitions(state)}
   end
 
   @impl true
@@ -222,6 +248,16 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_info({:retry_transition_effect, transition_id, attempt}, state) do
+    {result, state} = retry_transition_effect(transition_id, state)
+
+    state = handle_transition_effect_retry_result(state, transition_id, attempt, result)
+
+    Logger.info("Transition effect retry completed transition_id=#{transition_id} attempt=#{attempt} result=#{inspect(result)}")
+
+    {:noreply, state}
+  end
+
   def handle_info({:worker_runtime_info, issue_id, runtime_info}, %{running: running} = state)
       when is_binary(issue_id) and is_map(runtime_info) do
     case Map.get(running, issue_id) do
@@ -290,6 +326,51 @@ defmodule SymphonyElixir.Orchestrator do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
   end
+
+  defp handle_transition_effect_retry_result(state, transition_id, attempt, {:error, _reason})
+       when attempt < @max_failure_retry_attempts do
+    Process.send_after(
+      self(),
+      {:retry_transition_effect, transition_id, attempt + 1},
+      @transition_effect_retry_ms
+    )
+
+    state
+  end
+
+  defp handle_transition_effect_retry_result(state, transition_id, _attempt, {:error, reason}) do
+    if String.starts_with?(transition_id, "effect-retry-exhausted:") do
+      Logger.error("Exhausted retry for a handoff transition transition_id=#{transition_id} reason=#{inspect(reason)}")
+      state
+    else
+      handoff_exhausted_transition_effect(state, transition_id, reason)
+    end
+  end
+
+  defp handle_transition_effect_retry_result(state, transition_id, _attempt, result) do
+    _ = maybe_finalize_abandoned_cause(transition_id, result)
+    state
+  end
+
+  defp maybe_finalize_abandoned_cause(
+         "effect-retry-exhausted:" <> _rest = handoff_id,
+         {:ok, _applied}
+       ) do
+    with {:ok, snapshot} <- journal_snapshot(handoff_id),
+         cause_id when is_binary(cause_id) and cause_id != "" <- snapshot.data[:causation_id] do
+      normalize_journal_record(
+        journal_record(cause_id, :verified, %{
+          issue_id: snapshot.data[:issue_id],
+          abandoned_effect: true,
+          handoff_transition_id: handoff_id
+        })
+      )
+    else
+      _ -> :ok
+    end
+  end
+
+  defp maybe_finalize_abandoned_cause(_transition_id, _result), do: :ok
 
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
@@ -421,6 +502,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec mark_issue_in_progress_for_dispatch_for_test(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
   def mark_issue_in_progress_for_dispatch_for_test(%Issue{} = issue) do
     mark_issue_for_dispatch(issue)
+  end
+
+  @doc false
+  @spec worker_dispatch_lease_id_for_test(Issue.t(), integer() | nil) :: String.t()
+  def worker_dispatch_lease_id_for_test(%Issue{} = issue, attempt) do
+    worker_dispatch_lease_id(issue, attempt)
   end
 
   @doc false
@@ -744,6 +831,23 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp terminate_task(_pid), do: :ok
 
+  defp fence_inherited_worker_tasks do
+    case Process.whereis(SymphonyElixir.TaskSupervisor) do
+      pid when is_pid(pid) ->
+        SymphonyElixir.TaskSupervisor
+        |> Task.Supervisor.children()
+        |> Enum.each(fn child_pid ->
+          Logger.warning("Fencing worker task inherited across orchestrator restart pid=#{inspect(child_pid)}")
+          terminate_task(child_pid)
+        end)
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
@@ -1041,20 +1145,35 @@ defmodule SymphonyElixir.Orchestrator do
        ),
        do: {:ok, issue}
 
-  defp move_issue_to_human_review_after_pull_request(%Issue{id: issue_id} = issue)
+  defp move_issue_to_human_review_after_pull_request(issue, comment_body \\ nil)
+
+  defp move_issue_to_human_review_after_pull_request(%Issue{id: issue_id} = issue, comment_body)
        when is_binary(issue_id) do
-    case Tracker.update_issue_state(issue_id, "Human Review") do
-      :ok ->
+    intent = %TransitionIntent{
+      id: transition_id("pr-prepared", issue_id, issue.state),
+      issue_id: issue_id,
+      source: :orchestrator,
+      actor: "symphony",
+      expected_state: issue.state,
+      kind: :handoff_required,
+      work_item_kind: issue.kind,
+      comment_body: comment_body,
+      causation_id: issue_id
+    }
+
+    case apply_dispatch_transition(intent, issue) do
+      {:ok, _applied} ->
         Logger.info("Moved planned source issue to Human Review after pull request preparation: #{issue_context(issue)}")
         :ok
 
-      {:error, reason} ->
+      other ->
+        reason = if match?({:error, _}, other), do: elem(other, 1), else: other
         Logger.warning("Failed to move planned source issue to Human Review after pull request preparation for #{issue_context(issue)}: #{inspect(reason)}")
         {:error, reason}
     end
   end
 
-  defp move_issue_to_human_review_after_pull_request(_issue), do: :ok
+  defp move_issue_to_human_review_after_pull_request(_issue, _comment_body), do: :ok
 
   defp handle_pull_request_preparation_error(%Issue{} = issue, {:github_no_planned_sub_issue, _parent_number}) do
     Logger.info("Moving planned parent issue with no planned sub-issue to Human Review: #{issue_context(issue)}")
@@ -1065,15 +1184,7 @@ defmodule SymphonyElixir.Orchestrator do
     부모 이슈에서는 직접 구현 PR을 만들지 않습니다. 구현할 sub-issue에 `sym:planned`를 적용한 뒤 다시 진행해 주세요.
     """
 
-    case Tracker.create_comment(issue.id, body) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning("Failed to comment on parent issue without planned sub-issue for #{issue_context(issue)}: #{inspect(reason)}")
-    end
-
-    move_issue_to_human_review_after_pull_request(issue)
+    move_issue_to_human_review_after_pull_request(issue, body)
   end
 
   defp handle_pull_request_preparation_error(%Issue{} = issue, reason) do
@@ -1088,6 +1199,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp request_pull_request_refresh(_pull_request), do: :ok
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+    case attach_worker_dispatch_context(state, issue) do
+      {:ok, state, issue} ->
+        dispatch_issue_with_context(state, issue, attempt, preferred_worker_host)
+
+      {:stop, state} ->
+        state
+    end
+  end
+
+  defp dispatch_issue_with_context(state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -1100,11 +1221,66 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp attach_worker_dispatch_context(state, issue) do
+    if Config.settings!().state_manager.mode == "authoritative" do
+      metadata = issue.metadata || %{}
+      dispatch_id = metadata["symphony_transition_id"] || metadata[:symphony_transition_id]
+      dispatch_id = dispatch_id || latest_dispatch_transition_id_for_issue(issue.id)
+
+      if is_binary(dispatch_id) do
+        {:ok, state, %{issue | metadata: Map.put(metadata, "symphony_transition_id", dispatch_id)}}
+      else
+        handoff_missing_dispatch_context(state, issue)
+      end
+    else
+      {:ok, state, issue}
+    end
+  end
+
+  defp handoff_missing_dispatch_context(state, issue) do
+    intent = %TransitionIntent{
+      id: "missing-dispatch-causation:#{issue.id}:#{issue.updated_at || issue.state}",
+      issue_id: issue.id,
+      source: :journal_recovery,
+      actor: "symphony",
+      expected_state: issue.state,
+      kind: :handoff_required,
+      work_item_kind: issue.kind,
+      causation_id: issue.id,
+      comment_body: "Symphony가 검증 가능한 dispatch causation을 찾지 못해 사람 검토로 인계합니다."
+    }
+
+    case apply_transition_intent(state, intent) do
+      {{:ok, _applied}, next_state} ->
+        {:stop, next_state}
+
+      {result, next_state} ->
+        _ = schedule_transition_effect_retry(result, intent.id)
+        {:stop, next_state}
+    end
+  end
+
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    case reserve_worker_dispatch(issue, attempt) do
+      {:ok, dispatch_lease_id} ->
+        start_reserved_worker(state, issue, attempt, recipient, worker_host, dispatch_lease_id)
+
+      {:noop, :already_reserved} ->
+        Logger.warning("Skipping duplicate durable worker dispatch for #{issue_context(issue)}")
+        %{state | claimed: MapSet.put(state.claimed, issue.id)}
+
+      {:error, reason} ->
+        Logger.error("Unable to reserve worker dispatch for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp start_reserved_worker(state, issue, attempt, recipient, worker_host, dispatch_lease_id) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            run_agent_for_orchestrator(issue, recipient, attempt, worker_host)
          end) do
       {:ok, pid} ->
+        _ = journal_record(dispatch_lease_id, :verified, %{issue_id: issue.id, worker_pid: inspect(pid)})
         ref = Process.monitor(pid)
         state = cancel_cleanup_retry(state, issue.id)
 
@@ -1143,6 +1319,13 @@ defmodule SymphonyElixir.Orchestrator do
         }
 
       {:error, reason} ->
+        _ =
+          journal_record(dispatch_lease_id, :retrying, %{
+            issue_id: issue.id,
+            effect: :worker_dispatch,
+            reason: inspect(reason)
+          })
+
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
@@ -1151,6 +1334,84 @@ defmodule SymphonyElixir.Orchestrator do
           error: "failed to spawn agent: #{inspect(reason)}",
           worker_host: worker_host
         })
+    end
+  end
+
+  defp reserve_worker_dispatch(issue, attempt) do
+    case Config.settings!().state_manager.mode do
+      "authoritative" -> reserve_authoritative_worker_dispatch(issue, attempt)
+      _mode -> {:ok, "legacy-worker-dispatch"}
+    end
+  end
+
+  defp reserve_authoritative_worker_dispatch(issue, attempt) do
+    dispatch_lease_id = worker_dispatch_lease_id(issue, attempt)
+
+    case journal_snapshot(dispatch_lease_id) do
+      {:ok, %{phase: phase}} when phase in [:projection_applied, :verified] ->
+        {:noop, :already_reserved}
+
+      {:ok, _pending} ->
+        reserve_worker_dispatch_effect(dispatch_lease_id, issue, attempt)
+
+      :error ->
+        initialize_worker_dispatch_lease(dispatch_lease_id, issue, attempt)
+    end
+  end
+
+  defp worker_dispatch_lease_id(issue, attempt) do
+    "worker-dispatch:#{worker_dispatch_transition_id(issue)}:attempt-#{normalize_retry_attempt(attempt)}"
+  end
+
+  defp initialize_worker_dispatch_lease(dispatch_lease_id, issue, attempt) do
+    with :ok <-
+           normalize_journal_record(journal_record(dispatch_lease_id, :received, %{issue_id: issue.id, attempt: attempt})),
+         :ok <-
+           normalize_journal_record(journal_record(dispatch_lease_id, :decided, %{issue_id: issue.id, effect: :worker_dispatch})) do
+      reserve_worker_dispatch_effect(dispatch_lease_id, issue, attempt)
+    end
+  end
+
+  defp reserve_worker_dispatch_effect(dispatch_lease_id, issue, attempt) do
+    result =
+      journal_record(dispatch_lease_id, :projection_applied, %{
+        issue_id: issue.id,
+        effect: :worker_dispatch,
+        attempt: attempt,
+        reserved_at: System.system_time(:millisecond)
+      })
+
+    case normalize_journal_record(result) do
+      :ok -> {:ok, dispatch_lease_id}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp worker_dispatch_transition_id(issue) do
+    metadata = issue.metadata || %{}
+
+    metadata["symphony_transition_id"] || metadata[:symphony_transition_id] ||
+      latest_dispatch_transition_id(issue) || dispatch_transition_id(issue)
+  end
+
+  defp latest_dispatch_transition_id(issue) do
+    case Process.whereis(TransitionJournal) do
+      pid when is_pid(pid) ->
+        pid
+        |> TransitionJournal.replay()
+        |> Enum.reverse()
+        |> Enum.find_value(&matching_dispatch_transition_id(&1, issue))
+
+      _ ->
+        nil
+    end
+  end
+
+  defp matching_dispatch_transition_id(event, issue) do
+    if event.phase == :verified and event.data[:issue_id] == issue.id and
+         event.data[:to_state] == issue.state and
+         event.data[:kind] in [:dispatch_implementation, :dispatch_review, :dispatch_rework] do
+      event.transition_id
     end
   end
 
@@ -1186,31 +1447,81 @@ defmodule SymphonyElixir.Orchestrator do
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
   defp mark_issue_for_dispatch(%Issue{state: state_name} = issue) do
-    target_state =
-      case normalize_issue_state(state_name) do
-        state when state in ["planned", "rework"] -> "In Progress"
-        "review" -> "Reviewing"
-        _ -> nil
-      end
-
-    if is_binary(target_state) do
-      case Tracker.update_issue_state(issue.id, target_state) do
-        :ok ->
-          Logger.info("Marked issue for dispatch: #{issue_context(issue)} previous_state=#{inspect(state_name)} state=#{target_state}")
-
-          metadata =
-            issue.metadata
-            |> Kernel.||(%{})
-            |> Map.put("symphony_dispatch_state", state_name)
-
-          {:ok, %{issue | state: target_state, metadata: metadata}}
-
-        {:error, reason} ->
-          {:error, reason}
-      end
-    else
-      {:ok, issue}
+    case dispatch_intent_kind(state_name) do
+      nil -> {:ok, issue}
+      intent_kind -> dispatch_marked_issue(issue, intent_kind)
     end
+  end
+
+  defp dispatch_intent_kind(state_name) do
+    case normalize_issue_state(state_name) do
+      "planned" -> :dispatch_implementation
+      "rework" -> :dispatch_rework
+      "review" -> :dispatch_review
+      _ -> nil
+    end
+  end
+
+  defp dispatch_marked_issue(%Issue{state: state_name} = issue, intent_kind) do
+    intent = %TransitionIntent{
+      id: dispatch_transition_id(issue),
+      issue_id: issue.id,
+      source: :dispatch,
+      actor: "symphony",
+      expected_state: state_name,
+      kind: intent_kind,
+      work_item_kind: issue.kind,
+      head_oid: issue.metadata && (issue.metadata["head_oid"] || issue.metadata[:head_oid]),
+      causation_id: issue.id
+    }
+
+    case apply_dispatch_transition(intent, issue) do
+      {:ok, %AppliedTransition{to_state: target_state}} ->
+        Logger.info("Marked issue for dispatch: #{issue_context(issue)} previous_state=#{inspect(state_name)} state=#{target_state}")
+
+        metadata =
+          issue.metadata
+          |> Kernel.||(%{})
+          |> Map.put("symphony_dispatch_state", state_name)
+          |> Map.put("symphony_transition_id", intent.id)
+
+        {:ok, %{issue | state: target_state, metadata: metadata}}
+
+      {:noop, :already_applied} ->
+        {:ok, issue}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      other ->
+        {:error, {:dispatch_transition_failed, other}}
+    end
+  end
+
+  defp dispatch_transition_id(%Issue{} = issue) do
+    revision = issue.updated_at || (issue.metadata && (issue.metadata["head_oid"] || issue.metadata[:head_oid])) || issue.state
+    transition_id("dispatch", issue.id, "#{issue.state}:#{revision}")
+  end
+
+  defp apply_dispatch_transition(intent, current_issue) do
+    mode = Config.settings!().state_manager.mode
+
+    transition_result =
+      case ensure_transition_received(intent, mode) do
+        :ok -> apply_transition_intent_from_issue(%State{}, mode, intent, current_issue)
+        {:noop, reason} -> {{:noop, reason}, %State{}}
+        {:error, reason} -> {{:error, reason}, %State{}}
+      end
+
+    case transition_result do
+      {result, _state} ->
+        result
+    end
+  end
+
+  defp transition_id(prefix, issue_id, state_name) do
+    normalized_state = state_name |> to_string() |> normalize_issue_state() |> String.replace(" ", "-")
+    "#{prefix}:#{issue_id}:#{normalized_state}"
   end
 
   defp complete_issue(%State{} = state, issue_id) do
@@ -1225,6 +1536,15 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
+
+    if Config.settings!().state_manager.mode == "authoritative" and next_attempt > @max_failure_retry_attempts do
+      handoff_exhausted_retry(state, issue_id, next_attempt, metadata)
+    else
+      schedule_retry_timer(state, issue_id, next_attempt, previous_retry, metadata)
+    end
+  end
+
+  defp schedule_retry_timer(state, issue_id, next_attempt, previous_retry, metadata) do
     delay_ms = retry_delay(next_attempt, metadata)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
@@ -1258,6 +1578,81 @@ defmodule SymphonyElixir.Orchestrator do
             workspace_path: workspace_path
           })
     }
+  end
+
+  defp handoff_exhausted_retry(state, issue_id, attempt, metadata) do
+    intent = %TransitionIntent{
+      id: "retry-exhausted:#{issue_id}:#{attempt}",
+      issue_id: issue_id,
+      source: :retry_budget,
+      actor: "symphony",
+      kind: :handoff_required,
+      causation_id: issue_id,
+      comment_body:
+        "Symphony 자동 재시도 한도를 소진하여 사람 검토로 인계합니다.\n\n" <>
+          "- 시도 횟수: #{attempt - 1}\n- 마지막 오류: #{metadata[:error] || "알 수 없음"}"
+    }
+
+    case apply_transition_intent(state, intent) do
+      {{:ok, _applied}, next_state} ->
+        Logger.warning("Retry budget exhausted; handed off issue_id=#{issue_id} attempts=#{attempt - 1}")
+        %{next_state | retry_attempts: Map.delete(next_state.retry_attempts, issue_id)}
+
+      {result, next_state} ->
+        _ = schedule_transition_effect_retry(result, intent.id)
+        Logger.error("Retry budget exhausted but handoff failed issue_id=#{issue_id} result=#{inspect(result)}")
+        %{next_state | retry_attempts: Map.delete(next_state.retry_attempts, issue_id)}
+    end
+  end
+
+  defp handoff_exhausted_transition_effect(state, transition_id, reason) do
+    case journal_snapshot(transition_id) do
+      {:ok, snapshot} ->
+        issue_id = snapshot.data[:issue_id]
+
+        intent = %TransitionIntent{
+          id: "effect-retry-exhausted:#{transition_id}",
+          issue_id: issue_id,
+          source: :effect_retry_budget,
+          actor: "symphony",
+          kind: :handoff_required,
+          causation_id: transition_id,
+          comment_body:
+            "Symphony 상태 효과 재시도 한도를 소진하여 사람 검토로 인계합니다.\n\n" <>
+              "- 전이 ID: #{transition_id}\n- 마지막 오류: #{inspect(reason)}"
+        }
+
+        _ =
+          journal_record(transition_id, :retrying, %{
+            issue_id: issue_id,
+            handoff_transition_id: intent.id,
+            reason: inspect(reason)
+          })
+
+        case apply_transition_intent(state, intent) do
+          {{:ok, _applied}, next_state} ->
+            _ =
+              journal_record(transition_id, :verified, %{
+                issue_id: issue_id,
+                abandoned_effect: true,
+                handoff_transition_id: intent.id,
+                reason: inspect(reason)
+              })
+
+            next_state
+
+          {handoff_result, next_state} ->
+            _ = schedule_transition_effect_retry(handoff_result, intent.id)
+
+            Logger.error("Transition effect handoff failed transition_id=#{transition_id} result=#{inspect(handoff_result)}")
+
+            next_state
+        end
+
+      :error ->
+        Logger.error("Transition effect handoff lacks journal snapshot transition_id=#{transition_id}")
+        state
+    end
   end
 
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
@@ -1667,6 +2062,27 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec request_tracker_intent(map(), GenServer.server()) ::
+          SymphonyElixir.StateManager.result() | :unavailable
+  def request_tracker_intent(intent, server \\ __MODULE__) when is_map(intent) do
+    case Map.get(intent, :kind) || Map.get(intent, "kind") do
+      :projection_echo ->
+        {:noop, :projection_echo}
+
+      :state_projection_drift ->
+        safe_orchestrator_call(server, {:projection_drift, intent})
+
+      _ ->
+        with {:ok, transition_intent} <- transition_intent_from_tracker_event(intent) do
+          try do
+            SymphonyElixir.StateManager.request(server, transition_intent)
+          catch
+            :exit, _reason -> :unavailable
+          end
+        end
+    end
+  end
+
   @spec request_refresh_after(GenServer.server(), non_neg_integer()) :: :ok | :unavailable
   def request_refresh_after(server, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     case Process.whereis(server) do
@@ -1710,6 +2126,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_call({:transition_request, %TransitionIntent{} = intent}, _from, state) do
+    {result, state} = apply_transition_intent(state, intent)
+    result = schedule_transition_effect_retry(result, intent.id)
+    notify_dashboard()
+    {:reply, result, state}
+  end
+
+  def handle_call({:projection_drift, intent}, _from, state) when is_map(intent) do
+    {result, state} = reconcile_projection_drift(state, intent)
+    {:reply, result, state}
+  end
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
@@ -1758,6 +2186,7 @@ defmodule SymphonyElixir.Orchestrator do
        retrying: retrying,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       state_manager: state_manager_snapshot(state),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1793,6 +2222,1008 @@ defmodule SymphonyElixir.Orchestrator do
        issue_id: issue_id
      }, state}
   end
+
+  defp apply_transition_intent(%State{} = state, %TransitionIntent{} = intent) do
+    mode = Config.settings!().state_manager.mode
+
+    case ensure_transition_received(intent, mode) do
+      :ok -> fetch_and_apply_transition_intent(state, mode, intent)
+      {:noop, reason} -> {{:noop, reason}, state}
+      {:error, reason} -> {{:error, reason}, state}
+    end
+  end
+
+  defp schedule_transition_effect_retry({:error, reason}, transition_id) do
+    Process.send_after(self(), {:retry_transition_effect, transition_id, 1}, @transition_effect_retry_ms)
+    {:error, {:transition_retry_scheduled, reason}}
+  end
+
+  defp schedule_transition_effect_retry(result, _transition_id), do: result
+
+  defp fetch_and_apply_transition_intent(state, mode, intent) do
+    case fetch_transition_issue(intent.issue_id) do
+      {:ok, current_issue} ->
+        apply_transition_intent_from_issue(state, mode, intent, current_issue)
+
+      {:error, reason} when mode == "authoritative" and elem(intent.kind, 0) == :operator_request ->
+        case quarantine_unreadable_operator_request(intent, reason) do
+          result when result in [:applied, :already_applied] ->
+            finalize_quarantined_operator_intent(state, intent, reason, result)
+
+          {:error, effect_reason} ->
+            {{:error, {:quarantine_failed, effect_reason}}, state}
+        end
+
+      {:error, reason} ->
+        {{:error, reason}, state}
+    end
+  end
+
+  defp finalize_quarantined_operator_intent(state, intent, reason, result) do
+    data = %{
+      issue_id: intent.issue_id,
+      mode: "authoritative",
+      result: :rejected,
+      reason: inspect({:quarantined, reason}),
+      quarantine_status: result
+    }
+
+    with :ok <- normalize_journal_record(journal_record(intent.id, :decided, data)),
+         :ok <-
+           normalize_journal_record(journal_record(intent.id, :required_comment_applied, data)),
+         :ok <- normalize_journal_record(journal_record(intent.id, :projection_applied, data)),
+         :ok <- normalize_journal_record(journal_record(intent.id, :verified, data)) do
+      {{:rejected, {:quarantined, reason}}, state}
+    else
+      {:error, journal_reason} -> {{:error, journal_reason}, state}
+    end
+  end
+
+  defp apply_transition_intent_from_issue(state, mode, intent, current_issue) do
+    with :ok <- validate_worker_causation(intent, current_issue),
+         :ok <- validate_operator_request_labels(mode, intent, current_issue) do
+      intent =
+        if is_nil(intent.expected_state),
+          do: %{intent | expected_state: current_issue.state},
+          else: intent
+
+      decision = WorkflowStatePolicy.decide(current_issue.state, intent)
+      apply_transition_decision(state, mode, intent, decision)
+    else
+      {:noop, reason} ->
+        finalize_non_effect_decision(state, mode, intent, :noop, reason)
+
+      {:rejected, reason} ->
+        reconciliation_result(state, intent, reason)
+    end
+  end
+
+  defp validate_worker_causation(
+         %TransitionIntent{source: :worker, metadata: %{dispatch_transition_id: dispatch_id}} = intent,
+         current_issue
+       )
+       when is_binary(dispatch_id) and dispatch_id != "" do
+    latest_dispatch_id = latest_dispatch_transition_id_for_issue(intent.issue_id)
+    live_head_oid = current_issue.metadata && (current_issue.metadata["head_oid"] || current_issue.metadata[:head_oid])
+
+    cond do
+      latest_dispatch_id != dispatch_id ->
+        {:noop, :stale_causation}
+
+      missing_required_pull_request_head?(current_issue, live_head_oid, intent.head_oid) ->
+        {:noop, :missing_head_oid}
+
+      stale_head_oid?(intent.head_oid, live_head_oid) ->
+        {:noop, :stale_head_oid}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_worker_causation(%TransitionIntent{source: :worker}, _current_issue),
+    do: {:noop, :missing_causation}
+
+  defp validate_worker_causation(_intent, _current_issue), do: :ok
+
+  defp missing_required_pull_request_head?(current_issue, live_head_oid, outcome_head_oid) do
+    current_issue.kind == :pull_request and nonempty_binary?(live_head_oid) and
+      not nonempty_binary?(outcome_head_oid)
+  end
+
+  defp stale_head_oid?(outcome_head_oid, live_head_oid) do
+    is_binary(outcome_head_oid) and is_binary(live_head_oid) and outcome_head_oid != live_head_oid
+  end
+
+  defp nonempty_binary?(value), do: is_binary(value) and value != ""
+
+  defp latest_dispatch_transition_id_for_issue(issue_id) do
+    case Process.whereis(TransitionJournal) do
+      pid when is_pid(pid) ->
+        pid
+        |> TransitionJournal.replay()
+        |> Enum.reverse()
+        |> Enum.find_value(&dispatch_transition_id(&1, issue_id))
+
+      _ ->
+        nil
+    end
+  end
+
+  defp dispatch_transition_id(event, issue_id) do
+    dispatch_kind? =
+      event.data[:kind] in [:dispatch_implementation, :dispatch_review, :dispatch_rework]
+
+    if event.phase == :verified and event.data[:issue_id] == issue_id and dispatch_kind?,
+      do: event.transition_id
+  end
+
+  defp validate_operator_request_labels(
+         "authoritative",
+         %TransitionIntent{
+           source: :github_webhook,
+           kind: {:operator_request, _},
+           metadata: %{kind: :operator_transition_requested}
+         } = intent,
+         issue
+       ) do
+    request_labels = Config.settings!().state_manager.human_intent_labels |> Map.values() |> MapSet.new()
+    observed = Enum.filter(issue.labels || [], &MapSet.member?(request_labels, &1))
+    expected_label = intent.metadata[:label]
+
+    case observed do
+      [^expected_label] -> :ok
+      [] -> stale_request_delivery_or_rejection(issue, expected_label)
+      labels -> {:rejected, {:ambiguous_request_labels, expected_label, Enum.sort(labels)}}
+    end
+  end
+
+  defp validate_operator_request_labels(_mode, _intent, _issue), do: :ok
+
+  defp quarantine_unreadable_operator_request(intent, reason) do
+    marker = "<!-- sym-transition:#{intent.id}:quarantine -->"
+
+    body =
+      "Symphony가 상태 요청을 격리했습니다. 검증 가능한 상태 라벨이 정확히 하나가 아니므로 작업을 실행하지 않습니다.\n\n" <>
+        "- 사유: #{inspect(reason)}"
+
+    with comment_result when comment_result in [:applied, :already_applied] <-
+           Tracker.create_comment_once(intent.issue_id, body, marker) do
+      restore_quarantined_projection(intent.issue_id, comment_result)
+    end
+  end
+
+  defp restore_quarantined_projection(issue_id, comment_result) do
+    case committed_state_for_issue(issue_id) do
+      {:ok, committed_state} ->
+        case Tracker.apply_state_projection(issue_id, :any, committed_state) do
+          projection when elem(projection, 0) in [:applied, :already_applied] -> comment_result
+          {:conflict, snapshot} -> {:error, {:quarantine_projection_conflict, snapshot}}
+          {:partial_failure, details} -> {:error, {:quarantine_projection_partial_failure, details}}
+        end
+
+      :error ->
+        comment_result
+    end
+  end
+
+  defp stale_request_delivery_or_rejection(issue, expected_label) do
+    case committed_state_for_issue(issue.id) do
+      {:ok, committed_state} when committed_state == issue.state -> {:noop, :stale_request_delivery}
+      _ -> {:rejected, {:missing_request_label, expected_label}}
+    end
+  end
+
+  defp apply_transition_decision(state, mode, intent, {:noop, reason}),
+    do: finalize_non_effect_decision(state, mode, intent, :noop, reason)
+
+  defp apply_transition_decision(state, mode, intent, {:conflict, snapshot}) do
+    state = %{state | transition_conflicts: state.transition_conflicts + 1}
+    finalize_non_effect_decision(state, mode, intent, :conflict, snapshot)
+  end
+
+  defp apply_transition_decision(state, "authoritative", %TransitionIntent{kind: {:operator_request, _}} = intent, {:rejected, reason}) do
+    reconciliation_result(state, intent, reason)
+  end
+
+  defp apply_transition_decision(state, mode, intent, {:rejected, reason}),
+    do: finalize_non_effect_decision(state, mode, intent, :rejected, reason)
+
+  defp apply_transition_decision(state, "shadow", _intent, {:ok, plan}),
+    do: apply_shadow_plan(state, plan, true)
+
+  defp apply_transition_decision(state, "legacy", _intent, {:ok, plan}) do
+    with :ok <- apply_legacy_transition_comment(plan),
+         :ok <- Tracker.adapter().update_issue_state(plan.issue_id, plan.to_state) do
+      applied = AppliedTransition.from_plan(plan, metadata: %{mode: "legacy"})
+      {{:ok, applied}, %{state | last_transition: applied}}
+    else
+      {:error, reason} ->
+        {{:error, reason}, state}
+    end
+  end
+
+  defp apply_transition_decision(state, "authoritative", _intent, {:ok, plan}) do
+    apply_authoritative_plan(state, plan, true)
+  end
+
+  defp apply_transition_decision(state, mode, _intent, {:ok, _plan}),
+    do: {{:error, {:unsupported_state_manager_mode, mode}}, state}
+
+  defp apply_shadow_plan(state, plan, record_decision?) do
+    with :ok <- maybe_record_shadow_decision(plan, record_decision?),
+         :ok <- apply_shadow_legacy_comment(plan),
+         :ok <- apply_shadow_legacy_projection(plan),
+         {:ok, readback} <- verify_shadow_projection(plan),
+         :ok <-
+           normalize_journal_record(
+             journal_record(
+               plan.id,
+               :verified,
+               transition_plan_data(plan, %{mode: "shadow", shadow_readback: readback})
+             )
+           ) do
+      applied = AppliedTransition.from_plan(plan, metadata: %{mode: "shadow", shadow_readback: readback})
+      {{:ok, applied}, %{state | last_transition: applied}}
+    else
+      {:error, reason} ->
+        _ = journal_retry(plan, reason, %{mode: "shadow"})
+        {{:error, reason}, state}
+    end
+  end
+
+  defp maybe_record_shadow_decision(plan, true) do
+    normalize_journal_record(journal_record(plan.id, :decided, transition_plan_data(plan, %{mode: "shadow"})))
+  end
+
+  defp maybe_record_shadow_decision(_plan, false), do: :ok
+
+  defp apply_shadow_legacy_projection(plan) do
+    if journal_phase_reached?(plan.id, :projection_applied) do
+      :ok
+    else
+      Tracker.adapter().update_issue_state(plan.issue_id, plan.to_state)
+    end
+  end
+
+  defp apply_shadow_legacy_comment(%{comment_body: body} = plan)
+       when is_binary(body) and body != "" do
+    if journal_phase_reached?(plan.id, :required_comment_applied) do
+      :ok
+    else
+      with :ok <- apply_legacy_transition_comment(plan) do
+        normalize_journal_record(
+          journal_record(plan.id, :required_comment_applied, %{
+            mode: "shadow",
+            legacy_comment: true
+          })
+        )
+      end
+    end
+  end
+
+  defp apply_shadow_legacy_comment(_plan), do: :ok
+
+  defp verify_shadow_projection(plan) do
+    case fetch_transition_issue(plan.issue_id) do
+      {:ok, %{state: state}} when state == plan.to_state ->
+        with :ok <-
+               normalize_journal_record(journal_record(plan.id, :projection_applied, %{mode: "shadow", agreement: true, state: state})) do
+          {:ok, %{agreement: true, state: state}}
+        end
+
+      {:ok, issue} ->
+        mismatch = %{mode: "shadow", agreement: false, expected_state: plan.to_state, state: issue.state}
+
+        with :ok <- normalize_journal_record(journal_record(plan.id, :projection_applied, mismatch)),
+             :ok <- normalize_journal_record(journal_record(plan.id, :verified, mismatch)) do
+          {:error, {:shadow_policy_mismatch, plan.to_state, issue.state}}
+        end
+
+      {:error, reason} ->
+        {:error, {:shadow_readback_failed, reason}}
+    end
+  end
+
+  defp reconciliation_result(state, intent, reason) do
+    with :ok <- record_non_effect_decision(intent, "authoritative", :rejected, reason),
+         :ok <- reconcile_rejected_operator_intent(intent, reason),
+         :ok <- record_verified_decision(intent, "authoritative", :rejected, reason) do
+      {{:rejected, reason}, state}
+    else
+      {:error, effect_reason} ->
+        _ = journal_retry_for_intent(intent, {:reconciliation_failed, effect_reason})
+        {{:error, {:reconciliation_failed, effect_reason}}, state}
+    end
+  end
+
+  defp finalize_non_effect_decision(state, mode, intent, result, reason)
+       when mode in ["shadow", "authoritative"] do
+    with :ok <- record_non_effect_decision(intent, mode, result, reason),
+         :ok <- record_verified_decision(intent, mode, result, reason) do
+      {decision_result(result, reason), state}
+    else
+      {:error, journal_reason} -> {{:error, journal_reason}, state}
+    end
+  end
+
+  defp finalize_non_effect_decision(state, _mode, _intent, result, reason),
+    do: {decision_result(result, reason), state}
+
+  defp decision_result(:noop, reason), do: {:noop, reason}
+  defp decision_result(:conflict, snapshot), do: {:conflict, snapshot}
+  defp decision_result(:rejected, reason), do: {:rejected, reason}
+
+  defp record_non_effect_decision(intent, mode, result, reason) do
+    normalize_journal_record(
+      journal_record(intent.id, :decided, %{
+        issue_id: intent.issue_id,
+        mode: mode,
+        result: result,
+        reason: inspect(reason)
+      })
+    )
+  end
+
+  defp record_verified_decision(intent, mode, result, reason) do
+    normalize_journal_record(
+      journal_record(intent.id, :verified, %{
+        issue_id: intent.issue_id,
+        mode: mode,
+        result: result,
+        reason: inspect(reason)
+      })
+    )
+  end
+
+  defp apply_authoritative_plan(state, plan, record_decision?) do
+    with :ok <- maybe_record_transition_decision(plan, record_decision?),
+         :ok <- apply_required_transition_comment(plan),
+         :ok <- apply_transition_broker_effects(plan),
+         {:ok, projection_metadata} <- apply_tracker_projection(plan),
+         :ok <- normalize_journal_record(journal_record(plan.id, :verified, Map.put(transition_plan_data(plan), :projection, projection_metadata))) do
+      applied = AppliedTransition.from_plan(plan, metadata: %{projection: projection_metadata})
+      {{:ok, applied}, %{state | last_transition: applied}}
+    else
+      {:conflict, snapshot} ->
+        _ = journal_retry(plan, {:conflict, snapshot})
+        {{:conflict, snapshot}, %{state | transition_conflicts: state.transition_conflicts + 1}}
+
+      {:error, reason} ->
+        _ = journal_retry(plan, reason)
+        {{:error, reason}, state}
+    end
+  end
+
+  defp maybe_record_transition_decision(plan, true),
+    do: normalize_journal_record(journal_record(plan.id, :decided, transition_plan_data(plan)))
+
+  defp maybe_record_transition_decision(_plan, false), do: :ok
+
+  defp apply_legacy_transition_comment(%{comment_body: body, issue_id: issue_id})
+       when is_binary(body) and body != "",
+       do: Tracker.create_comment(issue_id, body)
+
+  defp apply_legacy_transition_comment(_plan), do: :ok
+
+  defp ensure_transition_received(%TransitionIntent{} = intent, mode)
+       when mode in ["shadow", "authoritative"] do
+    case journal_snapshot(intent.id) do
+      {:ok, %{phase: :verified}} -> {:noop, :already_applied}
+      {:ok, _pending} -> :ok
+      :error -> normalize_journal_record(journal_record(intent.id, :received, transition_intent_data(intent)))
+    end
+  end
+
+  defp ensure_transition_received(_intent, _mode), do: :ok
+
+  defp fetch_transition_issue(issue_id) do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [issue | _]} -> {:ok, issue}
+      {:ok, []} -> {:error, :transition_issue_not_found}
+      {:error, reason} -> {:error, {:transition_issue_fetch_failed, reason}}
+    end
+  end
+
+  defp apply_required_transition_comment(%{comment_body: body} = plan)
+       when is_binary(body) and body != "" do
+    if journal_phase_reached?(plan.id, :required_comment_applied) do
+      :ok
+    else
+      marker = "<!-- sym-transition:#{plan.id} -->"
+
+      case Tracker.create_comment_once(plan.issue_id, body, marker) do
+        result when result in [:applied, :already_applied] ->
+          normalize_journal_record(
+            journal_record(plan.id, :required_comment_applied, %{
+              comment_marker: marker,
+              comment_status: result
+            })
+          )
+
+        {:error, reason} ->
+          {:error, {:transition_comment_failed, reason}}
+      end
+    end
+  end
+
+  defp apply_required_transition_comment(_plan), do: :ok
+
+  defp apply_transition_broker_effects(%{kind: :merge_ready, head_oid: head_oid} = plan)
+       when is_binary(head_oid) and head_oid != "" do
+    case Tracker.merge_pull_request(plan.issue_id, head_oid) do
+      {:applied, _metadata} -> :ok
+      {:conflict, snapshot} -> {:conflict, snapshot}
+      {:error, reason} -> {:error, {:merge_failed, reason}}
+    end
+  end
+
+  defp apply_transition_broker_effects(%{kind: :merge_ready}),
+    do: {:error, :merge_head_oid_required}
+
+  defp apply_transition_broker_effects(_plan), do: :ok
+
+  defp reconcile_rejected_operator_intent(intent, reason) do
+    with {:ok, issue} <- fetch_transition_issue(intent.issue_id) do
+      marker = rejected_request_marker(intent, issue, reason)
+
+      body =
+        "Symphony가 요청한 상태 전이를 적용하지 않았습니다.\n\n" <>
+          "- 현재 상태: #{issue.state}\n- 사유: #{inspect(reason)}"
+
+      with :ok <- apply_rejection_comment_once(intent, body, marker),
+           :ok <- apply_rejection_projection_once(intent, issue.state) do
+        :ok
+      else
+        {:error, effect_reason} -> {:error, effect_reason}
+      end
+    end
+  end
+
+  defp apply_rejection_comment_once(intent, body, marker) do
+    if journal_phase_reached?(intent.id, :required_comment_applied) do
+      :ok
+    else
+      case Tracker.create_comment_once(intent.issue_id, body, marker) do
+        result when result in [:applied, :already_applied] ->
+          normalize_journal_record(
+            journal_record(intent.id, :required_comment_applied, %{
+              comment_marker: marker,
+              comment_status: result
+            })
+          )
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp record_rejection_projection(intent, projection) do
+    normalize_journal_record(journal_record(intent.id, :projection_applied, %{projection: projection}))
+  end
+
+  defp apply_rejection_projection_once(intent, state) do
+    if journal_phase_reached?(intent.id, :projection_applied) do
+      :ok
+    else
+      case Tracker.apply_state_projection(intent.issue_id, :any, state) do
+        projection when elem(projection, 0) in [:applied, :already_applied] ->
+          record_rejection_projection(intent, projection)
+
+        {:conflict, snapshot} ->
+          {:error, {:reconciliation_conflict, snapshot}}
+
+        {:partial_failure, details} ->
+          {:error, {:reconciliation_partial_failure, details}}
+      end
+    end
+  end
+
+  defp rejected_request_marker(intent, issue, reason) do
+    request_labels =
+      issue.labels
+      |> List.wrap()
+      |> Enum.filter(&String.starts_with?(&1, "sym:request-"))
+      |> Enum.sort()
+
+    category =
+      case reason do
+        {:ambiguous_request_labels, _, _} -> :ambiguous_request_labels
+        {:missing_request_label, _} -> :missing_request_label
+        {name, _, _} when is_atom(name) -> name
+        name when is_atom(name) -> name
+      end
+
+    digest = payload_digest({intent.issue_id, issue.state, category, request_labels})
+    "<!-- sym-transition:request-rejected:#{digest} -->"
+  end
+
+  defp apply_tracker_projection(plan) do
+    if journal_phase_reached?(plan.id, :projection_applied) do
+      verify_replayed_projection(plan)
+    else
+      apply_tracker_projection_effect(plan)
+    end
+  end
+
+  defp verify_replayed_projection(plan) do
+    case fetch_transition_issue(plan.issue_id) do
+      {:ok, %{state: state}} when state == plan.to_state ->
+        {:ok, %{status: :replayed, state: state}}
+
+      {:ok, issue} ->
+        {:conflict, %{issue_id: plan.issue_id, expected_state: plan.to_state, state: issue.state}}
+
+      {:error, reason} ->
+        {:error, {:projection_readback_failed, reason}}
+    end
+  end
+
+  defp apply_tracker_projection_effect(plan) do
+    case Tracker.apply_state_projection(plan.issue_id, plan.from_state, plan.to_state) do
+      {:applied, metadata} -> record_projection_applied(plan, metadata, :applied)
+      {:already_applied, metadata} -> record_projection_applied(plan, metadata, :already_applied)
+      {:conflict, snapshot} -> {:conflict, snapshot}
+      {:partial_failure, details} -> {:error, {:projection_partial_failure, details}}
+    end
+  end
+
+  defp record_projection_applied(plan, metadata, status) do
+    with :ok <- normalize_journal_record(journal_record(plan.id, :projection_applied, %{projection: metadata})) do
+      {:ok, Map.put(metadata, :status, status)}
+    end
+  end
+
+  defp journal_retry(plan, reason) do
+    journal_retry(plan, reason, %{})
+  end
+
+  defp journal_retry(plan, reason, extra) do
+    data =
+      plan
+      |> transition_plan_data()
+      |> Map.merge(extra)
+      |> Map.put(:retry_reason, inspect(reason))
+
+    journal_record(plan.id, :retrying, data)
+  end
+
+  defp journal_retry_for_intent(intent, reason) do
+    journal_record(
+      intent.id,
+      :retrying,
+      Map.put(transition_intent_data(intent), :retry_reason, inspect(reason))
+    )
+  end
+
+  defp journal_record(transition_id, phase, data) do
+    case Process.whereis(TransitionJournal) do
+      pid when is_pid(pid) -> TransitionJournal.record(pid, transition_id, phase, data)
+      _ -> {:error, :transition_journal_unavailable}
+    end
+  end
+
+  defp journal_snapshot(transition_id) do
+    case Process.whereis(TransitionJournal) do
+      pid when is_pid(pid) -> TransitionJournal.snapshot(pid, transition_id)
+      _ -> :error
+    end
+  end
+
+  defp normalize_journal_record({:ok, _event}), do: :ok
+  defp normalize_journal_record({:noop, _reason}), do: :ok
+  defp normalize_journal_record({:error, reason}), do: {:error, reason}
+
+  defp journal_phase_reached?(transition_id, wanted_phase) do
+    case journal_snapshot(transition_id) do
+      {:ok, %{history: history}} ->
+        Enum.any?(history, &(&1.phase == wanted_phase or &1.phase == :verified))
+
+      :error ->
+        false
+    end
+  end
+
+  defp transition_intent_data(intent) do
+    %{
+      issue_id: intent.issue_id,
+      source: intent.source,
+      actor: intent.actor,
+      expected_state: intent.expected_state,
+      kind: intent.kind,
+      causation_id: intent.causation_id,
+      head_oid: intent.head_oid,
+      work_item_kind: intent.work_item_kind,
+      review_attempt: intent.review_attempt,
+      review_limit: intent.review_limit,
+      comment_body: intent.comment_body,
+      metadata: intent.metadata
+    }
+  end
+
+  defp transition_plan_data(plan, extra \\ %{}) do
+    Map.merge(
+      %{
+        issue_id: plan.issue_id,
+        from_state: plan.from_state,
+        to_state: plan.to_state,
+        source: plan.source,
+        actor: plan.actor,
+        kind: plan.kind,
+        causation_id: plan.causation_id,
+        head_oid: plan.head_oid,
+        comment_body: plan.comment_body,
+        metadata: plan.metadata
+      },
+      extra
+    )
+  end
+
+  defp replay_pending_transitions(state) do
+    case Process.whereis(TransitionJournal) do
+      pid when is_pid(pid) ->
+        state =
+          pid
+          |> TransitionJournal.pending()
+          |> Enum.reduce(state, &replay_pending_transition/2)
+
+        recover_orphaned_worker_dispatches(pid, state)
+
+      _ ->
+        state
+    end
+  end
+
+  defp recover_orphaned_worker_dispatches(journal, state) do
+    events = TransitionJournal.replay(journal)
+
+    events
+    |> Enum.filter(&verified_worker_dispatch_event?/1)
+    |> Enum.group_by(& &1.data[:issue_id])
+    |> Enum.map(fn {_issue_id, leases} -> Enum.max_by(leases, & &1.recorded_at) end)
+    |> Enum.reject(&worker_outcome_recorded_after?(events, &1))
+    |> Enum.reduce(state, &recover_orphaned_worker_dispatch/2)
+  end
+
+  defp verified_worker_dispatch_event?(event) do
+    event.phase == :verified and String.starts_with?(event.transition_id, "worker-dispatch:")
+  end
+
+  defp worker_outcome_recorded_after?(events, lease) do
+    events
+    |> events_after(lease)
+    |> Enum.any?(&worker_outcome_for_issue?(&1, lease.data[:issue_id]))
+  end
+
+  defp events_after(events, target) do
+    case Enum.split_while(events, &(&1 != target)) do
+      {_before, [_target | after_target]} -> after_target
+      {_before, []} -> []
+    end
+  end
+
+  defp worker_outcome_for_issue?(event, issue_id) do
+    event.phase == :verified and event.data[:issue_id] == issue_id and
+      event.data[:kind] in [
+        :planning_complete,
+        :implementation_complete,
+        :rework_complete,
+        :clean_review,
+        :review_findings,
+        :merge_ready,
+        :blocked,
+        :handoff_required
+      ]
+  end
+
+  defp recover_orphaned_worker_dispatch(event, state) do
+    issue_id = event.data[:issue_id]
+    lease = %{transition_id: event.transition_id, data: %{issue_id: issue_id}}
+    handoff_ambiguous_worker_dispatch(state, lease, issue_id)
+  end
+
+  defp replay_pending_transition(
+         %{
+           transition_id: "worker-dispatch:" <> _rest,
+           phase: :projection_applied,
+           data: %{issue_id: issue_id}
+         } = lease,
+         state
+       ) do
+    Logger.warning("Recovered an ambiguous worker dispatch lease; fail-closed issue_id=#{issue_id}")
+    handoff_ambiguous_worker_dispatch(state, lease, issue_id)
+  end
+
+  defp replay_pending_transition(%{transition_id: "worker-dispatch:" <> _rest}, state), do: state
+
+  defp replay_pending_transition(snapshot, state) do
+    {result, next_state} = resume_transition_snapshot(snapshot, state)
+    log_replay_result(snapshot.transition_id, result)
+    _ = schedule_transition_effect_retry(result, snapshot.transition_id)
+    next_state
+  end
+
+  defp handoff_ambiguous_worker_dispatch(state, lease, issue_id) do
+    intent = %TransitionIntent{
+      id: "ambiguous-worker-handoff:#{lease.transition_id}",
+      issue_id: issue_id,
+      source: :journal_recovery,
+      actor: "symphony",
+      kind: :handoff_required,
+      causation_id: lease.transition_id,
+      comment_body:
+        "Symphony 재시작 중 worker dispatch 완료 여부를 안전하게 확인할 수 없어 사람 검토로 인계합니다.\n\n" <>
+          "- dispatch lease: #{lease.transition_id}"
+    }
+
+    case apply_transition_intent(state, intent) do
+      {{:ok, _applied}, next_state} ->
+        next_state
+
+      {result, next_state} ->
+        _ = schedule_transition_effect_retry(result, intent.id)
+        %{next_state | claimed: MapSet.put(next_state.claimed, issue_id)}
+    end
+  end
+
+  defp retry_transition_effect(transition_id, state) do
+    case journal_snapshot(transition_id) do
+      {:ok, %{phase: :verified}} -> {{:noop, :already_applied}, state}
+      {:ok, snapshot} -> resume_transition_snapshot(snapshot, state)
+      :error -> {{:error, :transition_journal_entry_not_found}, state}
+    end
+  end
+
+  defp resume_transition_snapshot(snapshot, state) do
+    case snapshot.data[:handoff_transition_id] do
+      handoff_id when is_binary(handoff_id) and handoff_id != "" ->
+        resume_handoff_transition(snapshot, handoff_id, state)
+
+      _ ->
+        case pending_transition_plan(snapshot) do
+          {:ok, plan} -> resume_decided_transition(snapshot, state, plan)
+          :error -> replay_received_transition_result(snapshot, state)
+        end
+    end
+  end
+
+  defp resume_handoff_transition(snapshot, handoff_id, state) do
+    {result, next_state} = retry_transition_effect(handoff_id, state)
+
+    if handoff_completed?(result) do
+      _ =
+        normalize_journal_record(
+          journal_record(snapshot.transition_id, :verified, %{
+            issue_id: snapshot.data[:issue_id],
+            abandoned_effect: true,
+            handoff_transition_id: handoff_id
+          })
+        )
+    end
+
+    {result, next_state}
+  end
+
+  defp handoff_completed?({:ok, _applied}), do: true
+  defp handoff_completed?({:noop, :already_applied}), do: true
+  defp handoff_completed?(_result), do: false
+
+  defp resume_decided_transition(snapshot, state, plan) do
+    case transition_snapshot_mode(snapshot) do
+      "shadow" -> apply_shadow_plan(state, plan, false)
+      _ -> apply_authoritative_plan(state, plan, false)
+    end
+  end
+
+  defp transition_snapshot_mode(%{history: history}) do
+    Enum.find_value(Enum.reverse(history), fn event -> event.data[:mode] end)
+  end
+
+  defp pending_transition_plan(%{history: history, transition_id: transition_id}) do
+    Enum.find_value(Enum.reverse(history), :error, fn event ->
+      if event.phase in [:decided, :retrying] and Map.has_key?(event.data, :from_state) do
+        {:ok, transition_plan_from_data(transition_id, event.data)}
+      end
+    end)
+  end
+
+  defp transition_plan_from_data(transition_id, data) do
+    %TransitionPlan{
+      id: transition_id,
+      issue_id: data[:issue_id],
+      from_state: data[:from_state],
+      to_state: data[:to_state],
+      source: data[:source],
+      actor: data[:actor],
+      kind: data[:kind],
+      head_oid: data[:head_oid],
+      causation_id: data[:causation_id],
+      comment_body: data[:comment_body],
+      metadata: data[:metadata] || %{}
+    }
+  end
+
+  defp replay_received_transition_result(%{transition_id: transition_id, data: data}, state) do
+    intent = %TransitionIntent{
+      id: transition_id,
+      issue_id: data[:issue_id],
+      source: data[:source],
+      actor: data[:actor],
+      expected_state: data[:expected_state],
+      kind: data[:kind],
+      head_oid: data[:head_oid],
+      causation_id: data[:causation_id],
+      work_item_kind: data[:work_item_kind],
+      review_attempt: data[:review_attempt],
+      review_limit: data[:review_limit],
+      comment_body: data[:comment_body],
+      metadata: data[:metadata] || %{}
+    }
+
+    {result, next_state} = apply_transition_intent(state, intent)
+    {result, next_state}
+  end
+
+  defp log_replay_result(transition_id, result) do
+    Logger.info("Replayed transition journal entry transition_id=#{transition_id} result=#{inspect(result)}")
+  end
+
+  defp state_manager_snapshot(state) do
+    pending =
+      case Process.whereis(TransitionJournal) do
+        pid when is_pid(pid) -> TransitionJournal.pending(pid)
+        _ -> []
+      end
+
+    %{
+      mode: Config.settings!().state_manager.mode,
+      journal_available?: is_pid(Process.whereis(TransitionJournal)),
+      pending_transitions: length(pending),
+      conflicts: state.transition_conflicts,
+      last_transition: state.last_transition
+    }
+  end
+
+  defp transition_intent_from_tracker_event(intent) do
+    issue_id = intent_value(intent, :issue_id)
+    event_kind = intent_value(intent, :kind)
+    id = intent_id(intent)
+
+    attributes = %{
+      id: to_string(id),
+      issue_id: issue_id,
+      source: :github_webhook,
+      actor: intent_value(intent, :actor),
+      kind: tracker_event_transition_kind(event_kind, intent),
+      head_oid: intent_value(intent, :head_oid),
+      causation_id: to_string(id),
+      work_item_kind: tracker_work_item_kind(issue_id),
+      metadata: intent
+    }
+
+    case attributes.kind do
+      nil -> {:error, {:ignored_tracker_intent, event_kind}}
+      _ -> TransitionIntent.new(attributes)
+    end
+  end
+
+  defp intent_value(intent, key), do: Map.get(intent, key) || Map.get(intent, Atom.to_string(key))
+
+  defp intent_id(intent) do
+    case intent_value(intent, :delivery_id) || intent_value(intent, :id) do
+      id when is_binary(id) and id != "" -> id
+      _ -> "tracker-payload:#{payload_digest(intent)}"
+    end
+  end
+
+  defp payload_digest(intent) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(intent))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp tracker_work_item_kind("github:pr:" <> _number), do: :pull_request
+  defp tracker_work_item_kind(_issue_id), do: :issue
+
+  defp tracker_event_transition_kind(:operator_transition_requested, intent),
+    do: {:operator_request, Map.get(intent, :label) || Map.get(intent, "label")}
+
+  defp tracker_event_transition_kind(:pull_request_closed, intent) do
+    if Map.get(intent, :merged) || Map.get(intent, "merged"), do: :merge_observed, else: :closed_unmerged
+  end
+
+  defp tracker_event_transition_kind(:issue_closed, _intent), do: {:operator_request, :canceled}
+  defp tracker_event_transition_kind(:review_feedback_detected, _intent), do: {:operator_request, :rework}
+  defp tracker_event_transition_kind(:projection_echo, _intent), do: nil
+  defp tracker_event_transition_kind(:state_projection_drift, _intent), do: nil
+  defp tracker_event_transition_kind(:head_updated, _intent), do: nil
+  defp tracker_event_transition_kind(:review_submitted, _intent), do: nil
+  defp tracker_event_transition_kind(:item_reopened, _intent), do: nil
+  defp tracker_event_transition_kind(_kind, _intent), do: nil
+
+  defp safe_orchestrator_call(server, message) do
+    GenServer.call(server, message)
+  catch
+    :exit, _reason -> :unavailable
+  end
+
+  defp reconcile_projection_drift(state, intent) do
+    issue_id = Map.get(intent, :issue_id) || Map.get(intent, "issue_id")
+    observed_state = Map.get(intent, :observed_state) || Map.get(intent, "observed_state")
+
+    case committed_state_for_issue(issue_id) do
+      {:ok, committed_state} when committed_state == observed_state ->
+        {{:noop, :projection_confirmed}, state}
+
+      {:ok, committed_state} ->
+        reconcile_live_projection_drift(state, issue_id, observed_state, committed_state)
+
+      :error ->
+        {{:error, :canonical_state_unavailable}, state}
+    end
+  end
+
+  defp reconcile_live_projection_drift(state, issue_id, observed_state, committed_state) do
+    case fetch_transition_issue(issue_id) do
+      {:ok, issue} when issue.state == committed_state ->
+        {{:noop, :projection_already_reconciled}, state}
+
+      {:ok, _issue} ->
+        apply_projection_drift_reconciliation(state, issue_id, observed_state, committed_state)
+
+      {:error, :transition_issue_not_found} ->
+        apply_projection_drift_reconciliation(state, issue_id, observed_state, committed_state)
+
+      {:error, reason} ->
+        {{:error, {:projection_drift_readback_failed, reason}}, state}
+    end
+  end
+
+  defp apply_projection_drift_reconciliation(state, issue_id, observed_state, committed_state) do
+    digest = payload_digest({issue_id, observed_state, committed_state})
+    marker = "<!-- sym-transition:projection-drift:#{digest} -->"
+
+    body =
+      "Symphony가 직접 변경된 상태 라벨을 마지막 검증 상태로 복구했습니다.\n\n" <>
+        "- 복구 상태: #{committed_state}"
+
+    case Tracker.create_comment_once(issue_id, body, marker) do
+      comment when comment in [:applied, :already_applied] ->
+        case Tracker.apply_state_projection(issue_id, :any, committed_state) do
+          result when elem(result, 0) in [:applied, :already_applied] ->
+            {{:ok, %{reconciled: true, state: committed_state}}, state}
+
+          {:conflict, snapshot} ->
+            {{:conflict, snapshot}, %{state | transition_conflicts: state.transition_conflicts + 1}}
+
+          {:partial_failure, details} ->
+            {{:error, {:projection_partial_failure, details}}, state}
+        end
+
+      {:error, reason} ->
+        {{:error, {:projection_drift_comment_failed, reason}}, state}
+    end
+  end
+
+  defp committed_state_for_issue(issue_id) when is_binary(issue_id) do
+    case Process.whereis(TransitionJournal) do
+      pid when is_pid(pid) ->
+        pid
+        |> TransitionJournal.replay()
+        |> Enum.reverse()
+        |> Enum.find_value(:error, &verified_state_for_issue(&1, issue_id))
+
+      _ ->
+        :error
+    end
+  end
+
+  defp committed_state_for_issue(_issue_id), do: :error
+
+  defp verified_state_for_issue(%{phase: :verified, data: %{issue_id: issue_id, to_state: state}}, issue_id),
+    do: {:ok, state}
+
+  defp verified_state_for_issue(_event, _issue_id), do: nil
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     running_entry = reset_token_baseline_for_new_session(running_entry, update)

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "ADR-20260719-0001-QNX",
+    "title": "Symphony owns tracker workflow state",
+    "tags": [
+      "orchestration",
+      "state-machine",
+      "tracker",
+      "github",
+      "linear",
+      "reliability"
+    ],
+    "status": "Accepted",
+    "date": "2026-07-19",
+    "tldr": "Symphony serializes every automated workflow transition and projects one canonical state to the tracker; workers return semantic outcomes and never mutate workflow state directly.",
+    "path": "docs/adr/ADR-20260719-0001-QNX-symphony-owns-tracker-state.md"
+  }
+]

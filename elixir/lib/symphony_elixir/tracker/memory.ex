@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @behaviour SymphonyElixir.Tracker
 
+  alias SymphonyElixir.Config
   alias SymphonyElixir.Tracker.Issue
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
@@ -41,16 +42,55 @@ defmodule SymphonyElixir.Tracker.Memory do
     :ok
   end
 
+  @spec create_comment_once(String.t(), String.t(), String.t()) ::
+          :applied | :already_applied | {:error, term()}
+  def create_comment_once(issue_id, body, marker) do
+    send_event({:memory_tracker_comment_once, issue_id, body, marker})
+    :applied
+  end
+
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) do
     send_event({:memory_tracker_state_update, issue_id, state_name})
     :ok
   end
 
+  @spec apply_state_projection(String.t(), String.t() | nil | :any, String.t()) ::
+          {:applied, map()} | {:already_applied, map()} | {:conflict, map()} | {:partial_failure, map()}
+  def apply_state_projection(issue_id, expected_state, target_state) do
+    current = Enum.find(issue_entries(), &(&1.id == issue_id))
+
+    cond do
+      is_nil(current) ->
+        {:partial_failure, %{issue_id: issue_id, reason: :issue_not_found}}
+
+      current.state == target_state and not managed_request_label_present?(current) ->
+        {:already_applied, %{issue_id: issue_id, state: target_state}}
+
+      expected_state not in [nil, :any] and current.state != expected_state ->
+        {:conflict, %{issue_id: issue_id, expected_state: expected_state, state: current.state}}
+
+      true ->
+        send_event({:memory_tracker_state_projection, issue_id, current.state, target_state})
+        {:applied, %{issue_id: issue_id, previous_state: current.state, state: target_state}}
+    end
+  end
+
+  defp managed_request_label_present?(%Issue{labels: labels}) do
+    request_labels = Config.settings!().state_manager.human_intent_labels |> Map.values() |> MapSet.new()
+    Enum.any?(labels || [], &MapSet.member?(request_labels, &1))
+  end
+
   @spec create_pull_request_for_issue(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
   def create_pull_request_for_issue(%Issue{} = issue) do
     send_event({:memory_tracker_create_pull_request_for_issue, issue})
     {:error, :unsupported_pull_request_creation}
+  end
+
+  @spec merge_pull_request(String.t(), String.t()) :: {:error, map()}
+  def merge_pull_request(issue_id, expected_head_oid) do
+    send_event({:memory_tracker_merge_pull_request, issue_id, expected_head_oid})
+    {:error, %{stage: :validate, reason: :unsupported_pull_request_merge}}
   end
 
   defp configured_issues do

@@ -121,6 +121,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:reply, Keyword.get(state, :targeted_refresh, :unavailable), state}
     end
 
+    def handle_call({:projection_drift, %{issue_id: issue_id}}, _from, state) do
+      send(Keyword.get(state, :recipient, self()), {:targeted_refresh, issue_id})
+      {:reply, Keyword.get(state, :targeted_refresh, :unavailable), state}
+    end
+
     def handle_info(:tick, state) do
       send(Keyword.get(state, :recipient, self()), :webhook_follow_up_refresh)
       {:noreply, state}
@@ -352,6 +357,87 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Process.put({FakeLinearClient, :graphql_result}, :unexpected)
     assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd")
+    flush_graphql_messages()
+
+    marker = "<!-- sym-transition:linear-1 -->"
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "comments" => %{
+                 "nodes" => [],
+                 "pageInfo" => %{"hasPreviousPage" => false, "startCursor" => nil}
+               }
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+      ]
+    )
+
+    assert :applied = Adapter.create_comment_once("issue-1", "once", marker)
+    assert_receive {:graphql_called, comments_query, %{issueId: "issue-1", before: nil}}
+    assert comments_query =~ "SymphonyIssueComments"
+    assert_receive {:graphql_called, _, %{body: marked_body, issueId: "issue-1"}}
+    assert marked_body =~ marker
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "comments" => %{
+                 "nodes" => [%{"body" => "existing #{marker}"}],
+                 "pageInfo" => %{"hasPreviousPage" => false, "startCursor" => nil}
+               }
+             }
+           }
+         }}
+      ]
+    )
+
+    assert :already_applied = Adapter.create_comment_once("issue-1", "once", marker)
+    assert_receive {:graphql_called, _, %{issueId: "issue-1", before: nil}}
+    refute_receive {:graphql_called, _, %{body: _, issueId: "issue-1"}}
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "comments" => %{
+                 "nodes" => [%{"body" => "newer"}],
+                 "pageInfo" => %{"hasPreviousPage" => true, "startCursor" => "cursor-2"}
+               }
+             }
+           }
+         }},
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "comments" => %{
+                 "nodes" => [%{"body" => "older #{marker}"}],
+                 "pageInfo" => %{"hasPreviousPage" => false, "startCursor" => nil}
+               }
+             }
+           }
+         }}
+      ]
+    )
+
+    assert :already_applied = Adapter.create_comment_once("issue-1", "once", marker)
+    assert_receive {:graphql_called, _, %{issueId: "issue-1", before: nil}}
+    assert_receive {:graphql_called, _, %{issueId: "issue-1", before: "cursor-2"}}
+    refute_receive {:graphql_called, _, %{body: _, issueId: "issue-1"}}
 
     Process.put(
       {FakeLinearClient, :graphql_results},
@@ -537,7 +623,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              json_response(conn, 202)
   end
 
-  test "github webhook queues targeted refresh for valid signed issue events" do
+  test "github webhook queues targeted refresh without mutating state for valid signed issue events" do
     secret = "github-webhook-secret"
 
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -624,7 +710,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert_receive {:targeted_refresh, "github:pr:29"}, 200
     assert_receive {:webhook_follow_up_refresh, "github:pr:29"}, 200
-    assert_receive {:github_webhook_sync_request, :delete, "/repos/studiojin-dev/myven/issues/29/labels/sym%3Atodo", nil, nil}
+    refute_receive {:github_webhook_sync_request, _, _, _, _}, 100
   end
 
   test "github webhook rejects invalid signatures" do
@@ -963,6 +1049,14 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp github_response(status, body), do: {:ok, %Req.Response{status: status, body: body}}
+
+  defp flush_graphql_messages do
+    receive do
+      {:graphql_called, _, _} -> flush_graphql_messages()
+    after
+      0 -> :ok
+    end
+  end
 
   defp static_snapshot do
     %{

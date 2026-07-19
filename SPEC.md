@@ -16,7 +16,7 @@ behavior.
 ## 1. Problem Statement
 
 Symphony is a long-running automation service that continuously reads work from an issue tracker
-(Linear in this specification version), creates an isolated workspace for each issue, and runs a
+(Linear or GitHub), creates an isolated workspace for each issue, and runs a
 coding agent session for that issue inside the workspace.
 
 The service solves four operational problems:
@@ -35,9 +35,13 @@ stricter approvals or sandboxing.
 
 Important boundary:
 
-- Symphony is a scheduler/runner and tracker reader.
-- Ticket writes (state transitions, comments, PR links) are typically performed by the coding agent
-  using tools available in the workflow/runtime environment.
+- Symphony is the sole automated authority for tracker workflow state.
+- Coding agents report semantic outcomes; they MUST NOT select or write target workflow states.
+- Symphony serializes transition intents, records required effects durably, and projects the verified
+  state to the tracker through a broker.
+- Human-authored comments remain unrestricted. Human GitHub state changes enter Symphony as explicit
+  request-label events; other adapters provide an equivalent explicit operator intent. Every intent
+  is validated before the canonical state is changed.
 - A successful run can end at a workflow-defined handoff state (for example `Human Review`), not
   necessarily `Done`.
 
@@ -47,21 +51,25 @@ Important boundary:
 
 - Poll the issue tracker on a fixed cadence and dispatch work with bounded concurrency.
 - Maintain a single authoritative orchestrator state for dispatch, retries, and reconciliation.
+- Maintain one authoritative workflow-state policy and one serialized automated tracker writer.
+- Preserve tracker-visible execution states while preventing stale outcomes from regressing newer or
+  terminal states.
+- Replay incomplete tracker effects after restart from a durable transition journal.
 - Create deterministic per-issue workspaces and preserve them across runs.
 - Stop active runs when issue state changes make them ineligible.
 - Recover from transient failures with exponential backoff.
 - Load runtime behavior from a repository-owned `WORKFLOW.md` contract.
 - Expose operator-visible observability (at minimum structured logs).
-- Support tracker/filesystem-driven restart recovery without requiring a persistent database; exact
-  in-memory scheduler state is not restored.
+- Support journal/tracker/filesystem-driven restart recovery without requiring an external database;
+  exact in-memory scheduler and live session state is not restored.
 
 ### 2.2 Non-Goals
 
 - Rich web UI or multi-tenant control plane.
 - Prescribing a specific dashboard or terminal UI implementation.
 - General-purpose workflow engine or distributed job scheduler.
-- Built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in the
-  workflow prompt and agent tooling.)
+- General-purpose workflow automation beyond the transition policy configured for the current
+  workflow.
 - Mandating strong sandbox controls beyond what the coding agent and host OS provide.
 - Mandating a single default approval, sandbox, or operator-confirmation posture for all
   implementations.
@@ -85,30 +93,42 @@ Important boundary:
    - Fetches current states for specific issue IDs (reconciliation).
    - Fetches terminal-state issues during startup cleanup.
    - Normalizes tracker payloads into a stable issue model.
+   - Applies broker-requested comments and state projections without deciding transitions.
 
 4. `Orchestrator`
    - Owns the poll tick.
    - Owns the in-memory runtime state.
    - Decides which issues to dispatch, retry, stop, or release.
+   - Serializes all transition intents through its mailbox.
    - Tracks session metrics and retry queue state.
 
-5. `Workspace Manager`
+5. `Workflow State Policy and Manager`
+   - Converts observed state plus semantic intent into a pure transition decision.
+   - Writes transition phases to a durable journal before external effects.
+   - Invokes the tracker broker and verifies the resulting projection.
+
+6. `Tracker Broker`
+   - Owns every automated tracker write, including transition comments, close/reopen, and merge.
+   - Applies idempotency markers, expected-state checks, and read-after-write verification.
+
+7. `Workspace Manager`
    - Maps issue identifiers to workspace paths.
    - Ensures per-issue workspace directories exist.
    - Runs workspace lifecycle hooks.
    - Cleans workspaces for terminal issues.
 
-6. `Agent Runner`
+8. `Agent Runner`
    - Creates workspace.
    - Builds prompt from issue + workflow template.
    - Launches the coding agent app-server client.
    - Streams agent updates back to the orchestrator.
+   - Decodes a structured semantic outcome; it does not mutate tracker state.
 
-7. `Status Surface` (OPTIONAL)
+9. `Status Surface` (OPTIONAL)
    - Presents human-readable runtime status (for example terminal output, dashboard, or other
      operator-facing view).
 
-8. `Logging`
+10. `Logging`
    - Emits structured runtime logs to one or more configured sinks.
 
 ### 3.2 Abstraction Levels
@@ -117,28 +137,29 @@ Symphony is easiest to port when kept in these layers:
 
 1. `Policy Layer` (repo-defined)
    - `WORKFLOW.md` prompt body.
-   - Team-specific rules for ticket handling, validation, and handoff.
+   - Team-specific intent-to-transition policy, validation, and handoff rules.
 
 2. `Configuration Layer` (typed getters)
    - Parses front matter into typed runtime settings.
    - Handles defaults, environment tokens, and path normalization.
 
 3. `Coordination Layer` (orchestrator)
-   - Polling loop, issue eligibility, concurrency, retries, reconciliation.
+   - Polling loop, issue eligibility, concurrency, retries, reconciliation, and serialized state
+     intents.
 
 4. `Execution Layer` (workspace + agent subprocess)
    - Filesystem lifecycle, workspace preparation, coding-agent protocol.
 
-5. `Integration Layer` (Linear adapter)
-   - API calls and normalization for tracker data.
+5. `Integration Layer` (tracker adapter + broker)
+   - Read normalization and policy-free application of verified tracker effects.
 
 6. `Observability Layer` (logs + OPTIONAL status surface)
    - Operator visibility into orchestrator and agent behavior.
 
 ### 3.3 External Dependencies
 
-- Issue tracker API (Linear for `tracker.kind: linear` in this specification version).
-- Local filesystem for workspaces and logs.
+- Issue tracker API (Linear and GitHub adapter profiles).
+- Local filesystem for workspaces, logs, and the durable transition journal.
 - OPTIONAL workspace population tooling (for example Git CLI, if used).
 - Coding-agent executable that supports the targeted Codex app-server mode.
 - Host environment authentication for the issue tracker and coding agent.
@@ -272,6 +293,52 @@ Fields:
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
 
+#### 4.1.9 Transition Intent
+
+Immutable request evaluated by the workflow state policy.
+
+Fields:
+
+- `id` (stable transition ID)
+- `issue_id`
+- `source` and `actor`
+- `expected_state`
+- `kind` (semantic worker outcome, operator request, or external tracker fact)
+- `causation_id` (delivery ID, run ID, or other replay-stable identifier)
+- `head_oid` (OPTIONAL; REQUIRED for head-sensitive PR transitions)
+- `summary` and `evidence` (OPTIONAL structured worker output)
+
+#### 4.1.10 Transition Plan and Applied Transition
+
+`WorkflowStatePolicy` returns a pure `TransitionPlan` containing the validated source state, target
+state, required comment, tracker effects, and no-op or rejection reason. It performs no network or
+filesystem I/O.
+
+After the effects are verified, `StateManager` returns an `AppliedTransition` containing the
+transition ID, previous and effective states, verified tracker snapshot, and journal position. The
+public `StateManager.request(intent)` result is one of:
+
+```text
+{:ok, AppliedTransition}
+{:noop, reason}
+{:conflict, current_snapshot}
+{:rejected, policy_reason}
+{:error, transport_reason}
+```
+
+#### 4.1.11 Transition Journal Record
+
+Durable append-only record keyed by transition ID and causation ID.
+
+Fields:
+
+- `transition_id`, `issue_id`, `causation_id`
+- `intent` and `decision`
+- `phase`: `received`, `decided`, `required_comment_applied`, `projection_applied`, `verified`, or
+  `retrying`
+- `attempt`, `error`, and timestamps
+- verified tracker snapshot when available
+
 ### 4.2 Stable Identifiers and Normalization Rules
 
 - `Issue ID`
@@ -334,6 +401,7 @@ Top-level keys:
 - `agent`
 - `codex`
 - `notifications`
+- `state_manager`
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
@@ -350,7 +418,7 @@ Fields:
 
 - `kind` (string)
   - REQUIRED for dispatch.
-  - Current supported value: `linear`
+  - Current supported values: `linear`, `github`
 - `endpoint` (string)
   - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
 - `api_key` (string)
@@ -359,6 +427,11 @@ Fields:
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
 - `project_slug` (string)
   - REQUIRED for dispatch when `tracker.kind == "linear"`.
+- `owner`, `repo` (strings)
+  - REQUIRED for dispatch when `tracker.kind == "github"`.
+- `state_labels` (map `state_name -> label`)
+  - REQUIRED when tracker-native workflow state is represented by GitHub labels.
+  - Canonical state labels MUST be disjoint from `state_manager.human_intent_labels`.
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings)
@@ -437,8 +510,11 @@ Fields:
   - Limits review verdicts, not implementation/rework turns, in a briefed worker run.
 - `orchestration_brief_enabled` (boolean)
   - Default: `false` for backward compatibility.
-- `review_states` (list of strings), `rework_state` (string), `human_review_state` (string)
+- `review_states` (list of strings), `rework_state` (string), `reworking_state` (string),
+  `human_review_state` (string)
   - Define the transition-aware review cycle without hard-coding tracker labels.
+  - `reworking_state` defaults to `Reworking` and is the tracker-visible execution state entered
+    before dispatching rework.
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
@@ -489,6 +565,33 @@ fields locally if they want stricter startup checks.
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
+
+#### 5.3.8 `state_manager` (object)
+
+Fields:
+
+- `mode` (`legacy | shadow | authoritative`)
+  - Default: `legacy` for workflows created before this contract.
+  - New production workflows SHOULD explicitly select `authoritative`.
+  - `legacy` enables the previous writer and disables state-manager effects.
+  - `shadow` evaluates and journals intents while the single legacy writer applies the transition;
+    the new broker performs no tracker write.
+  - `authoritative` enables the broker and MUST disable all legacy automated writers.
+  - Implementations MUST NOT run legacy and authoritative writes concurrently.
+- `journal_path` (path string or `$VAR`, OPTIONAL)
+  - Default:
+    `${XDG_STATE_HOME:-~/.local/state}/symphony/<workflow-path-hash>/transitions.log`.
+  - The path is normalized outside the repository and workspace roots.
+  - Only one process may hold the workflow journal; lock acquisition failure MUST fail closed.
+- `human_intent_labels` (map `state_or_action -> label`, OPTIONAL)
+  - REQUIRED for an authoritative GitHub workflow that exposes label-based operator requests.
+  - Maps `Planned`, `Rework`, `Merging`, `Human Review`, `Canceled`, `Duplicate`, and `Reopen` to
+    temporary operator request labels.
+  - `Reopen` targets `Human Review` and is the only request allowed to leave a terminal state.
+  - Request labels MUST NOT be treated as canonical workflow-state labels.
+
+The tracker write credential is supplied to the host as `SYMPHONY_TRACKER_WRITE_TOKEN`; it MUST be
+resolved only by the broker and MUST NOT be included in the coding-agent environment.
 
 ### 5.4 Prompt Template Contract
 
@@ -599,6 +702,9 @@ Validation checks:
 - `tracker.api_key` is present after `$` resolution.
 - `tracker.project_slug` is present when REQUIRED by the selected tracker kind.
 - `codex.command` is present and non-empty.
+- `state_manager.mode` is recognized and authoritative mode has a writable, exclusively lockable
+  journal location plus broker-only write credentials.
+- Canonical and request label maps are disjoint and contain all states/actions required by policy.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -606,10 +712,12 @@ This section is intentionally redundant so a coding agent can implement the conf
 Extension fields are documented in the extension section that defines them. Core conformance does
 not require recognizing or validating extension fields unless that extension is implemented.
 
-- `tracker.kind`: string, REQUIRED, currently `linear`
+- `tracker.kind`: string, REQUIRED, currently `linear` or `github`
 - `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
 - `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
 - `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
+- `tracker.owner`, `tracker.repo`: strings, REQUIRED when `tracker.kind=github`
+- `tracker.state_labels`: canonical state-to-label map for GitHub
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
@@ -625,6 +733,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.orchestration_brief_enabled`: boolean, default `false`
 - `agent.review_states`: list of strings, default `["Review", "Reviewing"]`
 - `agent.rework_state`: string, default `Rework`
+- `agent.reworking_state`: string, default `Reworking`
 - `agent.human_review_state`: string, default `Human Review`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
@@ -637,17 +746,22 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `state_manager.mode`: `legacy | shadow | authoritative`, default `legacy`
+- `state_manager.journal_path`: path or `$VAR`, default under the host XDG state directory
+- `state_manager.human_intent_labels`: map of human state/action names to request labels
 - `verification.full_states`: list of strings, default `["Merging"]`
 
-## 7. Orchestration State Machine
+## 7. Orchestration and Workflow State Machines
 
-The orchestrator is the only component that mutates scheduling state. All worker outcomes are
-reported back to it and converted into explicit state transitions.
+The orchestrator owns both scheduling state and serialized workflow transition intents. Scheduling
+state remains in memory. Canonical workflow decisions and their external effects are written to a
+durable journal and projected to the tracker by the broker. No worker, webhook handler, or tracker
+adapter may independently decide or apply an automated workflow transition.
 
 ### 7.1 Issue Orchestration States
 
-This is not the same as tracker states (`Todo`, `In Progress`, etc.). This is the service's internal
-claim state.
+This is not the same as canonical tracker states (`Todo`, `In Progress`, etc.). This is the service's
+internal claim state.
 
 1. `Unclaimed`
    - Issue is not running and has no retry scheduled.
@@ -669,10 +783,12 @@ claim state.
 Important nuance:
 
 - A successful worker exit does not mean the issue is done forever.
-- The worker MAY continue through multiple back-to-back coding-agent turns before it exits.
-- After each normal turn completion, the worker re-checks the tracker issue state.
-- If the issue is still in an active state, the worker SHOULD start another turn on the same live
-  coding-agent thread in the same workspace, up to `agent.max_turns`.
+- The worker produces exactly one structured outcome per turn. An implementation MAY retain the
+  app-server process for another turn only after the state manager accepts the outcome and explicitly
+  authorizes continuation in the effective state.
+- After each normal turn completion, the worker returns a semantic outcome to the orchestrator.
+- The state manager re-checks current state, evaluates that outcome, and decides whether another turn
+  is eligible, up to `agent.max_turns`.
 - The first turn SHOULD use the full rendered task prompt.
 - Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
   original task prompt that is already present in thread history.
@@ -693,7 +809,7 @@ Workflows MAY enable orchestration briefs for bounded PR review/rework cycles:
   rework may continue to review; review findings may continue to rework while the verdict budget
   remains; a clean review stops immediately in Human Review.
 - When the configured review-verdict budget is exhausted with findings remaining, or when a worker
-  completes in an unexpected active state, the item moves to Human Review with a handoff comment.
+  reports `handoff_required`, policy moves the item to Human Review with a brokered handoff comment.
 - Full verification and required-CI waiting are reserved for configured full states such as Merging.
   Earlier states run focused checks and inspect CI once without polling.
 
@@ -726,8 +842,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `Worker Exit (normal)`
   - Remove running entry.
   - Update aggregate runtime totals.
-  - Schedule continuation retry (attempt `1`) after the worker exhausts or finishes its in-process
-    turn loop.
+  - Submit the structured worker outcome to the state manager.
+  - Schedule continuation retry only when the applied transition remains dispatch-eligible.
 
 - `Worker Exit (abnormal)`
   - Remove running entry.
@@ -743,15 +859,60 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `Reconciliation State Refresh`
   - Stop runs whose issue states are terminal or no longer active.
 
+- `Tracker Webhook Fact`
+  - Submit immutable close, merge, review, or projection-echo facts to the state manager.
+
+- `Human Request Label`
+  - Re-read live state, validate the requested edge, and either apply it or restore the last verified
+    state.
+
 - `Stall Timeout`
   - Kill worker and schedule retry.
 
-### 7.4 Idempotency and Recovery Rules
+### 7.4 Canonical Workflow States and Outcomes
 
-- The orchestrator serializes state mutations through one authority to avoid duplicate dispatch.
+A tracker item MUST have exactly one canonical configured workflow-state label. Execution phases are
+tracker-visible so operators can inspect progress without opening Symphony:
+
+| Trigger or semantic outcome | Required transition |
+| --- | --- |
+| issue `planning_complete` | workflow-specific control effects, then `Human Review` |
+| implementation dispatch | `Planned -> In Progress` |
+| `implementation_complete` | `In Progress -> Review` |
+| review dispatch | `Review -> Reviewing` |
+| `clean_review` | `Reviewing -> Human Review` |
+| `review_findings` within budget | `Reviewing -> Rework` |
+| `review_findings` at final verdict | `Reviewing -> Human Review` |
+| rework dispatch | `Rework -> Reworking` |
+| `rework_complete` | `Reworking -> Review` |
+| `merge_ready` followed by observed successful merge | `Merging -> Done` |
+| close without merge | any non-terminal state `-> Canceled` |
+| `blocked` or `handoff_required` after retry policy | active execution state `-> Human Review` |
+
+`Todo`, `Planned`, `In Progress`, `Review`, `Reviewing`, `Rework`, `Reworking`, and `Merging` MAY be
+active according to workflow configuration. `Human Review` and `Waiting` are inactive retention or
+coordination states. `Done`, `Canceled`, and `Duplicate` are terminal and monotonic. A stale outcome
+observing a terminal state MUST return a no-op rather than regress it.
+
+A same-state observation that matches the transition's already-applied target is an idempotent no-op,
+not a failed worker outcome. Missing or multiple canonical states MUST quarantine the item and MUST
+NOT dispatch a worker.
+
+### 7.5 Idempotency and Recovery Rules
+
+- The orchestrator serializes scheduling and workflow-state mutations through one authority.
 - `claimed` and `running` checks are REQUIRED before launching any worker.
+- Before launching a worker, reserve a durable dispatch lease derived from the verified dispatch
+  transition. A crash after reservation is fail-closed and MUST NOT launch a second worker.
+- Each transition intent MUST have a replay-stable ID and causation ID.
+- Before every external effect, `StateManager` synchronously appends the next journal phase:
+  `received`, `decided`, `required_comment_applied`, `projection_applied`, `verified`; recoverable
+  failures are recorded as `retrying`.
+- Required automated comments contain `<!-- sym-transition:<transition-id> -->`. Replay MUST search
+  for the marker before creating a comment.
+- State projections use an expected-state check and read-after-write verification.
 - Reconciliation runs before dispatch on every tick.
-- Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
+- Restart recovery replays incomplete journal records, then reconciles tracker and filesystem state.
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
 ## 8. Polling, Scheduling, and Reconciliation
@@ -1022,6 +1183,8 @@ client to:
 - Supply the absolute per-issue workspace path as the thread/turn working directory wherever the
   targeted protocol accepts cwd.
 - Start the first turn with the rendered issue prompt.
+- Supply an output schema for worker turns that requires one semantic outcome, observed head OID when
+  relevant, verification evidence, and a human-readable summary.
 - Start later in-worker continuation turns on the same live thread with continuation guidance rather
   than resending the original issue prompt.
 - Supply the implementation's documented approval and sandbox policy using fields supported by the
@@ -1088,6 +1251,13 @@ Important emitted events include, for example:
 - `notification`
 - `other_message`
 - `malformed`
+- `worker_outcome`
+
+The terminal `worker_outcome` payload MUST validate against the configured output schema. Its
+`outcome` is one of `planning_complete`, `implementation_complete`, `rework_complete`,
+`clean_review`, `review_findings`, `merge_ready`, `blocked`, or `handoff_required`. The payload MAY
+include structured findings, verification evidence, and a Korean tracker-summary body. It MUST NOT
+contain a caller-selected target workflow state.
 
 ### 10.5 Approval, Tool Calls, and User Input Policy
 
@@ -1126,14 +1296,15 @@ Optional client-side tool extension:
 
 `linear_graphql` extension contract:
 
-- Purpose: execute a raw GraphQL query or mutation against Linear using Symphony's configured
-  tracker auth for the current session.
+- Purpose: execute one read-only GraphQL query against Linear using Symphony's configured read
+  credential for the current session. Mutations that create transition comments or change workflow
+  state MUST go through the tracker broker and MUST be rejected by this worker-facing tool.
 - Availability: only meaningful when `tracker.kind == "linear"` and valid Linear auth is configured.
 - Preferred input shape:
 
   ```json
   {
-    "query": "single GraphQL query or mutation document",
+    "query": "single GraphQL query document",
     "variables": {
       "optional": "graphql variables object"
     }
@@ -1141,7 +1312,7 @@ Optional client-side tool extension:
   ```
 
 - `query` MUST be a non-empty string.
-- `query` MUST contain exactly one GraphQL operation.
+- `query` MUST contain exactly one GraphQL query operation.
 - `variables` is OPTIONAL and, when present, MUST be a JSON object.
 - Implementations MAY additionally accept a raw GraphQL query string as shorthand input.
 - Execute one GraphQL operation per tool call.
@@ -1193,15 +1364,22 @@ Behavior:
 
 1. Create/reuse workspace for issue.
 2. Build prompt from workflow template.
-3. Start app-server session.
-4. Forward app-server events to orchestrator.
-5. On any error, fail the worker attempt (the orchestrator will retry).
+3. Start the app-server session with the semantic-outcome output schema.
+4. Forward app-server events to the orchestrator.
+5. Validate and return one structured worker outcome after a successful turn.
+6. On an app-server error or invalid outcome, fail the worker attempt so the orchestrator can retry
+   or hand off. If the semantic outcome was accepted but a broker effect failed, complete the worker
+   and retry only the journaled effect with the same transition ID.
+
+The runner MUST NOT infer success from a tracker state reread, call the state projection port, create
+an automated transition comment, or map a worker response directly to a target label. All such
+effects begin with a `TransitionIntent` submitted to `StateManager`.
 
 Note:
 
 - Workspaces are intentionally preserved after successful runs.
 
-## 11. Issue Tracker Integration Contract (Linear-Compatible)
+## 11. Issue Tracker Integration Contract
 
 ### 11.1 REQUIRED Operations
 
@@ -1215,6 +1393,20 @@ An implementation MUST support these tracker adapter operations:
 
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
+
+4. `apply_state_projection(issue_id, expected_state, target_state)`
+   - Re-read current tracker state and reject a stale expected state.
+   - Preserve non-workflow labels while replacing canonical state and request labels with exactly one
+     target-state projection.
+   - Perform read-after-write verification.
+   - Return `applied`, `already_applied`, `conflict`, or `partial_failure` with the observed snapshot
+     or stage-specific error.
+
+5. Broker effect operations
+   - Create a comment with an idempotency marker, close/reopen an item, and merge a pull request where
+     supported by the selected tracker.
+   - These operations MUST be callable only from the state-manager/broker boundary, not from a
+     coding-agent session.
 
 ### 11.2 Query Semantics (Linear)
 
@@ -1237,6 +1429,10 @@ Important:
 
 A non-Linear implementation MAY change transport details, but the normalized outputs MUST match the
 domain model in Section 4.
+
+GitHub-specific read and projection semantics are defined by Sections 11.1 and 11.5. GitHub issues
+and pull requests share the issue-label API; implementations normalize their configured canonical
+state label to the same language-neutral `Issue.state` field used by Linear.
 
 ### 11.3 Normalization Rules
 
@@ -1261,6 +1457,9 @@ RECOMMENDED error categories:
 - `linear_graphql_errors`
 - `linear_unknown_payload`
 - `linear_missing_end_cursor` (pagination integrity error)
+- `tracker_projection_conflict`
+- `tracker_projection_partial_failure`
+- `transition_journal_unavailable`
 
 Orchestrator behavior on tracker errors:
 
@@ -1272,15 +1471,26 @@ Orchestrator behavior on tracker errors:
 
 ### 11.5 Tracker Writes (Important Boundary)
 
-Symphony does not require first-class tracker write APIs in the orchestrator.
+Symphony requires first-class tracker write ports owned by the tracker broker.
 
-- Ticket mutations (state transitions, comments, PR metadata) are typically handled by the coding
-  agent using tools defined by the workflow prompt.
-- The service remains a scheduler/runner and tracker reader.
-- Workflow-specific success often means "reached the next handoff state" (for example
-  `Human Review`) rather than tracker terminal state `Done`.
-- If the `linear_graphql` client-side tool extension is implemented, it is still part of the agent
-  toolchain rather than orchestrator business logic.
+- `StateManager` is the only component allowed to request an automated workflow projection.
+- The broker owns automated transition comments, PR metadata, close/reopen effects, and merges.
+- The tracker adapter is transport-only: it applies a requested effect but does not choose the
+  target state or parent/sub-item policy.
+- Webhook handlers ingest immutable operator intents and external facts. They MUST NOT mutate state
+  before the state manager evaluates the event.
+- A GitHub state projection MUST begin from a fresh live snapshot, preserve every non-workflow
+  label, remove all configured canonical and request labels, add one target label, replace the full
+  label set in one request, and verify the result with a second read.
+- Linear projections MUST implement equivalent expected-state, idempotency, and verification
+  semantics through its native API.
+- A transport success without verified target state is `partial_failure`, not an applied transition.
+
+Human interaction remains part of the tracker UX. Human-authored comments are not brokered. On
+GitHub, a person requests a workflow transition by applying one configured `sym:request-*` label.
+The resulting webhook is an intent only; Symphony validates and consumes it. A direct edit of a
+canonical state label is drift and is reconciled to the last verified state. Other tracker adapters
+MUST expose an explicit, auditable operator-intent mechanism with equivalent validation.
 
 ## 12. Prompt Construction and Context Assembly
 
@@ -1298,6 +1508,11 @@ Inputs to prompt rendering:
 - Render with strict filter checking.
 - Convert issue object keys to strings for template compatibility.
 - Preserve nested arrays/maps (labels, blockers) so templates can iterate.
+- State clearly that workers return semantic outcomes and MUST NOT add/remove canonical or request
+  workflow labels, close/reopen tracker items, merge pull requests, or publish automated transition
+  comments directly.
+- State clearly that human-authored comments and request-label input remain tracker-facing operator
+  interfaces, while Symphony owns their validation and application.
 
 ### 12.3 Retry/Continuation Semantics
 
@@ -1616,8 +1831,16 @@ API design notes:
    - Non-200 status
    - GraphQL errors
    - malformed payloads
+   - stale expected state or read-after-write projection mismatch
+   - partial comment, close/reopen, merge, or projection effect
 
-5. `Observability Failures`
+5. `State Manager Failures`
+   - journal lock already held
+   - journal append/sync/replay failure
+   - missing or multiple canonical states
+   - invalid, unauthorized, duplicate, or out-of-order transition intent
+
+6. `Observability Failures`
    - Snapshot timeout
    - Dashboard render errors
    - Log sink configuration failure
@@ -1640,24 +1863,36 @@ API design notes:
   - Keep current workers.
   - Retry on next tick.
 
+- Transition journal failures:
+  - Stop authoritative tracker writes and new dispatches.
+  - Keep the journal for operator recovery; do not fall back to a legacy writer automatically.
+
+- Tracker effect partial failures:
+  - Record `retrying` before retry.
+  - Re-read comment markers and projection state so an already-applied effect is not duplicated.
+
 - Dashboard/log failures:
   - Do not crash the orchestrator.
 
 ### 14.3 Partial State Recovery (Restart)
 
-Current design is intentionally in-memory for scheduler state.
-Restart recovery means the service can resume useful operation by polling tracker state and reusing
-preserved workspaces. It does not mean retry timers, running sessions, or live worker state survive
-process restart.
+Scheduler state remains in memory, while workflow transitions and their effect phases are stored in
+the durable journal. Restart recovery means the service can resume useful operation by replaying the
+journal, polling tracker state, and reusing preserved workspaces. Retry timers, running sessions, and
+live worker state do not survive process restart.
 
 After restart:
 
 - No retry timers are restored from prior process memory.
 - No running sessions are assumed recoverable.
 - Service recovers by:
+  - acquiring the workflow journal's single-writer lock or failing closed
+  - replaying non-verified transition records
+  - checking comment markers and tracker state before repeating an external effect
+  - reconciling verified journal state with the live tracker projection
   - startup terminal workspace cleanup
   - fresh polling of active issues
-  - re-dispatching eligible work
+  - re-dispatching eligible work only when no completed or ambiguous durable dispatch lease exists
 
 ### 14.4 Operator Intervention Points
 
@@ -1666,9 +1901,10 @@ Operators can control behavior by:
 - Editing `WORKFLOW.md` (prompt and most runtime settings).
 - `WORKFLOW.md` changes are detected and re-applied automatically without restart according to
   Section 6.2.
-- Changing issue states in the tracker:
-  - terminal state -> running session is stopped and workspace cleaned when reconciled
-  - non-active state -> running session is stopped without cleanup
+- Applying a configured request label in the tracker. The state manager validates the edge and
+  applies or rejects the intent; operators SHOULD NOT edit canonical labels directly.
+- Inspecting or repairing a quarantined item after missing or multiple canonical state labels are
+  reported.
 - Restarting the service for process recovery or deployment (not as the normal path for applying
   workflow config changes).
 
@@ -1706,6 +1942,11 @@ RECOMMENDED additional hardening for ports:
 - Support `$VAR` indirection in workflow config.
 - Do not log API tokens or secret env values.
 - Validate presence of secrets without printing them.
+- Resolve `SYMPHONY_TRACKER_WRITE_TOKEN` only in the broker process.
+- Remove `GITHUB_TOKEN`, `GH_TOKEN`, and `SYMPHONY_TRACKER_WRITE_TOKEN` from worker environments and
+  use an empty worker `GH_CONFIG_DIR`.
+- Keep repository push credentials separate from tracker API credentials. Operations needing tracker
+  write permission, including automated comments and merge, MUST use the broker.
 
 ### 15.4 Hook Script Safety
 
@@ -1738,8 +1979,8 @@ Possible hardening measures include:
   separate credentials beyond the built-in Codex policy controls.
 - Filtering which Linear issues, projects, teams, labels, or other tracker sources are eligible for
   dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
-- Narrowing the `linear_graphql` tool so it can only read or mutate data inside the
-  intended project scope, rather than exposing general workspace-wide tracker access.
+- Restricting the worker-facing `linear_graphql` tool to reads inside the intended project scope and
+  rejecting state-changing mutations.
 - Reducing the set of client-side tools, credentials, filesystem paths, and network destinations
   available to the agent to the minimum needed for the workflow.
 
@@ -1772,6 +2013,11 @@ function start_service():
     log_validation_error(validation)
     fail_startup(validation)
 
+  journal = open_and_lock_transition_journal()
+  if journal lock failed:
+    fail_startup("state manager writer already active")
+
+  replay_incomplete_transitions(journal)
   startup_terminal_workspace_cleanup()
   schedule_tick(delay_ms=0)
 
@@ -1783,6 +2029,7 @@ function start_service():
 ```text
 on_tick(state):
   state = reconcile_running_issues(state)
+  state = reconcile_tracker_projections(state)
 
   validation = validate_dispatch_config()
   if validation is not ok:
@@ -1840,6 +2087,11 @@ function reconcile_running_issues(state):
 
 ```text
 function dispatch_issue(issue, state, attempt):
+  dispatch_result = state_manager.request(dispatch_intent_for(issue))
+  if dispatch_result is conflict or rejected or error:
+    return release_or_retry_without_worker(state, issue, dispatch_result)
+
+  issue = effective_snapshot(dispatch_result, issue)
   worker = spawn_worker(
     fn -> run_agent_attempt(issue, attempt, parent_orchestrator_pid) end
   )
@@ -1891,63 +2143,56 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
     run_hook_best_effort("after_run", workspace.path)
     fail_worker("agent session startup error")
 
-  max_turns = config.agent.max_turns
-  turn_number = 1
+  prompt = build_turn_prompt(workflow_template, issue, attempt)
+  if prompt failed:
+    app_server.stop_session(session)
+    run_hook_best_effort("after_run", workspace.path)
+    fail_worker("prompt error")
 
-  while true:
-    prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
-    if prompt failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("prompt error")
+  turn_result = app_server.run_turn(
+    session=session,
+    prompt=prompt,
+    output_schema=semantic_worker_outcome_schema,
+    issue=issue,
+    on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
+  )
 
-    turn_result = app_server.run_turn(
-      session=session,
-      prompt=prompt,
-      issue=issue,
-      on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
-    )
+  if turn_result failed or structured_outcome(turn_result) is invalid:
+    app_server.stop_session(session)
+    run_hook_best_effort("after_run", workspace.path)
+    fail_worker("agent turn or outcome error")
 
-    if turn_result failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("agent turn error")
-
-    refreshed_issue = tracker.fetch_issue_states_by_ids([issue.id])
-    if refreshed_issue failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("issue state refresh error")
-
-    issue = refreshed_issue[0] or issue
-
-    if issue.state is not active:
-      break
-
-    if turn_number >= max_turns:
-      break
-
-    turn_number = turn_number + 1
+  outcome = structured_outcome(turn_result)
 
   app_server.stop_session(session)
   run_hook_best_effort("after_run", workspace.path)
 
-  exit_normal()
+  exit_normal(outcome)
 ```
 
 ### 16.6 Worker Exit and Retry Handling
 
 ```text
-on_worker_exit(issue_id, reason, state):
+on_worker_exit(issue_id, reason, outcome, state):
   running_entry = state.running.remove(issue_id)
   state = add_runtime_seconds_to_totals(state, running_entry)
 
   if reason == normal:
-    state.completed.add(issue_id)  # bookkeeping only
-    state = schedule_retry(state, issue_id, 1, {
-      identifier: running_entry.identifier,
-      delay_type: continuation
-    })
+    transition_result = state_manager.request(
+      transition_intent_from_worker(running_entry.issue, outcome)
+    )
+
+    if transition_result is ok or noop:
+      state.completed.add(issue_id)  # bookkeeping only
+      if effective_state(transition_result) is dispatch-eligible:
+        state = schedule_retry(state, issue_id, 1, {
+          identifier: running_entry.identifier,
+          delay_type: continuation
+        })
+      else:
+        state.claimed.remove(issue_id)
+    else:
+      state = release_or_retry_without_projection(state, running_entry, transition_result)
   else:
     state = schedule_retry(state, issue_id, next_attempt_from(running_entry), {
       identifier: running_entry.identifier,
@@ -2013,7 +2258,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Invalid YAML front matter returns typed error
 - Front matter non-map returns typed error
 - Config defaults apply when OPTIONAL values are missing
-- `tracker.kind` validation enforces currently supported kind (`linear`)
+- `tracker.kind` validation enforces currently supported kinds (`linear`, `github`)
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
 - `~` path expansion works
@@ -2049,6 +2294,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Issue state refresh by ID returns minimal normalized issues
 - Issue state refresh query uses GraphQL ID typing (`[ID!]`) as specified in Section 11.2
 - Error mapping for request errors, non-200, GraphQL errors, malformed payloads
+- State projection preserves non-workflow labels and produces exactly one canonical workflow state
+- Projection returns applied, already-applied, conflict, and stage-specific partial failure distinctly
+- Read-after-write detects an unverified or concurrently changed projection
+- Duplicate delivery does not duplicate an automated transition comment
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
@@ -2059,12 +2308,21 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Non-active state stops running agent without workspace cleanup
 - Terminal state stops running agent and cleans workspace
 - Reconciliation with no running issues is a no-op
-- Normal worker exit schedules a short continuation retry (attempt 1)
+- Normal worker exit submits its semantic outcome and schedules a short continuation retry only when
+  the verified effective state remains dispatch-eligible
 - Abnormal worker exit increments retries with 10s-based exponential backoff
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
 - Slot exhaustion requeues retries with explicit error reason
+- The pure state-policy matrix covers every allowed and forbidden edge, item kind, and review budget
+- `Rework -> Reworking -> Review` remains distinct from implementation progress
+- Same-target observations are no-ops; stale outcomes cannot regress terminal state
+- Missing or multiple canonical states quarantine the item without dispatch
+- Poll and webhook races are serialized through one transition request mailbox
+- Duplicate and out-of-order intents are idempotent by transition and causation IDs
+- A process stop after each journal phase replays to at most one projection, one automated comment,
+  and one worker dispatch
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
   limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
@@ -2097,6 +2355,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   - top-level GraphQL `errors` produce `success=false` while preserving the GraphQL body
   - invalid arguments, missing auth, and transport failures return structured failure payloads
   - unsupported tool names still fail without stalling the session
+  - state-changing mutations are rejected from worker sessions
+- Worker output schema accepts every semantic outcome and rejects target-state output or malformed
+  evidence
+- Worker launch strips tracker-write credentials and uses an isolated `GH_CONFIG_DIR`
 
 ### 17.6 Observability
 
@@ -2125,6 +2387,8 @@ network access, or external service permissions are unavailable.
 
 - A real tracker smoke test can be run with valid credentials supplied by `LINEAR_API_KEY` or a
   documented local bootstrap mechanism (for example `~/.linear_api_key`).
+- Disposable GitHub and Linear trackers exercise the full workflow lifecycle, request-label
+  consumption, non-workflow label preservation, restart replay, and credential boundary.
 - Real integration tests SHOULD use isolated test identifiers/workspaces and clean up tracker
   artifacts when practical.
 - A skipped real-integration test SHOULD be reported as skipped, not silently treated as passed.
@@ -2146,6 +2410,13 @@ Use the same validation profiles as Section 17:
 - Typed config layer with defaults and `$` resolution
 - Dynamic `WORKFLOW.md` watch/reload/re-apply for config and prompt
 - Polling orchestrator with single-authority mutable state
+- Pure workflow state policy and serialized state-manager request API
+- Durable single-writer transition journal with restart replay
+- Tracker broker for verified state projections and idempotent automated comments
+- Structured worker outcomes that never select a target workflow state
+- Tracker-visible `In Progress`, `Reviewing`, and `Reworking` execution states
+- Human request-label validation and canonical-state drift reconciliation
+- Worker/broker credential isolation
 - Issue tracker client with candidate fetch + state refresh + terminal fetch
 - Workspace manager with sanitized per-issue workspaces
 - Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
@@ -2164,19 +2435,21 @@ Use the same validation profiles as Section 17:
 
 - HTTP server extension honors CLI `--port` over `server.port`, uses a safe default bind host, and
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
-- `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
-  app-server session using configured Symphony auth.
+- `linear_graphql` client-side tool extension exposes read-only Linear GraphQL queries through the
+  app-server session using configured Symphony read auth.
 - TODO: Persist retry queue and session metadata across process restarts.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.
-- TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
-  of only via agent tools.
 - TODO: Add pluggable issue tracker adapters beyond Linear.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)
 
 - Run the `Real Integration Profile` from Section 17.8 with valid credentials and network access.
 - Verify hook execution and workflow path resolution on the target host OS/shell environment.
+- Roll out only through `legacy -> shadow -> authoritative`; never enable dual-write.
+- Before promotion, require 100% shadow-policy agreement for at least seven days and 100 transitions,
+  then verify a disposable canary, hold a production allowlist for at least 72 hours and 50
+  transitions, and advance through 10% -> 50% -> 100% with at least 24 hours at each stage.
 - If the OPTIONAL HTTP server is shipped, verify the configured port behavior and loopback/default
   bind expectations on the target environment.
 

@@ -17,6 +17,7 @@ defmodule SymphonyElixir.GitHub.Client do
     "Human Review" => "sym:human-review",
     "Waiting" => "sym:waiting",
     "Rework" => "sym:rework",
+    "Reworking" => "sym:reworking",
     "Merging" => "sym:merging",
     "Done" => "sym:done",
     "Canceled" => "sym:canceled",
@@ -31,10 +32,29 @@ defmodule SymphonyElixir.GitHub.Client do
     "sym:human-review" => {"2da44e", "Waiting for human review or approval."},
     "sym:waiting" => {"6e7781", "Blocked until prerequisite Symphony work is complete."},
     "sym:rework" => {"fb8f44", "Review requested changes for Symphony to address."},
+    "sym:reworking" => {"d876e3", "Symphony is actively addressing review findings."},
     "sym:merging" => {"d4c5f9", "Approved work is being merged or finalized."},
     "sym:done" => {"8250df", "Completed successfully."},
     "sym:canceled" => {"8c959f", "Closed without completion."},
     "sym:duplicate" => {"8c959f", "Duplicate work item."}
+  }
+  @request_labels %{
+    "sym:request-planned" => "Planned",
+    "sym:request-rework" => "Rework",
+    "sym:request-merging" => "Merging",
+    "sym:request-human-review" => "Human Review",
+    "sym:request-canceled" => "Canceled",
+    "sym:request-duplicate" => "Duplicate",
+    "sym:request-reopen" => "Human Review"
+  }
+  @request_label_meta %{
+    "sym:request-planned" => {"bfd4ff", "Request that Symphony move this item to Planned."},
+    "sym:request-rework" => {"fb8f44", "Request that Symphony move this item to Rework."},
+    "sym:request-merging" => {"d4c5f9", "Request that Symphony move this item to Merging."},
+    "sym:request-human-review" => {"2da44e", "Request that Symphony move this item to Human Review."},
+    "sym:request-canceled" => {"8c959f", "Request that Symphony cancel this item."},
+    "sym:request-duplicate" => {"8c959f", "Request that Symphony mark this item duplicate."},
+    "sym:request-reopen" => {"bfd4ff", "Request that Symphony reopen this terminal item for human review."}
   }
   @default_codex_review_bot_logins [
     "chatgpt-codex-connector",
@@ -45,6 +65,24 @@ defmodule SymphonyElixir.GitHub.Client do
 
   @spec default_state_labels() :: map()
   def default_state_labels, do: @default_state_labels
+
+  @spec request_labels() :: map()
+  def request_labels, do: @request_labels
+
+  @spec managed_label_metadata() :: map()
+  def managed_label_metadata, do: Map.merge(@label_meta, @request_label_meta)
+
+  @spec classify_managed_label(String.t()) :: {:request, String.t()} | {:state, String.t()} | :unmanaged
+  def classify_managed_label(label) when is_binary(label) do
+    normalized = normalize_label(label)
+
+    case Enum.find(@request_labels, fn {request_label, _state} -> normalize_label(request_label) == normalized end) do
+      {_request_label, state} -> {:request, state}
+      nil -> if state = state_for_label(label), do: {:state, state}, else: :unmanaged
+    end
+  end
+
+  def classify_managed_label(_label), do: :unmanaged
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
@@ -85,6 +123,45 @@ defmodule SymphonyElixir.GitHub.Client do
     with {:ok, number, _kind} <- parse_issue_id(issue_id),
          {:ok, _body} <- request(:post, "/issues/#{number}/comments", json: %{body: body}) do
       :ok
+    end
+  end
+
+  @doc """
+  Creates a broker-owned comment once, using a durable marker embedded in the
+  comment body to make journal replay idempotent.
+  """
+  @spec create_comment_once(String.t(), String.t(), String.t()) :: :applied | :already_applied | {:error, term()}
+  def create_comment_once(issue_id, body, marker)
+      when is_binary(issue_id) and is_binary(body) and is_binary(marker) and marker != "" do
+    with {:ok, number, _kind} <- parse_issue_id(issue_id),
+         {:ok, comments} <- fetch_all_comments(number) do
+      if comment_marker_present?(comments, marker) do
+        :already_applied
+      else
+        create_marked_comment(number, body, marker)
+      end
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def create_comment_once(_issue_id, _body, _marker), do: {:error, :invalid_comment_marker}
+
+  defp fetch_all_comments(number, page \\ 1, acc \\ []) do
+    params = if page == 1, do: %{per_page: 100}, else: %{per_page: 100, page: page}
+
+    case request(:get, "/issues/#{number}/comments", params: params) do
+      {:ok, comments} when is_list(comments) and length(comments) == 100 ->
+        fetch_all_comments(number, page + 1, acc ++ comments)
+
+      {:ok, comments} when is_list(comments) ->
+        {:ok, acc ++ comments}
+
+      {:ok, _payload} ->
+        {:error, :github_unexpected_comments_payload}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -144,6 +221,64 @@ defmodule SymphonyElixir.GitHub.Client do
       _ -> {:error, :github_state_update_failed}
     end
   end
+
+  @doc """
+  Projects a state selected by Symphony onto GitHub.
+
+  The expected state is checked against a fresh snapshot before the label set
+  is replaced. Non-Symphony labels are preserved, while stale state labels and
+  one-shot `sym:request-*` labels are consumed. The replacement is read back so
+  callers can distinguish a verified application from a partial external
+  effect.
+  """
+  @spec apply_state_projection(String.t(), String.t() | nil | :any, String.t()) ::
+          {:applied, map()}
+          | {:already_applied, map()}
+          | {:conflict, map()}
+          | {:partial_failure, map()}
+  def apply_state_projection(issue_id, expected_state, target_state)
+      when is_binary(issue_id) and (is_binary(expected_state) or is_nil(expected_state) or expected_state == :any) and
+             is_binary(target_state) do
+    with {:ok, number, _kind} <- parse_issue_id(issue_id),
+         target_label when is_binary(target_label) <- label_for_state(target_state),
+         {:ok, raw_issue} <- request(:get, "/issues/#{number}") do
+      labels = extract_labels(raw_issue)
+
+      case projection_snapshot(issue_id, labels) do
+        {:ok, snapshot} ->
+          number
+          |> apply_verified_projection(expected_state, target_state, target_label, snapshot)
+          |> finalize_projection_open_state(number, target_state)
+
+        {:error, reason} ->
+          {:conflict, %{issue_id: issue_id, expected_state: expected_state, reason: reason, labels: labels}}
+      end
+    else
+      nil -> {:partial_failure, %{stage: :validate, reason: {:unknown_github_state, target_state}}}
+      {:error, reason} -> {:partial_failure, %{stage: :read, reason: reason}}
+      other -> {:partial_failure, %{stage: :validate, reason: other}}
+    end
+  end
+
+  @doc """
+  Merges a pull request only when its live head matches the orchestrator's
+  expected head OID. The guarded GitHub merge request is brokered here so a
+  worker never needs tracker write credentials.
+  """
+  @spec merge_pull_request(String.t(), String.t()) :: {:applied, map()} | {:conflict, map()} | {:error, map()}
+  def merge_pull_request(issue_id, expected_head_oid)
+      when is_binary(issue_id) and is_binary(expected_head_oid) and expected_head_oid != "" do
+    with {:ok, number, :pull_request} <- parse_issue_id(issue_id),
+         {:ok, pull_request} <- request(:get, "/pulls/#{number}") do
+      apply_guarded_merge(issue_id, number, expected_head_oid, pull_request)
+    else
+      {:ok, _number, kind} -> {:error, %{stage: :validate, reason: {:unsupported_github_issue_kind, kind}}}
+      {:error, reason} -> {:error, %{stage: :read, reason: reason}}
+    end
+  end
+
+  def merge_pull_request(issue_id, expected_head_oid),
+    do: {:error, %{stage: :validate, reason: {:invalid_merge_request, issue_id, expected_head_oid}}}
 
   @spec create_pull_request_for_issue(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
   def create_pull_request_for_issue(%Issue{kind: :issue} = issue) do
@@ -269,13 +404,16 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp fetch_issue_by_id(issue_id) do
     with {:ok, number, expected_kind} <- parse_issue_id(issue_id),
-         {:ok, raw_issue} <- request(:get, "/issues/#{number}") do
-      normalize_issue(raw_issue, fetch_pull_data(number, expected_kind, raw_issue))
+         {:ok, raw_issue} <- request(:get, "/issues/#{number}"),
+         {:ok, pull_data} <- fetch_pull_data(number, expected_kind, raw_issue) do
+      normalize_issue(raw_issue, pull_data)
     end
   end
 
   defp fetch_pull_data(number, expected_kind, raw_issue) do
-    if pull_data_required?(expected_kind, raw_issue), do: fetch_pull(number), else: nil
+    if pull_data_required?(expected_kind, raw_issue),
+      do: request(:get, "/pulls/#{number}"),
+      else: {:ok, nil}
   end
 
   defp pull_data_required?(expected_kind, raw_issue) do
@@ -333,7 +471,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
     case state_from_labels(labels) do
       {:ok, state} ->
-        state = state || fallback_closed_state(raw_issue, pull_data)
+        state = state_for_physical_item_state(raw_issue, pull_data, state)
 
         if is_nil(state) do
           :skip
@@ -358,7 +496,8 @@ defmodule SymphonyElixir.GitHub.Client do
                number: number,
                repository: github_repository(),
                node_id: raw_issue["node_id"],
-               merged: pull_merged?(pull_data)
+               merged: pull_merged?(pull_data),
+               head_oid: get_in(pull_data || %{}, ["head", "sha"])
              },
              labels: labels,
              assigned_to_worker: true,
@@ -391,14 +530,20 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp fallback_closed_state(%{"state" => "closed"} = raw_issue, pull_data) do
-    cond do
-      issue_kind(raw_issue) == :pull_request and pull_merged?(pull_data) -> "Done"
-      issue_kind(raw_issue) == :pull_request -> "Canceled"
-      true -> "Done"
-    end
+    if issue_kind(raw_issue) == :pull_request and pull_merged?(pull_data),
+      do: "Done",
+      else: "Canceled"
   end
 
   defp fallback_closed_state(_raw_issue, _pull_data), do: nil
+
+  defp state_for_physical_item_state(%{"state" => "closed"} = raw_issue, pull_data, state) do
+    if terminal_issue_state_reason(state),
+      do: state,
+      else: fallback_closed_state(raw_issue, pull_data)
+  end
+
+  defp state_for_physical_item_state(_raw_issue, _pull_data, state), do: state
 
   defp sync_labeled_webhook(_kind, %{"sender" => %{"login" => "github-actions[bot]"}}), do: :ok
 
@@ -621,6 +766,172 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  defp projection_snapshot(issue_id, labels) do
+    case state_from_labels(labels) do
+      {:ok, state} -> {:ok, %{issue_id: issue_id, state: state, labels: labels}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp comment_marker_present?(comments, marker) when is_list(comments) do
+    Enum.any?(comments, fn
+      %{"body" => body} when is_binary(body) -> String.contains?(body, marker)
+      _ -> false
+    end)
+  end
+
+  defp comment_marker_present?(_comments, _marker), do: false
+
+  defp create_marked_comment(number, body, marker) do
+    marked_body = if String.contains?(body, marker), do: body, else: body <> "\n\n" <> marker
+
+    case request(:post, "/issues/#{number}/comments", json: %{body: marked_body}) do
+      {:ok, _body} -> :applied
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp apply_guarded_merge(issue_id, _number, _expected_head_oid, %{"merged" => true} = pull_request) do
+    {:applied,
+     %{
+       issue_id: issue_id,
+       merged: true,
+       already_applied: true,
+       head_oid: get_in(pull_request, ["head", "sha"]),
+       merge_commit_sha: pull_request["merge_commit_sha"]
+     }}
+  end
+
+  defp apply_guarded_merge(issue_id, number, expected_head_oid, pull_request) do
+    current_head_oid = get_in(pull_request, ["head", "sha"])
+
+    if current_head_oid == expected_head_oid do
+      case request(:put, "/pulls/#{number}/merge", json: %{sha: expected_head_oid, merge_method: "squash"}) do
+        {:ok, %{"merged" => true} = body} ->
+          {:applied,
+           %{
+             issue_id: issue_id,
+             merged: true,
+             already_applied: false,
+             head_oid: expected_head_oid,
+             merge_commit_sha: body["sha"]
+           }}
+
+        {:ok, body} ->
+          {:error, %{stage: :merge, reason: {:github_merge_rejected, body}}}
+
+        {:error, {:github_api_status, 409, body}} ->
+          {:conflict,
+           %{
+             issue_id: issue_id,
+             expected_head_oid: expected_head_oid,
+             current_head_oid: current_head_oid,
+             reason: body
+           }}
+
+        {:error, reason} ->
+          {:error, %{stage: :merge, reason: reason}}
+      end
+    else
+      {:conflict, %{issue_id: issue_id, expected_head_oid: expected_head_oid, current_head_oid: current_head_oid}}
+    end
+  end
+
+  defp apply_verified_projection(number, expected_state, target_state, target_label, snapshot) do
+    desired_labels = projected_labels(snapshot.labels, target_label)
+
+    cond do
+      expected_state_matches?(target_state, snapshot.state) and
+          same_label_set?(snapshot.labels, desired_labels) ->
+        {:already_applied, %{snapshot | state: target_state, labels: desired_labels}}
+
+      expected_state_matches?(target_state, snapshot.state) ->
+        write_and_verify_projection(number, target_state, target_label, desired_labels, snapshot)
+
+      expected_state_matches?(expected_state, snapshot.state) ->
+        write_and_verify_projection(number, target_state, target_label, desired_labels, snapshot)
+
+      true ->
+        {:conflict, Map.merge(snapshot, %{expected_state: expected_state, target_state: target_state})}
+    end
+  end
+
+  defp write_and_verify_projection(number, target_state, target_label, desired_labels, snapshot) do
+    with :ok <- ensure_label(target_label),
+         {:ok, _body} <- request(:put, "/issues/#{number}/labels", json: %{labels: desired_labels}),
+         {:ok, verified_labels} <- current_labels(number),
+         true <- same_label_set?(verified_labels, desired_labels),
+         {:ok, observed_state} <- state_from_labels(verified_labels),
+         true <- expected_state_matches?(target_state, observed_state) do
+      {:applied, %{snapshot | state: target_state, labels: verified_labels}}
+    else
+      {:error, reason} ->
+        {:partial_failure, %{stage: projection_failure_stage(reason), reason: reason, before: snapshot}}
+
+      false ->
+        {:partial_failure, %{stage: :verify, reason: :github_projection_mismatch, before: snapshot}}
+    end
+  end
+
+  defp finalize_projection_open_state({status, metadata}, number, target_state)
+       when status in [:applied, :already_applied] do
+    with :ok <- sync_issue_open_state(number, target_state),
+         {:ok, issue} <- request(:get, "/issues/#{number}"),
+         :ok <- verify_projected_open_state(issue, target_state) do
+      {status, Map.put(metadata, :open_state, issue["state"])}
+    else
+      {:error, reason} ->
+        {:partial_failure, %{stage: :open_state_projection, reason: reason, projection: metadata}}
+    end
+  end
+
+  defp finalize_projection_open_state(result, _number, _target_state), do: result
+
+  defp verify_projected_open_state(issue, target_state) do
+    expected_state = if terminal_issue_state_reason(target_state), do: "closed", else: "open"
+
+    if issue["state"] == expected_state,
+      do: :ok,
+      else: {:error, {:github_open_state_mismatch, expected_state, issue["state"]}}
+  end
+
+  defp projected_labels(current_labels, target_label) do
+    managed_labels =
+      state_label_map()
+      |> Map.values()
+      |> Kernel.++(Map.keys(@request_labels))
+      |> Enum.map(&normalize_label/1)
+      |> MapSet.new()
+
+    current_labels
+    |> Enum.reject(&MapSet.member?(managed_labels, normalize_label(&1)))
+    |> Kernel.++([target_label])
+    |> Enum.uniq_by(&normalize_label/1)
+  end
+
+  defp expected_state_matches?(:any, _current_state), do: true
+  defp expected_state_matches?(nil, nil), do: true
+
+  defp expected_state_matches?(expected_state, current_state)
+       when is_binary(expected_state) and is_binary(current_state),
+       do: normalize_state(expected_state) == normalize_state(current_state)
+
+  defp expected_state_matches?(_expected_state, _current_state), do: false
+
+  defp same_label_set?(left, right) do
+    normalize_label_set(left) == normalize_label_set(right)
+  end
+
+  defp normalize_label_set(labels) do
+    labels
+    |> Enum.map(&normalize_label/1)
+    |> MapSet.new()
+  end
+
+  defp projection_failure_stage({:github_api_status, _, _}), do: :projection_write_or_verify
+  defp projection_failure_stage({:github_api_request, _}), do: :projection_write_or_verify
+  defp projection_failure_stage(_reason), do: :prepare
+
   defp fetch_sub_issues(number) when is_integer(number) do
     case request(:get, "/issues/#{number}/sub_issues", params: %{per_page: 100}) do
       {:ok, sub_issues} when is_list(sub_issues) ->
@@ -652,15 +963,15 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp remove_state_labels(number, current_labels, target_label, remove_target?) do
-    state_label_set =
-      state_label_map()
-      |> Map.values()
+    managed_label_set =
+      (Map.values(state_label_map()) ++
+         Map.values(Config.settings!().state_manager.human_intent_labels))
       |> Enum.map(&normalize_label/1)
       |> MapSet.new()
 
     current_labels
     |> Enum.filter(fn label ->
-      state_label? = MapSet.member?(state_label_set, normalize_label(label))
+      state_label? = MapSet.member?(managed_label_set, normalize_label(label))
       target_label? = not is_nil(target_label) and normalize_label(label) == normalize_label(target_label)
       state_label? and (remove_target? or not target_label?)
     end)
@@ -723,7 +1034,7 @@ defmodule SymphonyElixir.GitHub.Client do
         :ok
 
       {:error, {:github_api_status, 404, _body}} ->
-        {color, description} = Map.get(@label_meta, label, {"ededed", "Symphony workflow state."})
+        {color, description} = Map.get(managed_label_metadata(), label, {"ededed", "Symphony workflow state."})
 
         case request(:post, "/labels", json: %{name: label, color: color, description: description}) do
           {:ok, _body} -> :ok
@@ -1332,7 +1643,7 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp request(method, path, opts \\ []) when method in [:get, :post, :patch, :delete] and is_binary(path) do
+  defp request(method, path, opts \\ []) when method in [:get, :post, :put, :patch, :delete] and is_binary(path) do
     with {:ok, tracker} <- github_tracker_config(),
          {:ok, headers} <- github_headers(tracker) do
       request_opts =

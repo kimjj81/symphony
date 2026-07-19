@@ -3,6 +3,328 @@ defmodule SymphonyElixir.GitHubClientTest do
 
   alias SymphonyElixir.GitHub.Client
 
+  test "exposes Reworking and operator request label metadata" do
+    assert Client.default_state_labels()["Reworking"] == "sym:reworking"
+    assert Client.request_labels()["sym:request-reopen"] == "Human Review"
+
+    assert {_, "Request that Symphony reopen this terminal item for human review."} =
+             Client.managed_label_metadata()["sym:request-reopen"]
+
+    assert Client.classify_managed_label("sym:request-rework") == {:request, "Rework"}
+    assert Client.classify_managed_label("sym:reworking") == {:state, "Reworking"}
+  end
+
+  test "atomically projects a state while preserving non-state labels and consuming requests" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      json = Keyword.get(opts, :json)
+      send(test_pid, {:github_projection_request, method, path, json})
+
+      case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/issues/42"} ->
+          github_response(
+            200,
+            raw_issue(42, "Projection", "", [
+              %{"name" => "enhancement"},
+              %{"name" => "sym:planned"},
+              %{"name" => "sym:request-merging"}
+            ])
+          )
+
+        {:get, "/repos/studiojin-dev/myven/labels/sym%3Amerging"} ->
+          github_response(200, %{"name" => "sym:merging"})
+
+        {:put, "/repos/studiojin-dev/myven/issues/42/labels"} ->
+          assert json == %{labels: ["enhancement", "sym:merging"]}
+          github_response(200, Enum.map(json.labels, &%{"name" => &1}))
+
+        {:get, "/repos/studiojin-dev/myven/issues/42/labels"} ->
+          github_response(200, [%{"name" => "enhancement"}, %{"name" => "sym:merging"}])
+      end
+    end)
+
+    assert {:applied, %{state: "Merging", labels: ["enhancement", "sym:merging"]}} =
+             Client.apply_state_projection("github:issue:42", "Planned", "Merging")
+
+    assert_receive {:github_projection_request, :put, "/repos/studiojin-dev/myven/issues/42/labels", %{labels: ["enhancement", "sym:merging"]}}
+  end
+
+  test "returns conflict without writing when expected state is stale" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      send(test_pid, {:github_projection_request, method, path})
+      github_response(200, raw_issue(43, "Conflict", "", [%{"name" => "sym:done"}]))
+    end)
+
+    assert {:conflict, %{state: "Done", expected_state: "Review", target_state: "Human Review"}} =
+             Client.apply_state_projection("github:issue:43", "Review", "Human Review")
+
+    refute_receive {:github_projection_request, :put, _}, 50
+  end
+
+  test "returns already_applied without rewriting a verified projection" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      send(test_pid, {:github_projection_request, method, path})
+      github_response(200, raw_issue(44, "Noop", "", [%{"name" => "bug"}, %{"name" => "sym:reviewing"}]))
+    end)
+
+    assert {:already_applied, %{state: "Reviewing", labels: ["bug", "sym:reviewing"]}} =
+             Client.apply_state_projection("github:pr:44", "Reviewing", "Reviewing")
+
+    refute_receive {:github_projection_request, :put, _}, 50
+  end
+
+  test "closes an open issue when projecting Canceled" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    issue_path = "/repos/studiojin-dev/myven/issues/49"
+
+    stub_github_requests(self(), [
+      {:get, issue_path, github_response(200, raw_issue(49, "Cancel", "", [%{"name" => "sym:human-review"}]))},
+      {:get, "/repos/studiojin-dev/myven/labels/sym%3Acanceled", github_response(200, %{"name" => "sym:canceled"})},
+      {:put, "#{issue_path}/labels", github_response(200, [%{"name" => "sym:canceled"}])},
+      {:get, "#{issue_path}/labels", github_response(200, [%{"name" => "sym:canceled"}])},
+      {:get, issue_path, github_response(200, %{"state" => "open"})},
+      {:get, "#{issue_path}/sub_issues", github_response(200, [])},
+      {:patch, issue_path, github_response(200, %{"state" => "closed", "state_reason" => "not_planned"})},
+      {:get, issue_path, github_response(200, %{"state" => "closed", "state_reason" => "not_planned"})}
+    ])
+
+    assert {:applied, %{state: "Canceled", open_state: "closed"}} =
+             Client.apply_state_projection("github:issue:49", "Human Review", "Canceled")
+
+    assert_receive {:github_request, :patch, ^issue_path, nil, %{state: "closed", state_reason: "not_planned"}}
+    assert_github_responses_consumed()
+  end
+
+  test "closes an open issue when projecting Done" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    issue_path = "/repos/studiojin-dev/myven/issues/57"
+
+    stub_github_requests(self(), [
+      {:get, issue_path, github_response(200, raw_issue(57, "Complete", "", [%{"name" => "sym:merging"}]))},
+      {:get, "/repos/studiojin-dev/myven/labels/sym%3Adone", github_response(200, %{"name" => "sym:done"})},
+      {:put, "#{issue_path}/labels", github_response(200, [%{"name" => "sym:done"}])},
+      {:get, "#{issue_path}/labels", github_response(200, [%{"name" => "sym:done"}])},
+      {:get, issue_path, github_response(200, %{"state" => "open"})},
+      {:get, "#{issue_path}/sub_issues", github_response(200, [])},
+      {:patch, issue_path, github_response(200, %{"state" => "closed", "state_reason" => "completed"})},
+      {:get, issue_path, github_response(200, %{"state" => "closed", "state_reason" => "completed"})}
+    ])
+
+    assert {:applied, %{state: "Done", open_state: "closed"}} =
+             Client.apply_state_projection("github:issue:57", "Merging", "Done")
+
+    assert_receive {:github_request, :patch, ^issue_path, nil, %{state: "closed", state_reason: "completed"}}
+    assert_github_responses_consumed()
+  end
+
+  test "reopens a closed issue when consuming request-reopen into Human Review" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    issue_path = "/repos/studiojin-dev/myven/issues/50"
+    labels_path = "#{issue_path}/labels"
+
+    stub_github_requests(self(), [
+      {:get, issue_path,
+       github_response(
+         200,
+         raw_issue(
+           50,
+           "Reopen",
+           "",
+           [%{"name" => "sym:canceled"}, %{"name" => "sym:request-reopen"}],
+           "closed"
+         )
+       )},
+      {:get, "/repos/studiojin-dev/myven/labels/sym%3Ahuman-review", github_response(200, %{"name" => "sym:human-review"})},
+      {:put, "#{issue_path}/labels", github_response(200, [%{"name" => "sym:human-review"}])},
+      {:get, "#{issue_path}/labels", github_response(200, [%{"name" => "sym:human-review"}])},
+      {:get, issue_path, github_response(200, %{"state" => "closed", "state_reason" => "not_planned"})},
+      {:patch, issue_path, github_response(200, %{"state" => "open"})},
+      {:get, issue_path, github_response(200, %{"state" => "open"})}
+    ])
+
+    assert {:applied, %{state: "Human Review", labels: ["sym:human-review"], open_state: "open"}} =
+             Client.apply_state_projection("github:issue:50", "Canceled", "Human Review")
+
+    assert_receive {:github_request, :put, ^labels_path, nil, %{labels: ["sym:human-review"]}}
+    assert_receive {:github_request, :patch, ^issue_path, nil, %{state: "open"}}
+    assert_github_responses_consumed()
+  end
+
+  test "merges a pull request only at the expected head OID" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      json = Keyword.get(opts, :json)
+      send(test_pid, {:github_merge_request, method, path, json})
+
+      case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/pulls/45"} ->
+          github_response(200, %{"merged" => false, "head" => %{"sha" => "expected-head"}})
+
+        {:put, "/repos/studiojin-dev/myven/pulls/45/merge"} ->
+          assert json == %{sha: "expected-head", merge_method: "squash"}
+          github_response(200, %{"merged" => true, "sha" => "merge-sha"})
+      end
+    end)
+
+    assert {:applied,
+            %{
+              issue_id: "github:pr:45",
+              merged: true,
+              already_applied: false,
+              head_oid: "expected-head",
+              merge_commit_sha: "merge-sha"
+            }} = Client.merge_pull_request("github:pr:45", "expected-head")
+  end
+
+  test "rejects a merge when the live pull request head changed" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      send(test_pid, {:github_merge_request, method, path})
+      github_response(200, %{"merged" => false, "head" => %{"sha" => "new-head"}})
+    end)
+
+    assert {:conflict,
+            %{
+              issue_id: "github:pr:46",
+              expected_head_oid: "stale-head",
+              current_head_oid: "new-head"
+            }} = Client.merge_pull_request("github:pr:46", "stale-head")
+
+    refute_receive {:github_merge_request, :put, _}, 50
+  end
+
+  test "creates a transition comment once using its journal marker" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    marker = "<!-- sym-transition:transition-47 -->"
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      json = Keyword.get(opts, :json)
+      send(test_pid, {:github_comment_request, method, path, json})
+
+      case {method, path} do
+        {:get, "/repos/studiojin-dev/myven/issues/47/comments"} ->
+          github_response(200, [])
+
+        {:post, "/repos/studiojin-dev/myven/issues/47/comments"} ->
+          assert json == %{body: "상태를 전이했습니다.\n\n#{marker}"}
+          github_response(201, %{"id" => 1, "body" => json.body})
+      end
+    end)
+
+    assert :applied = Client.create_comment_once("github:issue:47", "상태를 전이했습니다.", marker)
+  end
+
+  test "skips an already-applied transition comment marker" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    marker = "<!-- sym-transition:transition-48 -->"
+    test_pid = self()
+
+    Application.put_env(:symphony_elixir, :github_request_fun, fn opts ->
+      method = Keyword.fetch!(opts, :method)
+      path = opts |> Keyword.fetch!(:url) |> URI.parse() |> Map.fetch!(:path)
+      send(test_pid, {:github_comment_request, method, path})
+      github_response(200, [%{"id" => 1, "body" => "기존 댓글\n\n#{marker}"}])
+    end)
+
+    assert :already_applied = Client.create_comment_once("github:pr:48", "중복되면 안 됩니다.", marker)
+    refute_receive {:github_comment_request, :post, _}, 50
+  end
+
   test "normalizes GitHub issues with Symphony state labels" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",
@@ -55,6 +377,110 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert issue.identifier == "PR #7"
     assert issue.kind == :pull_request
     assert issue.state == "Review"
+  end
+
+  test "preserves explicit terminal labels on closed GitHub issues" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    for {number, label, state} <- [
+          {51, "sym:done", "Done"},
+          {52, "sym:canceled", "Canceled"},
+          {53, "sym:duplicate", "Duplicate"}
+        ] do
+      assert {:ok, issue} =
+               Client.normalize_issue_for_test(raw_issue(number, "Terminal #{state}", "", [%{"name" => label}], "closed"))
+
+      assert issue.state == state
+    end
+  end
+
+  test "normalizes a closed nonterminal GitHub issue as Canceled" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    assert {:ok, issue} =
+             Client.normalize_issue_for_test(raw_issue(54, "Closed without terminal intent", "", [%{"name" => "sym:review"}], "closed"))
+
+    assert issue.state == "Canceled"
+  end
+
+  test "normalizes a closed pull request without a merge as Canceled" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    issue =
+      55
+      |> raw_pull_request_issue([%{"name" => "sym:review"}])
+      |> Map.put("state", "closed")
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/55", github_response(200, issue)},
+      {:get, "/repos/studiojin-dev/myven/pulls/55", github_response(200, %{"merged" => false})}
+    ])
+
+    assert {:ok, [%{state: "Canceled"}]} = Client.fetch_issue_states_by_ids(["github:pr:55"])
+    assert_github_responses_consumed()
+  end
+
+  test "normalizes a merged pull request as Done" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    issue =
+      56
+      |> raw_pull_request_issue([%{"name" => "sym:review"}])
+      |> Map.put("state", "closed")
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/56", github_response(200, issue)},
+      {:get, "/repos/studiojin-dev/myven/pulls/56", github_response(200, %{"merged" => true})}
+    ])
+
+    assert {:ok, [%{state: "Done"}]} = Client.fetch_issue_states_by_ids(["github:pr:56"])
+    assert_github_responses_consumed()
+  end
+
+  test "fails closed when pull request detail cannot provide the live head" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    issue = raw_pull_request_issue(58, [%{"name" => "sym:reviewing"}])
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/58", github_response(200, issue)},
+      {:get, "/repos/studiojin-dev/myven/pulls/58", github_response(503, %{"message" => "unavailable"})}
+    ])
+
+    assert {:error, {:github_api_status, 503, %{"message" => "unavailable"}}} =
+             Client.fetch_issue_states_by_ids(["github:pr:58"])
+
+    assert_github_responses_consumed()
   end
 
   test "collects GitHub candidate issues by locally filtering Symphony labels" do

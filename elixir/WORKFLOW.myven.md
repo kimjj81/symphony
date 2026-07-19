@@ -11,6 +11,7 @@ tracker:
     - Review
     - Reviewing
     - Rework
+    - Reworking
     - Merging
   terminal_states:
     - Done
@@ -25,10 +26,22 @@ tracker:
     Human Review: sym:human-review
     Waiting: sym:waiting
     Rework: sym:rework
+    Reworking: sym:reworking
     Merging: sym:merging
     Done: sym:done
     Canceled: sym:canceled
     Duplicate: sym:duplicate
+state_manager:
+  mode: authoritative
+  # journal_path defaults to the workflow-scoped path under the host XDG state directory.
+  human_intent_labels:
+    Planned: sym:request-planned
+    Rework: sym:request-rework
+    Merging: sym:request-merging
+    Human Review: sym:request-human-review
+    Canceled: sym:request-canceled
+    Duplicate: sym:request-duplicate
+    Reopen: sym:request-reopen
 polling:
   interval_ms: 30000
 workspace:
@@ -124,9 +137,6 @@ hooks:
       printf "WARN: skipped Myven compose cleanup; docker command not found\n" >&2
       exit 0
     fi
-
-    export DOCKER_CONFIG="${DOCKER_CONFIG:-/tmp/myven-docker-config}"
-    mkdir -p "$DOCKER_CONFIG" 2>/dev/null || true
 
     printf "INFO: stopping Myven local stack for %s\n" "$workspace_root"
     if ! pnpm local:down; then
@@ -230,6 +240,7 @@ agent:
     - Review
     - Reviewing
   rework_state: Rework
+  reworking_state: Reworking
   human_review_state: Human Review
   dispatch_kinds:
     - issue
@@ -343,61 +354,39 @@ Reasoning profile policy:
 | 구현(단일 파일, 버그 수정, 리팩터, 기능 추가) | `gpt-5.6-terra` + `high` effort |
 
 Instructions:
-1. GitHub Todo issues are planning-only Codex runs. Implementation work belongs to pull request lanes; when a GitHub issue enters Planned, Symphony's control path may create or reuse a PR for that issue without implementing in the source issue lane.
-2. Keep changes scoped and minimal.
-3. Prefer safe, deterministic changes and record blockers in the workpad.
-4. Use the GitHub labels as the state machine: sym:todo, sym:planned, sym:in-progress, sym:review, sym:reviewing, sym:human-review, sym:waiting, sym:rework, sym:merging, sym:done, sym:canceled, sym:duplicate.
-5. If Codex goal support is available, create exactly one active goal for the current tracker-state objective and keep it aligned with the label state machine. The goal is a scope guard, not permission to expand work.
-   - Todo issue goal: planning-only handoff, no repository edits, then Human Review.
-   - Planned issue goal: create or reuse the implementation PR, then return the source issue to Human Review.
-   - Planned or Rework PR goal: implement only the approved or requested change, validate, self-review, then move the PR to Review.
-   - Review or Reviewing PR goal: review only; move the PR to Rework on findings or Human Review when clean.
-   - Merging goal: verify merge readiness, follow repository merge policy, merge, then move the item to Done.
-   - Mark the goal complete only after the matching state transition and required GitHub/workpad synchronization are done.
-6. Do not spawn supervisor agents in this unattended Symphony run. For implementation runs, do not spawn reviewer or specialist agents; perform the required self-review instead.
-7. For Review or Reviewing pull request runs, perform the general code review only. Do not run a dedicated security review by default; run security review separately only when a human explicitly requests it.
-8. Do not call tools that require interactive MCP elicitation or human input; record the blocker and stop if no non-interactive path exists.
-   - Non-interactive headless Playwright MCP is allowed for local UI verification, console inspection, screenshots, and deterministic browser checks.
-   - Do not use headed browsers, browser extensions, login prompts, captchas, or any MCP flow that requires human input in unattended Symphony runs.
-   - If headless browser automation is unavailable, record the blocker and continue with the narrowest non-browser validation.
-   - Repo-local Playwright/E2E commands may need to run outside the Codex sandbox on macOS. For `pnpm e2e*`, `pnpm exec playwright`, or `bash ./scripts/playwright-local.sh ...`, use `sandbox_permissions=require_escalated` with a concise justification from the start. Symphony is configured to auto-approve only these command patterns.
-   - If Chromium fails with `MachPortRendezvousServer`, `bootstrap_check_in`, Crashpad, or `Permission denied (1100)`, retry the same Playwright/E2E command once with `sandbox_permissions=require_escalated` before treating it as an application failure.
-9. For local URLs and browser/smoke verification, read the current worktree's `.env.local` and use its `MYVEN_*_PORT` values. Do not assume the default ports such as 4999, 8080, 8000, 8100, 5433, or 4566 are free in a Symphony worktree.
-10. Write GitHub issue comments, issue bodies, pull request titles, pull request descriptions, and pull request comments in Korean unless quoting source text or preserving an existing external title.
-   - When creating a stacked child pull request whose base branch belongs to another open pull request, prefix the child PR title with the parent PR number in the format `PR #<parent>: <child PR title>`, and mention the parent PR in the PR body.
-11. If this item is a GitHub issue in Todo, do not implement code and do not create, modify, commit, or push repository files, including `docs/draft/*`. Analyze the issue, record the plan only in the issue body or a GitHub comment, propose PR-sized work items in a GitHub comment, then move the item to Human Review.
-12. If this item is a GitHub issue in Planned, do not implement in the issue lane. Create or reuse PR-sized implementation pull request(s) without creating a source-issue worktree, label each PR Planned for implementation, then move the source issue to Human Review.
-   - If the issue body has explicit `### PR1`, `### PR2`, or later PR-sized sections, do not create a single catch-all implementation PR.
-   - Split PR sections must use an issue-level feature branch, for example `symphony/_84-feature`; child PR branches such as `symphony/_84-pr1` and `symphony/_84-pr2` target that feature branch, not `main`.
-   - Create or reuse a feature-to-main integration PR for the split issue before creating child PRs so GitHub PR numbers reflect the integration PR first, followed by PR1, PR2, and later child PRs. The integration PR is the only PR that closes the source issue, and it should merge only after every required child PR is merged into the feature branch.
-   - The feature-to-main integration PR must stay in `sym:waiting` while any required child PR remains unmerged. `Waiting` is not an active state and must not dispatch implementation, review, rework, or merge work. After every required child PR is merged into the feature branch, a human may move the integration PR to `sym:merging`.
-   - For sequential split issues, a human may request the next child PR from the source issue by commenting `PR<N> 구현` or `PR<N> 구현 시작` and moving the source issue to `sym:planned`. A waiting feature-to-main integration PR does not count as an open implementation PR that blocks this source issue lane; create or reuse the requested child PR, or the first missing/unmerged child PR if no explicit PR number is requested.
-   - By default, treat split PR sections as sequential: create or reuse only the first PR section branch, for example `symphony/_84-pr1`, and leave later sections listed as follow-up PRs while the integration PR remains visible.
-   - If the issue explicitly says `PR 진행 방식: 병렬` or `execution mode: parallel`, create or reuse one child PR per section, for example `symphony/_84-pr1` and `symphony/_84-pr2`, plus the integration PR.
-   - Split child PR bodies should use `Refs #<issue>` while child or follow-up PR sections remain, not `Closes #<issue>`. The integration PR should use `Closes #<issue>`.
-   - If the issue has native GitHub sub-issues, treat the parent as a coordination issue and create/reuse the implementation PR for the first open `sym:planned` sub-issue instead. The child PR must close only the child issue and reference the parent with `Refs #<parent>`.
-   - A native GitHub parent issue may be marked Done/closed only after every sub-issue is terminal (`Done`, `Canceled`, or `Duplicate`). If any sub-issue remains non-terminal, keep or reopen the parent in Human Review.
-13. Symphony must not move a GitHub issue from Todo or Human Review to Planned by itself. Only a human-applied sym:planned label is an approval gate.
-14. If a Planned issue is explicitly a planning/splitting issue, create the requested PR-sized follow-up issues instead of changing product code. Label follow-up implementation issues sym:planned only when the parent issue explicitly asks for immediate execution; otherwise label them sym:todo for human review. If a direct implementation PR is needed, create the PR and let the PR lane do the work.
-15. If this item is a GitHub issue with an open linked pull request, keep or move the source issue to Human Review, update only the issue summary/comment and the linked PR body/comment with current PR status, then stop; PR execution belongs to the linked pull request. Exception: for split issues, an open feature-to-main integration PR in `sym:waiting` is only a coordination/finalization PR and must not block creation of the next requested child PR from a `sym:planned` source issue.
-16. If this item is a GitHub issue in In Progress and it does not have an open linked pull request, create or update a PR-sized implementation PR and keep the issue comment trail current. After opening or updating the implementation PR, move only the PR to Review and keep the source issue in Human Review while updating the source issue summary/comment with the PR status.
-17. If implementation becomes too large, stop before committing and comment: "이 PR은 너무 커졌으므로 여기까지 commit하지 않고 분할 제안". Move the item to Human Review with the split proposal.
-18. If this item is a pull request in Todo, improve the PR description, implementation plan, and validation plan, then move it to Human Review.
-19. If this item is a pull request in Planned, move it to In Progress, implement the approved change, run the narrowest useful validation, complete the self-review checklist, comment with results, move only the PR to Review, and keep the source issue in Human Review while updating the PR body/comment and source issue summary/comment with the PR status.
-20. If this item is a pull request in Review or Reviewing, perform automated code review only. Do not run a dedicated security review as part of the default review lane; reserve that for explicit human requests, periodic manual audits, or Codex Security. If there are no required improvements, synchronize the PR body/comment and relevant docs/workpad, move only the PR to Human Review, and keep the source issue in Human Review. If improvements are required, leave a PR comment with findings, move only the PR to Rework, and keep the source issue in Human Review while updating the source issue summary/comment with the blocker summary.
-21. If this item is a pull request in Rework, perform a full PR feedback sweep before changing code: read top-level PR comments, review summaries/states, and inline code review comments. Inline code review comments must be fetched through the PR review comments endpoint (for example, `gh api repos/<owner>/<repo>/pulls/<pr>/comments`); do not rely on `gh pr view --comments` alone because it can miss inline code comments. A Codex connector inline-comment webhook is a rework signal, not proof that a code change is required: inspect the live PR head and every unresolved review thread, then either address actionable feedback or reply with a concise, justified no-change response. This PR workspace is detached at the original PR head; before pushing, re-fetch `origin/$SYMPHONY_PR_HEAD_REF`, confirm it still points to the reviewed head, and use a non-force `git push origin HEAD:refs/heads/$SYMPHONY_PR_HEAD_REF`. If the remote head advanced, stop without pushing and leave the PR in Human Review. Address only the requested follow-up changes, comment with results, move only the PR to Review, and keep the source issue in Human Review while updating only the PR body/comment and source issue summary/comment. Do not move the source issue to Review, Reviewing, Rework, or In Progress while the PR remains open. Split new features or large design changes into a new issue instead of expanding PR Rework.
-22. If this item is a GitHub issue in Rework and it has an open linked pull request, do not implement or review in the issue lane. Keep or move the issue to Human Review, add a Korean comment pointing to the linked PR and its current rework status, then stop. If there is no open linked pull request, treat it as issue-only Rework: read the latest issue comments first, clarify the requested issue-level follow-up in a Korean issue comment, and move the issue to Human Review unless a human explicitly applies Planned.
-23. Human Review is a review-retention state, not a cleanup state. Do not delete or recreate the generated PR workspace while a PR is in Human Review; the same directory must remain available for manual re-review and later Rework.
-24. If this item is in Merging, treat it as approved merge work. Use the existing generated workspace and current PR branch, verify the PR is mergeable, follow repository merge instructions, and move the item to Done only after the merge succeeds.
-   - Before merging, inspect the code changed by this PR for user-facing text that bypasses the repository's i18n/localization path. If untranslated literals or missing locale entries are found, add the required translations and focused i18n verification in the PR branch before merging.
-25. Cleanup is allowed only after a true final state: Done, Canceled, or Duplicate.
-26. For GitHub issues, terminal state labels must match the GitHub open/closed state: `sym:done` closes as completed, and `sym:canceled` or `sym:duplicate` close as not planned. Moving an issue back to a non-terminal Symphony label should reopen it.
-27. Do not continue working after moving the item to Human Review.
-28. If durable documentation is needed for a Todo issue, defer it to an approved Planned PR-sized work item and commit it on that PR branch. Do not reference local-only scratch file paths in issue comments.
-29. Before moving a Todo GitHub issue to Human Review, run `git status --short --untracked-files=all` and confirm there are no task-authored repository changes.
-30. Before moving an implementation PR to Review, record this self-review checklist in the PR body or comment: tenant/RLS, migration/backfill, idempotency/retry/replay, local/prod URL, secret/token exposure, browser-visible terminology, and fixture/local smoke preservation.
-31. Preserve `docs/draft` workpads through Human Review. Before Merging, either move durable content into `docs/architecture`, `docs/design-system`, or `docs/adr`, or remove the draft-only workpad.
-32. The Symphony orchestration preflight owns the long conductor, review, and GitHub-review skill/reference reading. Briefed workers must use the supplied compact execution contract and must not reopen those documents unless the brief explicitly names a missing, task-critical reference.
-33. A clean Review or Reviewing verdict moves the pull request directly to Human Review and stops the run. Actionable findings move it to Rework only while the configured review-verdict budget remains. On the final allowed verdict, record remaining findings and move to Human Review instead of scheduling another Rework cycle.
-34. Before Merging, run only focused verification that directly covers changed files. Check CI once without polling; do not wait for pending required checks. Do not expand into full API/Web/OpenAPI/Astro suites, Compose startup, seed, or browser setup unless the exact change cannot be verified more narrowly. Retry a plausible browser or environment failure at most once, then report partial coverage.
-35. In Merging, wait for required CI and run the repository-defined full verification bundle before completing the merge.
+1. Symphony is the only workflow-state authority. You may read GitHub state and feedback, but you MUST NOT add or remove any `sym:*` label, create automated issue/PR comments or reviews, edit issue/PR bodies, close or reopen an item, create a tracker item, or merge a pull request. Return a semantic outcome and let Symphony's broker perform the tracker effects.
+2. Canonical labels are `sym:todo`, `sym:planned`, `sym:in-progress`, `sym:review`, `sym:reviewing`, `sym:human-review`, `sym:waiting`, `sym:rework`, `sym:reworking`, `sym:merging`, `sym:done`, `sym:canceled`, and `sym:duplicate`. Human operators request changes with `sym:request-*` labels; workers MUST NOT apply those request labels either.
+3. Keep changes scoped and minimal. Prefer safe, deterministic changes and record repository-local implementation notes only when the current lane permits repository edits.
+4. If Codex goal support is available, create exactly one active goal for the current tracker-state objective. The goal is a scope guard, not permission to expand work or mutate tracker state. Complete it after the repository work and verification required for the semantic outcome are finished.
+5. Do not spawn supervisor agents in this unattended run. For implementation runs, perform the required self-review yourself. For Review or Reviewing, perform general code review only; dedicated security review requires an explicit human request.
+6. Do not call tools that require interactive MCP elicitation or human input. Return `blocked` if no non-interactive path exists.
+   - Non-interactive headless Playwright is allowed for deterministic local checks.
+   - Repo-local Playwright/E2E commands may need `sandbox_permissions=require_escalated` on macOS. Retry a `MachPortRendezvousServer`, `bootstrap_check_in`, Crashpad, or `Permission denied (1100)` failure once with that permission before treating it as an application failure.
+7. For local URLs and browser/smoke verification, read the current worktree's `.env.local` and use its `MYVEN_*_PORT` values; do not assume default ports are free.
+8. Tracker-facing summaries, proposed issue/PR bodies, titles, and findings returned to Symphony must be Korean unless quoting source text or preserving an external title.
+9. Todo issues are planning-only. Do not create, modify, commit, or push repository files, including `docs/draft/*`. Analyze the issue and return `planning_complete` with a Korean summary and PR-sized proposals in `evidence`.
+10. Planned issues are control-lane work, not implementation lanes. Analyze the requested PR topology and return `planning_complete`; Symphony's control path owns issue/PR creation, bodies, links, labels, and the source-issue handoff.
+    - Preserve explicit PR1/PR2 sections. Split child branches target an issue feature branch; the feature-to-main integration PR is the only PR that closes the source issue.
+    - Default split execution is sequential unless the issue explicitly requests parallel execution.
+    - Native GitHub sub-issues remain the unit of implementation and close only their own child issue.
+11. If an issue already has an open linked implementation PR, do not implement or review in the issue lane. Return `planning_complete` with the linked PR status and recommended source-issue handoff. A waiting feature-to-main integration PR does not block the next explicitly requested child PR.
+12. Planned pull requests run after Symphony projects `In Progress`. Implement only the approved change, run focused verification, complete the self-review checklist, and return `implementation_complete`. Include the current head OID, commands/results, and the Korean transition summary; Symphony moves the PR to Review and keeps the source issue in Human Review.
+13. Review pull requests run after Symphony projects `Reviewing`. Review only. Return `clean_review` when no required improvement exists, or `review_findings` with actionable findings. Symphony applies Human Review or Rework according to the review-verdict budget and synchronizes the source issue.
+14. Rework pull requests run after Symphony projects `Reworking`. Read top-level comments, review summaries, inline review comments, and unresolved threads before changing code. Re-fetch `origin/$SYMPHONY_PR_HEAD_REF`, verify the reviewed head has not advanced, address only actionable feedback, use a non-force branch push, and return `rework_complete`. If the remote head advanced, return `handoff_required` without pushing.
+15. An inline-comment webhook is a rework signal, not proof that a code change is needed. A justified no-change result still returns `rework_complete` with the evidence Symphony should publish.
+16. If implementation becomes too large, stop before committing and return `handoff_required` with the Korean split proposal: "이 PR은 너무 커졌으므로 여기까지 commit하지 않고 분할 제안".
+17. Merging is an approved verification lane. Use the existing workspace and branch, inspect changed user-facing text for i18n compliance, wait for required CI, and run the repository-defined full verification bundle. Do not merge. Return `merge_ready` with the exact head OID only when merge preconditions pass; Symphony's broker performs the pinned merge and projects Done after observing success.
+18. Before Merging, other lanes run only focused verification and inspect CI once without polling. Do not expand into full API/Web/OpenAPI/Astro suites, Compose startup, seed, or browser setup unless the exact change cannot be verified more narrowly. Retry a plausible environment failure at most once, then report partial evidence.
+19. Human Review and Waiting are inactive retention/coordination states and must not execute work. Cleanup is allowed only after Done, Canceled, or Duplicate.
+20. Preserve `docs/draft` workpads through Human Review. Before returning `merge_ready`, either move durable content into `docs/architecture`, `docs/design-system`, or `docs/adr`, or remove the draft-only workpad.
+21. The orchestration preflight owns the long conductor, review, and GitHub-review reference reading. Use the supplied compact execution contract and do not reopen those documents unless the brief names a missing, task-critical reference.
+22. Return `blocked` for a retryable external/environment blocker and `handoff_required` when human judgment, scope split, stale head, or exhausted safe retry requires intervention. Do not invent a target state.
+
+Final output contract:
+
+- Return exactly one structured object matching the runtime output schema; do not wrap it in Markdown.
+- `outcome` MUST be one of `planning_complete`, `implementation_complete`, `rework_complete`, `clean_review`, `review_findings`, `merge_ready`, `blocked`, or `handoff_required`.
+- `head_oid` is the observed Git head for pull-request work and `null` for issue-only planning.
+- `evidence` is a list of concise checks, findings, artifacts, or proposed tracker content.
+- `summary_ko` is the Korean comment/body summary Symphony may publish with its idempotency marker.
+- Never include a target state or target label in the output.

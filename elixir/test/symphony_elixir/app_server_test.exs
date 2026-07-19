@@ -1683,7 +1683,10 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
-      assert argv_line =~ "exec "
+      assert argv_line =~ "mkdir -p"
+      assert argv_line =~ "symphony-worker-gh-config-"
+      assert argv_line =~ "trap "
+      assert argv_line =~ "env -u GITHUB_TOKEN -u GH_TOKEN"
       assert argv_line =~ "fake-remote-codex app-server"
 
       expected_turn_policy = %{

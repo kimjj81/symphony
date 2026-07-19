@@ -3,23 +3,20 @@ defmodule SymphonyElixir.GitHubWebhookProcessorTest do
 
   alias SymphonyElixir.GitHub.WebhookProcessor
 
-  test "processes pull request review comments as targeted PR refreshes" do
+  test "ingests pull request review comments without mutating tracker state" do
     test_pid = self()
 
     payload = %{
       "action" => "created",
-      "pull_request" => %{"number" => 259}
+      "pull_request" => %{"number" => 259},
+      "sender" => %{"login" => "reviewer"}
     }
 
     result =
       WebhookProcessor.handle_event("pull_request_review_comment", payload,
         tracker_kind: "github",
-        sync_fun: fn event, action, received_payload ->
-          send(test_pid, {:sync, event, action, received_payload})
-          :ok
-        end,
-        queue_rework_fun: fn event, action, received_payload ->
-          send(test_pid, {:queue_rework, event, action, received_payload})
+        intent_fun: fn intent ->
+          send(test_pid, {:intent, intent})
           :ok
         end,
         refresh_fun: fn issue_id ->
@@ -29,22 +26,71 @@ defmodule SymphonyElixir.GitHubWebhookProcessorTest do
       )
 
     assert {:ok, %{queued: true, issue_id: "github:pr:259", event: "pull_request_review_comment", action: "created"}} = result
-    assert_receive {:sync, "pull_request_review_comment", "created", ^payload}
-    assert_receive {:queue_rework, "pull_request_review_comment", "created", ^payload}
+
+    assert_receive {:intent,
+                    %{
+                      kind: :review_feedback_detected,
+                      issue_id: "github:pr:259",
+                      source: :github_webhook,
+                      actor: "reviewer"
+                    }}
+
     assert_receive {:refresh, "github:pr:259"}
   end
 
-  test "ignores unrelated actions after state sync" do
+  test "normalizes request labels as operator transition intents" do
+    payload = %{
+      "action" => "labeled",
+      "issue" => %{"number" => 42},
+      "label" => %{"name" => "sym:request-merging"},
+      "sender" => %{"login" => "maintainer", "type" => "User"}
+    }
+
+    assert {:ok, intent} = WebhookProcessor.normalize_intent("issues", "labeled", payload)
+    assert intent.kind == :operator_transition_requested
+    assert intent.issue_id == "github:issue:42"
+    assert intent.requested_state == "Merging"
+    assert intent.request_action == "labeled"
+    assert intent.actor == "maintainer"
+  end
+
+  test "distinguishes Symphony projection echoes from human state-label drift" do
+    base = %{
+      "action" => "labeled",
+      "pull_request" => %{"number" => 91},
+      "label" => %{"name" => "sym:reworking"}
+    }
+
+    assert {:ok, %{kind: :projection_echo, observed_state: "Reworking"}} =
+             WebhookProcessor.normalize_intent(
+               "pull_request",
+               "labeled",
+               Map.put(base, "sender", %{"login" => "symphony[bot]", "type" => "Bot"})
+             )
+
+    assert {:ok, %{kind: :state_projection_drift, observed_state: "Reworking"}} =
+             WebhookProcessor.normalize_intent(
+               "pull_request",
+               "labeled",
+               Map.put(base, "sender", %{"login" => "maintainer", "type" => "User"})
+             )
+
+    assert {:ok, %{kind: :state_projection_drift, observed_state: nil}} =
+             WebhookProcessor.normalize_intent(
+               "pull_request",
+               "unlabeled",
+               Map.put(base, "sender", %{"login" => "maintainer", "type" => "User"})
+             )
+  end
+
+  test "ignores unrelated actions without refreshing" do
     test_pid = self()
     payload = %{"action" => "opened", "pull_request" => %{"number" => 259}}
 
     result =
       WebhookProcessor.handle_event("pull_request", payload,
         tracker_kind: "github",
-        sync_fun: fn event, action, _payload ->
-          send(test_pid, {:sync, event, action})
-          :ok
-        end,
+        intent_fun: fn intent -> send(test_pid, {:intent, intent}) end,
         refresh_fun: fn issue_id ->
           send(test_pid, {:refresh, issue_id})
           {:ok, %{issue_id: issue_id}}
@@ -52,7 +98,7 @@ defmodule SymphonyElixir.GitHubWebhookProcessorTest do
       )
 
     assert {:ignored, %{event: "pull_request", action: "opened"}} = result
-    assert_receive {:sync, "pull_request", "opened"}
+    refute_receive {:intent, _}, 50
     refute_receive {:refresh, _}, 50
   end
 end

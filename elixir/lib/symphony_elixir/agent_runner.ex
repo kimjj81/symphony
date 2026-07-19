@@ -7,10 +7,27 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Codex.OrchestrationBrief
   alias SymphonyElixir.Codex.TaskClassifier
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, PromptBuilder, StateManager, Tracker, TransitionIntent}
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.{TransitionJournal, WorkerOutcome, Workspace}
 
   @type worker_host :: String.t() | nil
+
+  @worker_outcome_schema %{
+    "type" => "object",
+    "additionalProperties" => false,
+    "required" => ["kind", "summary_ko", "evidence", "head_oid", "findings"],
+    "properties" => %{
+      "kind" => %{
+        "type" => "string",
+        "enum" => Enum.map(WorkerOutcome.kinds(), &Atom.to_string/1)
+      },
+      "summary_ko" => %{"type" => "string", "minLength" => 1},
+      "evidence" => %{"type" => "array", "items" => %{"type" => "string"}},
+      "head_oid" => %{"type" => ["string", "null"]},
+      "findings" => %{"type" => "array", "items" => %{"type" => "string"}}
+    }
+  }
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | {:error, term()} | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
@@ -254,6 +271,28 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp run_briefed_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, app_server_opts) do
+    if Config.settings!().state_manager.mode == "authoritative" do
+      run_authoritative_briefed_codex_turn(
+        workspace,
+        issue,
+        codex_update_recipient,
+        opts,
+        worker_host,
+        app_server_opts
+      )
+    else
+      run_legacy_briefed_codex_turns(
+        workspace,
+        issue,
+        codex_update_recipient,
+        opts,
+        worker_host,
+        app_server_opts
+      )
+    end
+  end
+
+  defp run_legacy_briefed_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, app_server_opts) do
     settings = Config.settings!()
     max_turns = Keyword.get(opts, :max_turns, settings.agent.max_turns)
     max_review_verdicts = Keyword.get(opts, :max_review_verdicts, settings.agent.max_review_verdicts)
@@ -299,6 +338,184 @@ defmodule SymphonyElixir.AgentRunner do
 
     do_run_briefed_turns(context, lane_issue, 1, 0)
   end
+
+  defp run_authoritative_briefed_codex_turn(
+         workspace,
+         tracker_issue,
+         codex_update_recipient,
+         opts,
+         worker_host,
+         app_server_opts
+       ) do
+    settings = Config.settings!()
+    lane_issue = restore_dispatch_state(tracker_issue)
+    max_review_verdicts = Keyword.get(opts, :max_review_verdicts, settings.agent.max_review_verdicts)
+    review_attempt = Keyword.get(opts, :review_attempt, next_review_attempt(tracker_issue.id))
+
+    brief_opts =
+      opts
+      |> Keyword.put(:worker_host, worker_host)
+      |> Keyword.put(:on_message, codex_message_handler(codex_update_recipient, lane_issue))
+
+    {brief, _brief_meta} =
+      case OrchestrationBrief.generate(workspace, lane_issue, brief_opts) do
+        {:ok, generated, metadata} -> {generated, metadata}
+        {:error, _reason} -> {OrchestrationBrief.fallback(lane_issue), %{source: :fallback}}
+      end
+
+    task_profile = select_briefed_task_profile(lane_issue)
+    verification_tier = verification_tier(lane_issue.state)
+
+    prompt =
+      build_briefed_turn_prompt(
+        lane_issue,
+        brief,
+        verification_tier,
+        review_attempt,
+        max_review_verdicts
+      )
+
+    session_opts =
+      app_server_opts
+      |> Keyword.put(:worker_host, worker_host)
+      |> Keyword.put(:codex_command, task_profile.command)
+
+    with {:ok, session} <- AppServer.start_session(workspace, session_opts) do
+      try do
+        with {:ok, turn_session} <-
+               AppServer.run_turn(session, prompt, lane_issue,
+                 on_message: codex_message_handler(codex_update_recipient, lane_issue),
+                 model: task_profile.model,
+                 effort: task_profile.effort,
+                 output_schema: @worker_outcome_schema
+               ),
+             {:ok, outcome} <- decode_worker_outcome(turn_session),
+             result <-
+               request_worker_outcome_transition(
+                 tracker_issue,
+                 outcome,
+                 turn_session,
+                 review_attempt,
+                 max_review_verdicts,
+                 opts
+               ) do
+          normalize_worker_transition_result(result)
+        end
+      after
+        AppServer.stop_session(session)
+      end
+    end
+  end
+
+  defp decode_worker_outcome(turn_session) do
+    with message when is_binary(message) <- Map.get(turn_session, :final_agent_message),
+         {:ok, payload} <- Jason.decode(message),
+         {:ok, outcome} <- WorkerOutcome.new(payload) do
+      {:ok, outcome}
+    else
+      nil -> {:error, :missing_worker_outcome}
+      {:error, reason} -> {:error, {:invalid_worker_outcome, reason}}
+      _ -> {:error, :invalid_worker_outcome}
+    end
+  end
+
+  defp request_worker_outcome_transition(
+         tracker_issue,
+         outcome,
+         turn_session,
+         review_attempt,
+         review_limit,
+         opts
+       ) do
+    session_id = Map.fetch!(turn_session, :session_id)
+
+    dispatch_transition_id =
+      tracker_issue.metadata &&
+        (tracker_issue.metadata["symphony_transition_id"] || tracker_issue.metadata[:symphony_transition_id])
+
+    intent = %TransitionIntent{
+      id: "worker:#{tracker_issue.id}:#{session_id}",
+      issue_id: tracker_issue.id,
+      source: :worker,
+      actor: "codex-worker",
+      expected_state: tracker_issue.state,
+      kind: outcome.kind,
+      head_oid: outcome.head_oid,
+      causation_id: dispatch_transition_id || session_id,
+      work_item_kind: tracker_issue.kind,
+      review_attempt: review_attempt,
+      review_limit: review_limit,
+      comment_body: render_worker_outcome_comment(outcome),
+      metadata: %{
+        evidence: outcome.evidence,
+        findings: outcome.findings,
+        dispatch_transition_id: dispatch_transition_id,
+        session_id: session_id
+      }
+    }
+
+    requester = Keyword.get(opts, :state_manager_requester)
+
+    if is_function(requester, 1) do
+      requester.(intent)
+    else
+      StateManager.request(Keyword.get(opts, :state_manager, SymphonyElixir.Orchestrator), intent)
+    end
+  end
+
+  defp render_worker_outcome_comment(outcome) do
+    evidence = render_outcome_list("검증", outcome.evidence)
+    findings = render_outcome_list("발견 사항", outcome.findings)
+
+    [outcome.summary_ko, evidence, findings]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n\n")
+  end
+
+  defp next_review_attempt(issue_id) do
+    case Process.whereis(TransitionJournal) do
+      pid when is_pid(pid) ->
+        completed_reviews =
+          pid
+          |> TransitionJournal.replay()
+          |> Enum.reverse()
+          |> Enum.take_while(&(not review_lifecycle_boundary?(&1, issue_id)))
+          |> Enum.count(&completed_review?(&1, issue_id))
+
+        completed_reviews + 1
+
+      _ ->
+        1
+    end
+  end
+
+  defp completed_review?(event, issue_id) do
+    event.phase == :verified and event.data[:issue_id] == issue_id and
+      event.data[:kind] in [:clean_review, :review_findings]
+  end
+
+  defp review_lifecycle_boundary?(event, issue_id) do
+    event.phase == :verified and event.data[:issue_id] == issue_id and
+      event.data[:kind] in [
+        :dispatch_implementation,
+        {:operator_request, :planned},
+        {:operator_request, :reopen}
+      ]
+  end
+
+  defp render_outcome_list(_title, []), do: nil
+
+  defp render_outcome_list(title, entries) do
+    title <> "\n" <> Enum.map_join(entries, "\n", &("- " <> to_string(&1)))
+  end
+
+  defp normalize_worker_transition_result({:ok, _applied}), do: :ok
+  defp normalize_worker_transition_result({:noop, _reason}), do: :ok
+  defp normalize_worker_transition_result({:conflict, _snapshot}), do: :ok
+  defp normalize_worker_transition_result({:error, {:transition_retry_scheduled, _reason}}), do: :ok
+  defp normalize_worker_transition_result({:rejected, reason}), do: {:error, {:worker_outcome_rejected, reason}}
+  defp normalize_worker_transition_result({:error, reason}), do: {:error, {:worker_transition_failed, reason}}
+  defp normalize_worker_transition_result(other), do: {:error, {:invalid_worker_transition_result, other}}
 
   defp restore_dispatch_state(%Issue{metadata: metadata} = issue) when is_map(metadata) do
     case Map.get(metadata, "symphony_dispatch_state") || Map.get(metadata, :symphony_dispatch_state) do
@@ -633,7 +850,12 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp handoff_to_human_review(%Issue{id: issue_id} = issue, reason, opts) when is_binary(issue_id) do
     commenter = Keyword.get(opts, :tracker_commenter, &Tracker.create_comment/2)
-    state_updater = Keyword.get(opts, :tracker_state_updater, &Tracker.update_issue_state/2)
+
+    state_updater =
+      Keyword.get(opts, :tracker_state_updater, fn id, state ->
+        Tracker.adapter().update_issue_state(id, state)
+      end)
+
     target_state = Config.settings!().agent.human_review_state
     body = "Symphony 자동 실행 중단\n\n#{reason}"
 

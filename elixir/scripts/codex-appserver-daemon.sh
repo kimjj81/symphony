@@ -70,6 +70,20 @@ command -v "$CODEX_BIN" >/dev/null 2>&1 || {
   exit 1
 }
 
+# Tracker writes are broker-owned. Each daemon lifetime receives a new empty
+# gh configuration directory so cached credentials cannot cross runs.
+unset GITHUB_TOKEN GH_TOKEN SYMPHONY_TRACKER_WRITE_TOKEN LINEAR_API_KEY
+export GH_CONFIG_DIR
+GH_CONFIG_DIR=$(mktemp -d "${CODEX_APPSERVER_STATE_DIR}/worker-gh-config.XXXXXX")
+chmod 500 "$GH_CONFIG_DIR"
+export GIT_TERMINAL_PROMPT=0
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=credential.helper
+export GIT_CONFIG_VALUE_0=
+if [ -n "${SYMPHONY_TRACKER_READ_TOKEN:-}" ]; then
+  export GH_TOKEN=$SYMPHONY_TRACKER_READ_TOKEN
+fi
+
 set +e
 printf "INFO: booting codex app-server via ws on %s\n" "$CODEX_WS_URL"
 

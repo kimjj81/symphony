@@ -19,21 +19,34 @@ defmodule SymphonyElixir.Application do
 
   use Application
 
+  alias SymphonyElixir.{Config, TransitionJournal}
   alias SymphonyElixir.GitHub.NatsWebhookConsumer
 
   @impl true
   def start(_type, _args) do
     :ok = SymphonyElixir.LogFile.configure()
 
+    journal_children =
+      case Config.settings() do
+        {:ok, %{state_manager: %{mode: mode}}} when mode in ["shadow", "authoritative"] ->
+          [{TransitionJournal, name: TransitionJournal, path: Config.transition_journal_path()}]
+
+        _ ->
+          []
+      end
+
     children =
       [
         {Phoenix.PubSub, name: SymphonyElixir.PubSub},
         {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
-        SymphonyElixir.WorkflowStore,
-        SymphonyElixir.Orchestrator,
-        SymphonyElixir.HttpServer,
-        SymphonyElixir.StatusDashboard
-      ] ++ NatsWebhookConsumer.child_specs_from_env()
+        SymphonyElixir.WorkflowStore
+      ] ++
+        journal_children ++
+        [
+          SymphonyElixir.Orchestrator,
+          SymphonyElixir.HttpServer,
+          SymphonyElixir.StatusDashboard
+        ] ++ NatsWebhookConsumer.child_specs_from_env()
 
     Supervisor.start_link(
       children,

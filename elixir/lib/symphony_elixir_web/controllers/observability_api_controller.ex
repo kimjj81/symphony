@@ -7,6 +7,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   alias Plug.Conn
   alias SymphonyElixir.GitHub.WebhookProcessor
+  alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @github_webhook_secret_env "SYMPHONY_GITHUB_WEBHOOK_SECRET"
@@ -46,9 +47,16 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     with {:ok, secret} <- github_webhook_secret(),
          :ok <- verify_github_signature(conn, secret) do
       event = conn |> header_value("x-github-event") |> to_string()
+      delivery_id = conn |> header_value("x-github-delivery") |> to_string()
+      orchestrator = orchestrator()
 
       case WebhookProcessor.handle_event(event, params,
-             orchestrator: orchestrator(),
+             orchestrator: orchestrator,
+             intent_fun: fn intent ->
+               intent
+               |> Map.put(:delivery_id, delivery_id)
+               |> Orchestrator.request_tracker_intent(orchestrator)
+             end,
              follow_up_delay_ms: github_webhook_follow_up_refresh_ms()
            ) do
         {:ok, payload} ->

@@ -48,11 +48,13 @@ defmodule SymphonyElixir.Config.Schema do
       field(:kind, :string)
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:api_key, :string)
+      field(:read_api_key, :string)
+      field(:write_api_key, :string)
       field(:project_slug, :string)
       field(:owner, :string)
       field(:repo, :string)
       field(:assignee, :string)
-      field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
+      field(:active_states, {:array, :string}, default: ["Todo", "In Progress", "Reworking"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
       field(:state_labels, :map, default: %{})
     end
@@ -66,6 +68,8 @@ defmodule SymphonyElixir.Config.Schema do
           :kind,
           :endpoint,
           :api_key,
+          :read_api_key,
+          :write_api_key,
           :project_slug,
           :owner,
           :repo,
@@ -76,6 +80,39 @@ defmodule SymphonyElixir.Config.Schema do
         ],
         empty_values: []
       )
+    end
+  end
+
+  defmodule StateManager do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    @modes ~w(legacy shadow authoritative)
+
+    embedded_schema do
+      field(:mode, :string, default: "legacy")
+      field(:journal_path, :string)
+
+      field(:human_intent_labels, :map,
+        default: %{
+          "Planned" => "sym:request-planned",
+          "Rework" => "sym:request-rework",
+          "Merging" => "sym:request-merging",
+          "Human Review" => "sym:request-human-review",
+          "Canceled" => "sym:request-canceled",
+          "Duplicate" => "sym:request-duplicate",
+          "Reopen" => "sym:request-reopen"
+        }
+      )
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:mode, :journal_path, :human_intent_labels], empty_values: [])
+      |> validate_inclusion(:mode, @modes)
     end
   end
 
@@ -533,6 +570,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:state_manager, StateManager, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
@@ -695,6 +733,7 @@ defmodule SymphonyElixir.Config.Schema do
     %__MODULE__{}
     |> cast(attrs, [])
     |> cast_embed(:tracker, with: &Tracker.changeset/2)
+    |> cast_embed(:state_manager, with: &StateManager.changeset/2)
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
@@ -710,10 +749,26 @@ defmodule SymphonyElixir.Config.Schema do
   defp finalize_settings(settings) do
     tracker_kind = settings.tracker.kind
 
+    legacy_tracker_api_key = resolve_tracker_api_key(tracker_kind, settings.tracker.api_key)
+
     tracker = %{
       settings.tracker
       | endpoint: resolve_tracker_endpoint(tracker_kind, settings.tracker.endpoint),
-        api_key: resolve_tracker_api_key(tracker_kind, settings.tracker.api_key),
+        api_key:
+          resolve_secret_setting(
+            settings.tracker.write_api_key,
+            System.get_env("SYMPHONY_TRACKER_WRITE_TOKEN") || legacy_tracker_api_key
+          ),
+        write_api_key:
+          resolve_secret_setting(
+            settings.tracker.write_api_key,
+            System.get_env("SYMPHONY_TRACKER_WRITE_TOKEN") || legacy_tracker_api_key
+          ),
+        read_api_key:
+          resolve_secret_setting(
+            settings.tracker.read_api_key,
+            System.get_env("SYMPHONY_TRACKER_READ_TOKEN")
+          ),
         assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
     }
 
@@ -744,9 +799,16 @@ defmodule SymphonyElixir.Config.Schema do
 
     notifications = resolve_notifications(settings.notifications)
 
+    state_manager = %{
+      settings.state_manager
+      | mode: settings.state_manager.mode |> String.trim() |> String.downcase(),
+        journal_path: resolve_path_value(settings.state_manager.journal_path, nil)
+    }
+
     %{
       settings
       | tracker: tracker,
+        state_manager: state_manager,
         workspace: workspace,
         agent: agent,
         codex: codex,

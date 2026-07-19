@@ -15,6 +15,7 @@ defmodule SymphonyElixir.GitHub.NatsWebhookConsumer do
   alias Gnat.Jetstream.API.Consumer
   alias Gnat.Jetstream.PullConsumer
   alias SymphonyElixir.GitHub.WebhookProcessor
+  alias SymphonyElixir.Orchestrator
 
   @default_stream "GITHUB_WEBHOOKS"
   @default_durable "symphony-webhook"
@@ -58,18 +59,26 @@ defmodule SymphonyElixir.GitHub.NatsWebhookConsumer do
   def handle_message(%{body: body}, state) do
     case Jason.decode(IO.iodata_to_binary(body)) do
       {:ok, envelope} ->
-        case handle_envelope(envelope, state) do
-          :ok ->
-            {:ack, state}
-
-          {:error, reason} ->
-            Logger.warning("Symphony GitHub NATS webhook envelope rejected reason=#{inspect(reason)}")
-            {:term, state}
-        end
+        handle_decoded_envelope(envelope, state)
 
       {:error, reason} ->
         Logger.warning("Symphony GitHub NATS webhook JSON decode failed reason=#{inspect(reason)}")
         {:term, state}
+    end
+  end
+
+  defp handle_decoded_envelope(envelope, state) do
+    case handle_envelope(envelope, state) do
+      :ok ->
+        {:ack, state}
+
+      {:error, :invalid_envelope = reason} ->
+        Logger.warning("Symphony GitHub NATS webhook envelope rejected reason=#{inspect(reason)}")
+        {:term, state}
+
+      {:error, reason} ->
+        Logger.warning("Symphony GitHub NATS webhook envelope rejected reason=#{inspect(reason)}")
+        {:nack, state}
     end
   end
 
@@ -79,7 +88,16 @@ defmodule SymphonyElixir.GitHub.NatsWebhookConsumer do
     delivery_id = Map.get(envelope, "delivery_id", "")
     processor_fun = Keyword.get(opts, :processor_fun, &WebhookProcessor.handle_event/3)
 
-    case invoke_processor(processor_fun, event, payload, opts) do
+    processor_opts =
+      opts
+      |> Keyword.put(:delivery_id, delivery_id)
+      |> Keyword.put_new(:intent_fun, fn intent ->
+        intent
+        |> Map.put(:delivery_id, delivery_id)
+        |> Orchestrator.request_tracker_intent(Keyword.get(opts, :orchestrator, Orchestrator))
+      end)
+
+    case invoke_processor(processor_fun, event, payload, processor_opts) do
       {:ok, payload} ->
         Logger.info("Symphony GitHub NATS webhook processed event=#{event} delivery=#{delivery_id} result=refresh issue_id=#{inspect(Map.get(payload, :issue_id))}")
         :ok
@@ -147,7 +165,9 @@ defmodule SymphonyElixir.GitHub.NatsWebhookConsumer do
         :tracker_kind,
         :sync_fun,
         :queue_rework_fun,
-        :refresh_fun
+        :refresh_fun,
+        :intent_fun,
+        :delivery_id
       ])
 
     processor_fun.(event, payload, processor_opts)

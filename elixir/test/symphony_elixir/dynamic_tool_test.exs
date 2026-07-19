@@ -134,11 +134,25 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
            }
   end
 
+  test "linear_graphql rejects worker mutations before invoking the configured client" do
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "mutation UpdateIssue { issueUpdate(id: \"1\", input: {}) { success } }"},
+        linear_client: fn _query, _variables, _opts -> flunk("mutation reached Linear client") end
+      )
+
+    assert response["success"] == false
+
+    assert get_in(Jason.decode!(response["output"]), ["error", "message"]) =~
+             "Tracker mutations are owned by Symphony"
+  end
+
   test "linear_graphql marks GraphQL error responses as failures while preserving the body" do
     response =
       DynamicTool.execute(
         "linear_graphql",
-        %{"query" => "mutation BadMutation { nope }"},
+        %{"query" => "query BadQuery { nope }"},
         linear_client: fn _query, _variables, _opts ->
           {:ok, %{"errors" => [%{"message" => "Unknown field `nope`"}], "data" => nil}}
         end

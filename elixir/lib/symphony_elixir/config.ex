@@ -105,6 +105,17 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec transition_journal_path() :: Path.t()
+  def transition_journal_path do
+    case Application.get_env(:symphony_elixir, :transition_journal_path_override) do
+      path when is_binary(path) and path != "" ->
+        Path.expand(path)
+
+      _ ->
+        configured_transition_journal_path() || default_transition_journal_path()
+    end
+  end
+
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
     with {:ok, settings} <- settings() do
@@ -134,6 +145,29 @@ defmodule SymphonyElixir.Config do
     settings.tracker
     |> validate_tracker_kind()
     |> validate_tracker_semantics(settings.tracker)
+  end
+
+  defp configured_transition_journal_path do
+    case settings!().state_manager.journal_path do
+      path when is_binary(path) and path != "" -> Path.expand(path)
+      _ -> nil
+    end
+  end
+
+  defp default_transition_journal_path do
+    state_home =
+      case System.get_env("XDG_STATE_HOME") do
+        path when is_binary(path) and path != "" -> Path.expand(path)
+        _ -> Path.join(System.user_home!(), ".local/state")
+      end
+
+    workflow_digest =
+      Workflow.workflow_file_path()
+      |> Path.expand()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    Path.join([state_home, "symphony", workflow_digest, "transitions.log"])
   end
 
   defp validate_tracker_kind(%{kind: nil}), do: {:error, :missing_tracker_kind}

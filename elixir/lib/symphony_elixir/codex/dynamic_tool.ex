@@ -7,7 +7,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   @linear_graphql_tool "linear_graphql"
   @linear_graphql_description """
-  Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
+  Execute a read-only GraphQL query against Linear using Symphony's configured auth.
+  Mutations are broker-owned and are rejected for worker sessions.
   """
   @linear_graphql_input_schema %{
     "type" => "object",
@@ -63,6 +64,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
 
     with {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
+         :ok <- reject_mutation(query),
          {:ok, response} <- linear_client.(query, variables, []) do
       graphql_response(response)
     else
@@ -95,6 +97,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp normalize_linear_graphql_arguments(_arguments), do: {:error, :invalid_arguments}
+
+  defp reject_mutation(query) when is_binary(query) do
+    if Regex.match?(~r/(?:^|[^_[:alnum:]])mutation(?:[^_[:alnum:]]|$)/iu, query) do
+      {:error, :worker_tracker_mutation_forbidden}
+    else
+      :ok
+    end
+  end
 
   defp normalize_query(arguments) do
     case Map.get(arguments, "query") || Map.get(arguments, :query) do
@@ -170,6 +180,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     %{
       "error" => %{
         "message" => "`linear_graphql.variables` must be a JSON object when provided."
+      }
+    }
+  end
+
+  defp tool_error_payload(:worker_tracker_mutation_forbidden) do
+    %{
+      "error" => %{
+        "message" => "Tracker mutations are owned by Symphony. Return a structured worker outcome instead of executing a Linear mutation."
       }
     }
   end

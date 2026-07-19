@@ -10,6 +10,18 @@ _In this [demo video](.github/media/symphony-demo.mp4), Symphony monitors a Line
 > [!WARNING]
 > Symphony is a low-key engineering preview for testing in trusted environments.
 
+## Workflow state ownership
+
+Symphony is the sole automated authority for workflow state. Coding agents return semantic outcomes
+such as implementation complete, review findings, or merge ready; they do not mutate workflow labels
+or publish automated transition comments themselves. Symphony serializes those outcomes, records
+external effects in a durable journal, and projects one verified state to GitHub or Linear.
+
+Operators continue to work in the tracker. Human comments are unchanged, and state changes are
+requested with workflow-configured request labels such as `sym:request-planned`; Symphony validates
+the request before replacing the canonical state label. See
+[ADR-20260719-0001-QNX](docs/adr/ADR-20260719-0001-QNX-symphony-owns-tracker-state.md).
+
 ## Running Symphony
 
 ### Requirements

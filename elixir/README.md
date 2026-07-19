@@ -13,15 +13,24 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls Linear for candidate work
+1. Polls Linear or GitHub for candidate work
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until the work is done
+4. Sends a workflow prompt and structured semantic-outcome schema to Codex
+5. Serializes the outcome through Symphony's state manager and projects one verified tracker state
 
-During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
-skills can make raw Linear GraphQL calls.
+During app-server sessions, Symphony may serve a read-only client-side `linear_graphql` tool. Tracker
+state changes and automated comments use Symphony's broker and are not exposed to worker sessions.
+
+Workers do not add/remove `sym:*` labels, close/reopen items, publish automated transition comments,
+or merge pull requests. They return a semantic outcome plus head OID, evidence, and a Korean summary.
+The state manager journals and validates the transition before the tracker broker applies it.
+
+The Elixir contract is `SymphonyElixir.StateManager.request/1` (or `/2` for an explicit server) with
+`SymphonyElixir.TransitionIntent`. It returns `{:ok, %AppliedTransition{}}`, `{:noop, reason}`,
+`{:conflict, snapshot}`, `{:rejected, reason}`, or `{:error, reason}`. Worker output is decoded into a
+`SymphonyElixir.TransitionWorkerOutcome` before any transition request is made.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -34,13 +43,13 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    set it as the `LINEAR_API_KEY` environment variable.
 3. Copy this directory's `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
-   - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
-     operations such as comment editing or upload flows.
+   - Worker sessions may use Symphony's `linear_graphql` app-server tool for scoped reads. Mutations,
+     including comments and state changes, go through Symphony's broker.
 5. Customize the copied `WORKFLOW.md` file for your project.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
-     issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
+     issue statuses: "Reviewing", "Rework", "Reworking", "Human Review", and "Merging". You can customize them in
      Team Settings → Workflow in Linear.
 6. Follow the instructions below to install the required runtime dependencies and start the service.
 
@@ -101,6 +110,8 @@ agent:
   dispatch_kinds:
     - issue
     - pull_request
+state_manager:
+  mode: authoritative
 codex:
   command: codex app-server
 notifications:
@@ -134,6 +145,13 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- `state_manager.mode` supports `legacy`, `shadow`, and `authoritative`; never run legacy and
+  authoritative writers together. New production workflows should explicitly select
+  `authoritative`.
+- `state_manager.journal_path` defaults to
+  `${XDG_STATE_HOME:-~/.local/state}/symphony/<workflow-path-hash>/transitions.log`.
+- GitHub workflows configure `state_manager.human_intent_labels` so operators can request changes
+  with temporary labels. Direct edits to canonical workflow labels are reconciled as drift.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -206,8 +224,9 @@ codex:
 - `POST /api/v1/github/webhook` accepts GitHub `issues`, `pull_request`,
   `pull_request_review`, and `issue_comment` events. Set `SYMPHONY_GITHUB_WEBHOOK_SECRET` so
   Symphony can verify `X-Hub-Signature-256` before queueing an immediate refresh. For GitHub tracker
-  workflows, labeled and pull-request closed events also synchronize the configured Symphony state
-  labels before the refresh is queued.
+  workflows, labeled and pull-request closed events are queued as immutable intents or facts. The
+  webhook handler does not change labels directly; the state manager validates the event before the
+  broker projects state.
 
 ## Web dashboard
 

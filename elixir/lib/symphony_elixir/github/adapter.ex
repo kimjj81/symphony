@@ -19,8 +19,23 @@ defmodule SymphonyElixir.GitHub.Adapter do
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body), do: client_module().create_comment(issue_id, body)
 
+  @spec create_comment_once(String.t(), String.t(), String.t()) :: :applied | :already_applied | {:error, term()}
+  def create_comment_once(issue_id, body, marker), do: client_module().create_comment_once(issue_id, body, marker)
+
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name), do: client_module().update_issue_state(issue_id, state_name)
+
+  @spec apply_state_projection(String.t(), String.t() | nil | :any, String.t()) ::
+          {:applied, map()}
+          | {:already_applied, map()}
+          | {:conflict, map()}
+          | {:partial_failure, map()}
+  def apply_state_projection(issue_id, expected_state, target_state),
+    do: client_module().apply_state_projection(issue_id, expected_state, target_state)
+
+  @spec merge_pull_request(String.t(), String.t()) :: {:applied, map()} | {:conflict, map()} | {:error, map()}
+  def merge_pull_request(issue_id, expected_head_oid),
+    do: client_module().merge_pull_request(issue_id, expected_head_oid)
 
   @spec sync_webhook_state(String.t(), String.t(), map()) :: :ok | {:error, term()}
   def sync_webhook_state(event, action, payload), do: client_module().sync_webhook_state(event, action, payload)
