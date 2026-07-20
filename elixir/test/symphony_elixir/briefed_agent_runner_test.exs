@@ -149,7 +149,8 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     fallback = OrchestrationBrief.fallback(issue)
 
     assert fallback =~ "lane: unknown"
-    assert fallback =~ "inspect only the current live tracker feedback"
+    assert fallback =~ "tracker feedback already present in the workflow context"
+    assert fallback =~ "do not query GitHub"
   end
 
   test "clean review uses one brief and one fresh worker thread before Human Review" do
@@ -188,7 +189,69 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     assert count_lines(trace, "THREAD:") == 1
     assert trace =~ "Verification tier: focused"
     assert trace =~ "review verdict 1 of 3"
+    assert trace =~ "returning exactly one structured semantic outcome"
+    assert trace =~ "do not query or mutate GitHub"
+    refute trace =~ "synchronizing the required Korean tracker comment"
+    refute trace =~ "Re-check the live head once before writes"
     refute trace =~ "You are an agent for this repository."
+  end
+
+  test "authoritative preflight failure hands off without starting a worker" do
+    test_root = test_root("authoritative-preflight-handoff")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+    codex_binary = write_fake_codex!(test_root, trace_file)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true,
+      tracker_active_states: ["Review", "Reviewing", "Rework", "Reworking", "Merging"]
+    )
+
+    enable_authoritative_mode!()
+
+    issue = %{
+      review_issue("authoritative-preflight-handoff")
+      | state: "Reworking",
+        metadata: %{
+          "head_oid" => "head-123",
+          "symphony_dispatch_state" => "Rework",
+          "symphony_transition_id" => "dispatch-123"
+        }
+    }
+
+    parent = self()
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               brief_generator: fn _workspace, brief_issue ->
+                 send(parent, {:brief_lane, brief_issue.state})
+                 {:error, :github_preflight_unavailable}
+               end,
+               state_manager_requester: fn intent ->
+                 send(parent, {:preflight_handoff, intent})
+                 {:ok, %{}}
+               end
+             )
+
+    assert_receive {:brief_lane, "Rework"}
+
+    assert_receive {:preflight_handoff,
+                    %SymphonyElixir.TransitionIntent{
+                      id: "preflight-handoff:github:pr:authoritative-preflight-handoff:dispatch-123",
+                      source: :orchestrator,
+                      expected_state: "Reworking",
+                      kind: :handoff_required,
+                      head_oid: "head-123",
+                      causation_id: "dispatch-123",
+                      comment_body: body
+                    }}
+
+    assert body =~ "작업 에이전트를 시작하지 않고"
+    assert body =~ ":github_preflight_unavailable"
+    refute File.exists?(trace_file)
   end
 
   test "three review findings stop in Human Review without a fourth verdict" do
@@ -400,8 +463,9 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     trace = File.read!(trace_file)
     assert trace =~ "lane: Rework"
     assert trace =~ "State: Rework"
-    assert trace =~ "unresolved live PR review threads and comments once"
-    assert trace =~ "Rework completion moves to Review"
+    assert trace =~ "tracker feedback already present in the workflow context"
+    assert trace =~ "return the matching semantic outcome"
+    assert trace =~ "Symphony decides and applies the tracker transition"
     assert trace =~ "ARGV:--profile rework app-server"
     assert count_lines(trace, "RUN:") == 2
   end
@@ -460,7 +524,8 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
 
     trace = File.read!(trace_file)
     assert trace =~ "Verification tier: full"
-    assert trace =~ "wait for required CI checks"
+    assert trace =~ "full local verification bundle"
+    assert trace =~ "Symphony validates required CI"
     assert trace =~ "lane: Merging"
     assert count_lines(trace, "RUN:") == 1
   end
@@ -585,5 +650,17 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     text
     |> String.split("\n", trim: true)
     |> Enum.count(&String.starts_with?(&1, prefix))
+  end
+
+  defp enable_authoritative_mode! do
+    workflow_path = Workflow.workflow_file_path()
+
+    updated =
+      workflow_path
+      |> File.read!()
+      |> String.replace("polling:\n", "state_manager:\n  mode: authoritative\npolling:\n")
+
+    File.write!(workflow_path, updated)
+    :ok = WorkflowStore.force_reload()
   end
 end

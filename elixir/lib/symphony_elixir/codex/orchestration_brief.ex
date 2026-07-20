@@ -45,14 +45,14 @@ defmodule SymphonyElixir.Codex.OrchestrationBrief do
   def fallback(%Issue{} = issue) do
     unresolved_feedback =
       if normalize_lane(issue.state) == "rework" do
-        "fetch unresolved live PR review threads and comments once at the current head; address only actionable Rework findings"
+        "use only tracker feedback already present in the workflow context; do not query GitHub; stop if actionable Rework feedback is unavailable"
       else
-        "inspect only the current live tracker feedback needed for this lane"
+        "use only tracker feedback already present in the workflow context; do not query GitHub"
       end
 
     """
     lane: #{issue.state || "unknown"}
-    live_head: verify once before any write
+    live_head: use the tracker head metadata already supplied; stop before writes if it is unknown
     unresolved_feedback: #{unresolved_feedback}
     allowed_scope: make the smallest change required by the current lane; do not expand scope
     focused_verification: run git diff --check and only tests or static checks directly covering changed files

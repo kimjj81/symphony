@@ -357,11 +357,39 @@ defmodule SymphonyElixir.AgentRunner do
       |> Keyword.put(:worker_host, worker_host)
       |> Keyword.put(:on_message, codex_message_handler(codex_update_recipient, lane_issue))
 
-    {brief, _brief_meta} =
-      case OrchestrationBrief.generate(workspace, lane_issue, brief_opts) do
-        {:ok, generated, metadata} -> {generated, metadata}
-        {:error, _reason} -> {OrchestrationBrief.fallback(lane_issue), %{source: :fallback}}
-      end
+    case OrchestrationBrief.generate(workspace, lane_issue, brief_opts) do
+      {:ok, brief, _brief_meta} ->
+        run_authoritative_worker(%{
+          workspace: workspace,
+          tracker_issue: tracker_issue,
+          lane_issue: lane_issue,
+          brief: brief,
+          codex_update_recipient: codex_update_recipient,
+          opts: opts,
+          worker_host: worker_host,
+          app_server_opts: app_server_opts,
+          review_attempt: review_attempt,
+          max_review_verdicts: max_review_verdicts
+        })
+
+      {:error, reason} ->
+        request_preflight_handoff_transition(tracker_issue, reason, opts)
+    end
+  end
+
+  defp run_authoritative_worker(context) do
+    %{
+      workspace: workspace,
+      tracker_issue: tracker_issue,
+      lane_issue: lane_issue,
+      brief: brief,
+      codex_update_recipient: codex_update_recipient,
+      opts: opts,
+      worker_host: worker_host,
+      app_server_opts: app_server_opts,
+      review_attempt: review_attempt,
+      max_review_verdicts: max_review_verdicts
+    } = context
 
     task_profile = select_briefed_task_profile(lane_issue)
     verification_tier = verification_tier(lane_issue.state)
@@ -405,6 +433,39 @@ defmodule SymphonyElixir.AgentRunner do
         AppServer.stop_session(session)
       end
     end
+  end
+
+  defp request_preflight_handoff_transition(tracker_issue, reason, opts) do
+    metadata = tracker_issue.metadata || %{}
+
+    dispatch_transition_id =
+      metadata["symphony_transition_id"] || metadata[:symphony_transition_id]
+
+    intent = %TransitionIntent{
+      id: "preflight-handoff:#{tracker_issue.id}:#{dispatch_transition_id || "missing-causation"}",
+      issue_id: tracker_issue.id,
+      source: :orchestrator,
+      actor: "symphony",
+      expected_state: tracker_issue.state,
+      kind: :handoff_required,
+      head_oid: metadata["head_oid"] || metadata[:head_oid],
+      causation_id: dispatch_transition_id,
+      work_item_kind: tracker_issue.kind,
+      comment_body:
+        "Symphony orchestration preflight을 완료하지 못해 작업 에이전트를 시작하지 않고 사람 검토로 인계합니다.\n\n" <>
+          "- 사유: #{inspect(reason)}"
+    }
+
+    requester = Keyword.get(opts, :state_manager_requester)
+
+    result =
+      if is_function(requester, 1) do
+        requester.(intent)
+      else
+        StateManager.request(Keyword.get(opts, :state_manager, SymphonyElixir.Orchestrator), intent)
+      end
+
+    normalize_worker_transition_result(result)
   end
 
   defp decode_worker_outcome(turn_session) do
@@ -718,20 +779,20 @@ defmodule SymphonyElixir.AgentRunner do
     review_guidance =
       cond do
         review_state?(issue.state) and review_attempt >= max_review_verdicts ->
-          "This is review verdict #{review_attempt} of #{max_review_verdicts}. If any finding remains, post the Korean blocker summary and move the item to Human Review, not Rework. A clean review also moves directly to Human Review."
+          "This is review verdict #{review_attempt} of #{max_review_verdicts}. If any finding remains, return review_findings with a Korean blocker summary. Return clean_review when there are no findings. Symphony decides and applies the tracker transition."
 
         review_state?(issue.state) ->
-          "This is review verdict #{review_attempt} of #{max_review_verdicts}. Move a clean review directly to Human Review. Move to Rework only for actionable findings."
+          "This is review verdict #{review_attempt} of #{max_review_verdicts}. Return clean_review when there are no findings, or review_findings only for actionable findings. Symphony decides and applies the tracker transition."
 
         true ->
-          "Complete only the current lane. Implementation or Rework completion moves to Review."
+          "Complete only the current lane and return the matching semantic outcome. Symphony decides and applies the tracker transition."
       end
 
     verification_guidance =
       if verification_tier == :full do
-        "Run the repository-defined full verification bundle and wait for required CI checks before merge completion."
+        "Run the repository-defined full local verification bundle. Symphony validates required CI before merge completion."
       else
-        "Run only focused verification directly covering changed files. Check CI once without polling. Do not run full API/Web/OpenAPI/Astro suites or Compose/seed unless the exact finding cannot be verified more narrowly. Retry browser or environment failures at most once, then report partial coverage."
+        "Run only focused verification directly covering changed files. Use any CI snapshot supplied in the brief without polling GitHub. Do not run full API/Web/OpenAPI/Astro suites or Compose/seed unless the exact finding cannot be verified more narrowly. Retry browser or environment failures at most once, then report partial coverage."
       end
 
     """
@@ -748,16 +809,16 @@ defmodule SymphonyElixir.AgentRunner do
     The orchestration preflight already read and applied the long conductor, review, GitHub-review
     skills and their reference documents. Do not reopen those documents. Read a repository skill or
     reference only if this brief names it explicitly and the current live state cannot be handled
-    without it. Re-check the live head once before writes and keep the change literal to the brief.
-    If this lane started after the preflight, read only the new live review feedback added since the
-    brief; do not repeat the complete historical sweep.
+    without it. Treat the supplied live head and GitHub feedback as the tracker snapshot for this
+    dispatch. Use git to stop on branch-head drift before pushing, but do not query or mutate GitHub.
+    Keep the change literal to the brief.
 
     #{review_guidance}
     #{verification_guidance}
 
-    Finish by synchronizing the required Korean tracker comment and label transition. Do not leave
-    the item in the same active state. Stop immediately after reaching Human Review or another
-    non-active state.
+    Finish by returning exactly one structured semantic outcome. Do not post tracker comments,
+    add or remove workflow labels, close or reopen items, or merge pull requests. Symphony owns all
+    tracker responses and state transitions.
     """
   end
 
