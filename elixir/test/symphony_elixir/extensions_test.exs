@@ -261,7 +261,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
-    assert {:error, :unsupported_pull_request_creation} = SymphonyElixir.Tracker.create_pull_request_for_issue(issue)
+
+    assert {:error, :unsupported_pull_request_creation} =
+             SymphonyElixir.Tracker.create_pull_request_for_issue(issue)
+
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
     assert_receive {:memory_tracker_create_pull_request_for_issue, ^issue}
@@ -269,7 +272,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
     assert :ok = Memory.create_comment("issue-1", "quiet")
     assert :ok = Memory.update_issue_state("issue-1", "Quiet")
-    assert {:error, :unsupported_pull_request_creation} = Memory.create_pull_request_for_issue(issue)
+
+    assert {:error, :unsupported_pull_request_creation} =
+             Memory.create_pull_request_for_issue(issue)
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert SymphonyElixir.Tracker.adapter() == Adapter
@@ -304,10 +309,21 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert_receive {:github_update_issue_state_called, "issue-1", "Done"}
 
-    assert :ok = GitHubAdapter.sync_webhook_state("issues", "labeled", %{"label" => %{"name" => "sym:todo"}})
+    assert :ok =
+             GitHubAdapter.sync_webhook_state("issues", "labeled", %{
+               "label" => %{"name" => "sym:todo"}
+             })
+
     assert_receive {:github_sync_webhook_state_called, "issues", "labeled", %{"label" => %{"name" => "sym:todo"}}}
 
-    issue = %Issue{id: "github:issue:1", identifier: "#1", title: "Issue", state: "Planned", kind: :issue}
+    issue = %Issue{
+      id: "github:issue:1",
+      identifier: "#1",
+      title: "Issue",
+      state: "Planned",
+      kind: :issue
+    }
+
     assert {:ok, ^issue} = SymphonyElixir.Tracker.create_pull_request_for_issue(issue)
     assert_receive {:github_create_pull_request_for_issue_called, ^issue}
   end
@@ -512,7 +528,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
-    assert {:error, :unsupported_pull_request_creation} = Adapter.create_pull_request_for_issue(%Issue{})
+
+    assert {:error, :unsupported_pull_request_creation} =
+             Adapter.create_pull_request_for_issue(%Issue{})
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
@@ -731,7 +749,10 @@ defmodule SymphonyElixir.ExtensionsTest do
       |> post("/api/v1/github/webhook", body)
 
     assert json_response(conn, 401) == %{
-             "error" => %{"code" => "invalid_signature", "message" => "GitHub webhook signature is invalid"}
+             "error" => %{
+               "code" => "invalid_signature",
+               "message" => "GitHub webhook signature is invalid"
+             }
            }
   end
 
@@ -781,6 +802,150 @@ defmodule SymphonyElixir.ExtensionsTest do
              "ignored" => true,
              "event" => "pull_request",
              "action" => "opened"
+           }
+  end
+
+  test "forgejo webhook accepts raw hex signatures and queues a provider-qualified targeted refresh" do
+    secret = "forgejo-webhook-secret"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "forgejo",
+      tracker_endpoint: "https://forgejo.example/api/v1",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven"
+    )
+
+    body =
+      Jason.encode!(%{
+        action: "labeled",
+        label: %{name: "sym:planned"},
+        issue: %{
+          number: 29,
+          pull_request: %{
+            url: "https://forgejo.example/api/v1/repos/studiojin-dev/myven/pulls/29"
+          }
+        },
+        repository: %{full_name: "studiojin-dev/myven", html_url: "https://forgejo.example/studiojin-dev/myven"},
+        sender: %{login: "maintainer"}
+      })
+
+    orchestrator_name = Module.concat(__MODULE__, :ForgejoWebhookOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        recipient: self(),
+        targeted_refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["targeted-reconcile"],
+          issue_id: "forgejo:pr:29"
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      forgejo_webhook_secret: secret,
+      forgejo_webhook_follow_up_refresh_ms: 10
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("x-forgejo-event", "issues")
+      |> put_req_header("x-forgejo-delivery", "delivery-29")
+      |> put_req_header("x-forgejo-signature", forgejo_signature(body, secret))
+      |> post("/api/v1/forgejo/webhook", body)
+
+    assert %{
+             "queued" => true,
+             "coalesced" => false,
+             "operations" => ["targeted-reconcile"],
+             "event" => "issues",
+             "action" => "labeled",
+             "issue_id" => "forgejo:pr:29",
+             "follow_up_refresh_in_ms" => 10
+           } = json_response(conn, 202)
+
+    assert_receive {:targeted_refresh, "forgejo:pr:29"}, 200
+    assert_receive {:webhook_follow_up_refresh, "forgejo:pr:29"}, 200
+  end
+
+  test "forgejo webhook rejects prefixed or otherwise invalid signatures" do
+    secret = "forgejo-webhook-secret"
+    body = Jason.encode!(%{action: "labeled"})
+
+    start_test_endpoint(
+      orchestrator: Module.concat(__MODULE__, :ForgejoWebhookInvalidSignatureOrchestrator),
+      snapshot_timeout_ms: 5,
+      forgejo_webhook_secret: secret
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("x-forgejo-event", "issues")
+      |> put_req_header("x-forgejo-delivery", "delivery-invalid-signature")
+      |> put_req_header("x-forgejo-signature", "sha256=" <> forgejo_signature(body, secret))
+      |> post("/api/v1/forgejo/webhook", body)
+
+    assert json_response(conn, 401) == %{
+             "error" => %{
+               "code" => "invalid_signature",
+               "message" => "Forgejo webhook signature is invalid"
+             }
+           }
+  end
+
+  test "forgejo webhook rejects missing event and delivery headers before refresh" do
+    secret = "forgejo-webhook-secret"
+    body = Jason.encode!(%{action: "labeled"})
+
+    start_test_endpoint(
+      orchestrator: Module.concat(__MODULE__, :ForgejoWebhookMissingHeadersOrchestrator),
+      snapshot_timeout_ms: 5,
+      forgejo_webhook_secret: secret
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("x-forgejo-signature", forgejo_signature(body, secret))
+      |> post("/api/v1/forgejo/webhook", body)
+
+    assert json_response(conn, 400) == %{
+             "error" => %{
+               "code" => "invalid_webhook_headers",
+               "message" => "Forgejo webhook event and delivery headers are required exactly once"
+             }
+           }
+  end
+
+  test "forgejo webhook requires a configured secret" do
+    body = Jason.encode!(%{action: "labeled"})
+
+    start_test_endpoint(
+      orchestrator: Module.concat(__MODULE__, :ForgejoWebhookMissingSecretOrchestrator),
+      snapshot_timeout_ms: 5,
+      forgejo_webhook_secret: ""
+    )
+
+    conn =
+      build_conn()
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("x-forgejo-event", "issues")
+      |> put_req_header("x-forgejo-signature", "invalid")
+      |> post("/api/v1/forgejo/webhook", body)
+
+    assert json_response(conn, 503) == %{
+             "error" => %{
+               "code" => "forgejo_webhook_secret_missing",
+               "message" => "Forgejo webhook secret is not configured"
+             }
            }
   end
 
@@ -1046,6 +1211,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       |> Base.encode16(case: :lower)
 
     "sha256=" <> signature
+  end
+
+  defp forgejo_signature(body, secret) do
+    :crypto.mac(:hmac, :sha256, secret, body)
+    |> Base.encode16(case: :lower)
   end
 
   defp github_response(status, body), do: {:ok, %Req.Response{status: status, body: body}}

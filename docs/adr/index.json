@@ -1,5 +1,21 @@
 [
   {
+    "id": "ADR-20260720-0003-FJV",
+    "title": "Forgejo is a first-class tracker provider",
+    "tags": [
+      "orchestration",
+      "tracker",
+      "forgejo",
+      "github",
+      "webhook",
+      "security"
+    ],
+    "status": "Accepted",
+    "date": "2026-07-20",
+    "tldr": "Symphony uses a separate Forgejo v16 adapter while sharing workflow-state policy and broker safety with the GitHub adapter.",
+    "path": "docs/adr/ADR-20260720-0003-FJV-forgejo-is-a-first-class-tracker-provider.md"
+  },
+  {
     "id": "ADR-20260720-0002-RKT",
     "title": "Webhook registration does not gate runtime startup",
     "tags": [

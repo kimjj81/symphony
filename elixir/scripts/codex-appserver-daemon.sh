@@ -72,7 +72,22 @@ command -v "$CODEX_BIN" >/dev/null 2>&1 || {
 
 # Tracker writes are broker-owned. Each daemon lifetime receives a new empty
 # gh configuration directory so cached credentials cannot cross runs.
-unset GITHUB_TOKEN GH_TOKEN SYMPHONY_TRACKER_WRITE_TOKEN LINEAR_API_KEY
+tracker_read_token=${SYMPHONY_TRACKER_READ_TOKEN:-}
+unset GITHUB_TOKEN GH_TOKEN FORGEJO_TOKEN SYMPHONY_TRACKER_WRITE_TOKEN LINEAR_API_KEY \
+  SYMPHONY_TRACKER_READ_TOKEN SYMPHONY_FORGEJO_WEBHOOK_SECRET SYMPHONY_GITHUB_WEBHOOK_SECRET
+
+# The workflow loader records custom write-token variable names for in-process
+# workers. A standalone daemon cannot read that workflow, so operators can
+# provide the same comma-separated names here without exposing their values.
+if [ -n "${SYMPHONY_TRACKER_WRITE_TOKEN_ENV_NAMES:-}" ]; then
+  IFS=',' read -r -a write_token_envs <<< "$SYMPHONY_TRACKER_WRITE_TOKEN_ENV_NAMES"
+  for write_token_env in "${write_token_envs[@]}"; do
+    if [[ "$write_token_env" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      unset "$write_token_env"
+    fi
+  done
+fi
+unset SYMPHONY_TRACKER_WRITE_TOKEN_ENV_NAMES
 export GH_CONFIG_DIR
 GH_CONFIG_DIR=$(mktemp -d "${CODEX_APPSERVER_STATE_DIR}/worker-gh-config.XXXXXX")
 chmod 500 "$GH_CONFIG_DIR"
@@ -80,14 +95,50 @@ export GIT_TERMINAL_PROMPT=0
 export GIT_CONFIG_COUNT=1
 export GIT_CONFIG_KEY_0=credential.helper
 export GIT_CONFIG_VALUE_0=
-if [ -n "${SYMPHONY_TRACKER_READ_TOKEN:-}" ]; then
-  export GH_TOKEN=$SYMPHONY_TRACKER_READ_TOKEN
+if [ -n "$tracker_read_token" ]; then
+  if [ "${SYMPHONY_TRACKER_KIND:-github}" = "forgejo" ]; then
+    export FORGEJO_TOKEN=$tracker_read_token
+  else
+    export GH_TOKEN=$tracker_read_token
+  fi
+fi
+unset tracker_read_token
+
+# The app-server passes its environment to local Codex workers. Start it with
+# only the values a worker needs so an unrecognised custom tracker write-token
+# variable cannot be inherited. Proxy endpoints remain explicitly available.
+appserver_env=(
+  "HOME=$HOME"
+  "PATH=$PATH"
+  "GH_CONFIG_DIR=$GH_CONFIG_DIR"
+  "GIT_TERMINAL_PROMPT=$GIT_TERMINAL_PROMPT"
+  "GIT_CONFIG_COUNT=$GIT_CONFIG_COUNT"
+  "GIT_CONFIG_KEY_0=$GIT_CONFIG_KEY_0"
+  "GIT_CONFIG_VALUE_0=$GIT_CONFIG_VALUE_0"
+)
+
+for allowed_http_env in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+  if [ -n "${!allowed_http_env+x}" ]; then
+    appserver_env+=("$allowed_http_env=${!allowed_http_env}")
+  fi
+done
+
+if [ -n "${GH_TOKEN:-}" ]; then
+  appserver_env+=("GH_TOKEN=$GH_TOKEN")
+fi
+
+if [ -n "${FORGEJO_TOKEN:-}" ]; then
+  appserver_env+=("FORGEJO_TOKEN=$FORGEJO_TOKEN")
+fi
+
+if [ -n "${SSH_AUTH_SOCK:-}" ]; then
+  appserver_env+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
 fi
 
 set +e
 printf "INFO: booting codex app-server via ws on %s\n" "$CODEX_WS_URL"
 
-$CODEX_BIN app-server \
+env -i "${appserver_env[@]}" $CODEX_BIN app-server \
   --listen "$CODEX_WS_URL" \
   --config model="$CODEX_MODEL" \
   --config model_reasoning_effort="$CODEX_MODEL_REASONING_EFFORT" \

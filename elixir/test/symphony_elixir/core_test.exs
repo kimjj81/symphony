@@ -298,6 +298,104 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "| 탐색/조사/분석 | `gpt-5.6-terra` + `medium` effort |"
   end
 
+  test "Forgejo tracker config resolves v16 API settings and validates required fields" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "forgejo",
+      tracker_endpoint: "https://forgejo.example.org/api/v1",
+      tracker_api_token: "legacy-token",
+      tracker_read_api_token: "read-token",
+      tracker_write_api_token: "write-token",
+      tracker_project_slug: nil,
+      tracker_owner: "example",
+      tracker_repo: "project",
+      tracker_bot_login: "symphony"
+    )
+
+    assert :ok = Config.validate!()
+    tracker = Config.settings!().tracker
+    assert tracker.kind == "forgejo"
+    assert tracker.endpoint == "https://forgejo.example.org/api/v1"
+    assert tracker.api_key == "write-token"
+    assert tracker.write_api_key == "write-token"
+    assert tracker.read_api_key == "read-token"
+    assert tracker.bot_login == "symphony"
+    assert Tracker.adapter() == SymphonyElixir.Forgejo.Adapter
+
+    assert {:conflict,
+            %{
+              reason: {:tracker_provider_mismatch, "github", "forgejo", "github:issue:42"}
+            }} = Tracker.apply_state_projection("github:issue:42", "Todo", "Planned")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "forgejo",
+      tracker_endpoint: "https://forgejo.example.org",
+      tracker_api_token: "token",
+      tracker_project_slug: nil,
+      tracker_owner: "example",
+      tracker_repo: "project"
+    )
+
+    assert {:error, {:invalid_forgejo_endpoint, "https://forgejo.example.org"}} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "forgejo",
+      tracker_endpoint: "https://forgejo.example.org/api/v1",
+      tracker_api_token: "token",
+      tracker_project_slug: nil,
+      tracker_owner: nil,
+      tracker_repo: "project"
+    )
+
+    assert {:error, :missing_forgejo_owner} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "forgejo",
+      tracker_endpoint: nil,
+      tracker_api_token: "token",
+      tracker_project_slug: nil,
+      tracker_owner: "example",
+      tracker_repo: "project"
+    )
+
+    assert Config.settings!().tracker.endpoint == nil
+    assert {:error, :missing_forgejo_endpoint} = Config.validate!()
+  end
+
+  test "Forgejo config preserves write-token fallback precedence and a separate read token" do
+    previous_forgejo_token = System.get_env("FORGEJO_TOKEN")
+    previous_write_token = System.get_env("SYMPHONY_TRACKER_WRITE_TOKEN")
+    previous_read_token = System.get_env("SYMPHONY_TRACKER_READ_TOKEN")
+
+    on_exit(fn ->
+      restore_env("FORGEJO_TOKEN", previous_forgejo_token)
+      restore_env("SYMPHONY_TRACKER_WRITE_TOKEN", previous_write_token)
+      restore_env("SYMPHONY_TRACKER_READ_TOKEN", previous_read_token)
+    end)
+
+    System.put_env("FORGEJO_TOKEN", "legacy-forgejo-write")
+    System.delete_env("SYMPHONY_TRACKER_WRITE_TOKEN")
+    System.put_env("SYMPHONY_TRACKER_READ_TOKEN", "separate-forgejo-read")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "forgejo",
+      tracker_endpoint: "https://forgejo.example.org/api/v1",
+      tracker_api_token: nil,
+      tracker_read_api_token: nil,
+      tracker_write_api_token: nil,
+      tracker_project_slug: nil,
+      tracker_owner: "example",
+      tracker_repo: "project"
+    )
+
+    assert Config.settings!().tracker.write_api_key == "legacy-forgejo-write"
+    assert Config.settings!().tracker.read_api_key == "separate-forgejo-read"
+
+    System.put_env("SYMPHONY_TRACKER_WRITE_TOKEN", "preferred-write")
+    WorkflowStore.force_reload()
+
+    assert Config.settings!().tracker.write_api_key == "preferred-write"
+  end
+
   test "current WORKFLOW.md file is valid and complete" do
     original_workflow_path = Workflow.workflow_file_path()
     on_exit(fn -> Workflow.set_workflow_file_path(original_workflow_path) end)

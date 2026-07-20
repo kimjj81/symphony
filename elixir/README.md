@@ -13,7 +13,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls Linear or GitHub for candidate work
+1. Polls Linear, GitHub, or Forgejo for candidate work
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
@@ -150,7 +150,7 @@ Notes:
   `authoritative`.
 - `state_manager.journal_path` defaults to
   `${XDG_STATE_HOME:-~/.local/state}/symphony/<workflow-path-hash>/transitions.log`.
-- GitHub workflows configure `state_manager.human_intent_labels` so operators can request changes
+- GitHub and Forgejo workflows configure `state_manager.human_intent_labels` so operators can request changes
   with temporary labels. Direct edits to canonical workflow labels are reconciled as drift.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
@@ -191,6 +191,13 @@ Notes:
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- `tracker.kind: forgejo` requires a Forgejo v16 API endpoint ending in `/api/v1`, plus `owner` and
+  `repo`. Use separate `SYMPHONY_TRACKER_READ_TOKEN` and `SYMPHONY_TRACKER_WRITE_TOKEN` values when
+  possible. `FORGEJO_TOKEN` remains a legacy write-token fallback. The write token needs
+  `write:issue` and `write:repository`; Codex workers never inherit it.
+  When `write_api_key` uses a custom `$VAR`, Symphony also strips that source variable from workers.
+  The standalone daemon starts Codex with a narrow environment allowlist, so custom write-token
+  source variables cannot be inherited either.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -207,6 +214,26 @@ hooks:
 codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.6-terra\"' app-server"
 ```
+
+Forgejo example:
+
+```yaml
+tracker:
+  kind: forgejo
+  endpoint: https://forgejo.example.org/api/v1
+  owner: example
+  repo: project
+  read_api_key: $SYMPHONY_TRACKER_READ_TOKEN
+  write_api_key: $SYMPHONY_TRACKER_WRITE_TOKEN
+  bot_login: symphony
+```
+
+Copy `WORKFLOW.forgejo.md` as a starting point for a complete provider-specific workflow.
+
+Forgejo child issues use one `sym:parent-<number>` label, such as `sym:parent-42`. Symphony treats
+multiple or malformed parent labels as a conflict, preserves the relationship label during state
+projection, blocks terminal parents with unfinished children, completes a parent after its final
+terminal child, and uses it for Planned-child PR delegation.
 
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
@@ -227,6 +254,13 @@ codex:
   workflows, labeled and pull-request closed events are queued as immutable intents or facts. The
   webhook handler does not change labels directly; the state manager validates the event before the
   broker projects state.
+- `POST /api/v1/forgejo/webhook` accepts the equivalent Forgejo events. Set
+  `SYMPHONY_FORGEJO_WEBHOOK_SECRET`; Symphony validates the raw hexadecimal HMAC-SHA256 value in
+  `X-Forgejo-Signature` and reads `X-Forgejo-Event` plus `X-Forgejo-Delivery`. Forgejo webhook
+  support is direct HTTP only; the signed payload repository must match configured `owner/repo`.
+  Head updates and review submissions are refresh-only events. Reopens are brokered transition
+  requests that converge to `Human Review`, then schedule a targeted refresh. The GitHub NATS relay
+  remains unchanged.
 
 ## Web dashboard
 

@@ -7,6 +7,9 @@ defmodule SymphonyElixir.GitHub.Adapter do
 
   alias SymphonyElixir.GitHub.Client
 
+  @spec preflight() :: :ok
+  def preflight, do: :ok
+
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues, do: client_module().fetch_candidate_issues()
 

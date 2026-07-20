@@ -16,7 +16,7 @@ behavior.
 ## 1. Problem Statement
 
 Symphony is a long-running automation service that continuously reads work from an issue tracker
-(Linear or GitHub), creates an isolated workspace for each issue, and runs a
+(Linear, GitHub, or Forgejo), creates an isolated workspace for each issue, and runs a
 coding agent session for that issue inside the workspace.
 
 The service solves four operational problems:
@@ -418,19 +418,25 @@ Fields:
 
 - `kind` (string)
   - REQUIRED for dispatch.
-  - Current supported values: `linear`, `github`
+  - Current supported values: `linear`, `github`, `forgejo`
 - `endpoint` (string)
   - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
 - `api_key` (string)
   - MAY be a literal token or `$VAR_NAME`.
   - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_API_KEY`.
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
+- `read_api_key`, `write_api_key` (strings)
+  - OPTIONAL split credentials for hosted-Git trackers. Broker writes MUST use `write_api_key` when
+    present; workers MAY receive only `read_api_key`.
+  - For Forgejo, `api_key` and `FORGEJO_TOKEN` are compatibility write-token fallbacks.
+  - If a write key is configured as `$VAR_NAME`, the broker MUST remove `VAR_NAME` as well as the
+    canonical write-token variables from every worker environment.
 - `project_slug` (string)
   - REQUIRED for dispatch when `tracker.kind == "linear"`.
 - `owner`, `repo` (strings)
-  - REQUIRED for dispatch when `tracker.kind == "github"`.
+  - REQUIRED for dispatch when `tracker.kind == "github"` or `tracker.kind == "forgejo"`.
 - `state_labels` (map `state_name -> label`)
-  - REQUIRED when tracker-native workflow state is represented by GitHub labels.
+  - REQUIRED when tracker-native workflow state is represented by hosted-Git labels.
   - Canonical state labels MUST be disjoint from `state_manager.human_intent_labels`.
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
@@ -712,12 +718,15 @@ This section is intentionally redundant so a coding agent can implement the conf
 Extension fields are documented in the extension section that defines them. Core conformance does
 not require recognizing or validating extension fields unless that extension is implemented.
 
-- `tracker.kind`: string, REQUIRED, currently `linear` or `github`
+- `tracker.kind`: string, REQUIRED, currently `linear`, `github`, or `forgejo`
 - `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
 - `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
+- `tracker.read_api_key`, `tracker.write_api_key`: optional split hosted-Git credentials
 - `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
-- `tracker.owner`, `tracker.repo`: strings, REQUIRED when `tracker.kind=github`
-- `tracker.state_labels`: canonical state-to-label map for GitHub
+- `tracker.owner`, `tracker.repo`: strings, REQUIRED when `tracker.kind=github` or `tracker.kind=forgejo`
+- `tracker.endpoint`: MUST end in `/api/v1` when `tracker.kind=forgejo`; Forgejo major version 16 is supported
+- `tracker.bot_login`: optional tracker actor login used to recognize broker projection webhook echoes
+- `tracker.state_labels`: canonical state-to-label map for GitHub and Forgejo
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
@@ -1434,6 +1443,27 @@ GitHub-specific read and projection semantics are defined by Sections 11.1 and 1
 and pull requests share the issue-label API; implementations normalize their configured canonical
 state label to the same language-neutral `Issue.state` field used by Linear.
 
+Forgejo-specific requirements for `tracker.kind == "forgejo"`:
+
+- The endpoint MUST end in `/api/v1`; `/version` preflight MUST report major version 16 before
+  dispatch. A mismatch skips dispatch but MUST NOT terminate observability or journal recovery.
+- IDs MUST be `forgejo:issue:<number>` and `forgejo:pr:<number>`.
+- Listing MUST use Forgejo `page`/`limit` pagination and normalize issues plus pull requests.
+- State writes MUST resolve numeric label IDs, preserve non-Symphony labels and one valid
+  `sym:parent-<number>` relationship label, replace the full set, and verify it.
+- Malformed or multiple parent labels are a relationship conflict. Symphony does not infer
+  hierarchy from issue text.
+- A terminal parent with a non-terminal declared child MUST be projected to Human Review rather
+  than closed. When all declared children are terminal, the final child projection MUST
+  synchronously converge the parent to Done.
+- A parent with declared children but no open Planned child MUST NOT receive a direct PR.
+- Only same-repository branches and pull requests are supported; fork and cross-instance PRs fail
+  closed.
+- Squash merge MUST re-read the PR, compare its head with the expected OID, send `Do: squash` and
+  `head_commit_id`, then verify merged/head state. A mergeability-pending response MAY be retried
+  only while the pinned head remains unchanged.
+- The broker token requires Forgejo `write:issue` and `write:repository` scopes.
+
 ### 11.3 Normalization Rules
 
 Candidate issue normalization SHOULD produce fields listed in Section 4.1.1.
@@ -1482,15 +1512,27 @@ Symphony requires first-class tracker write ports owned by the tracker broker.
 - A GitHub state projection MUST begin from a fresh live snapshot, preserve every non-workflow
   label, remove all configured canonical and request labels, add one target label, replace the full
   label set in one request, and verify the result with a second read.
+- A Forgejo projection MUST provide the same semantics using Forgejo numeric label IDs.
 - Linear projections MUST implement equivalent expected-state, idempotency, and verification
   semantics through its native API.
 - A transport success without verified target state is `partial_failure`, not an applied transition.
 
 Human interaction remains part of the tracker UX. Human-authored comments are not brokered. On
-GitHub, a person requests a workflow transition by applying one configured `sym:request-*` label.
+GitHub or Forgejo, a person requests a workflow transition by applying one configured
+`sym:request-*` label.
 The resulting webhook is an intent only; Symphony validates and consumes it. A direct edit of a
 canonical state label is drift and is reconciled to the last verified state. Other tracker adapters
 MUST expose an explicit, auditable operator-intent mechanism with equivalent validation.
+
+Forgejo HTTP webhooks use `POST /api/v1/forgejo/webhook`, `X-Forgejo-Event`,
+`X-Forgejo-Delivery`, and the raw lowercase hexadecimal HMAC-SHA256 value in
+`X-Forgejo-Signature`, keyed by `SYMPHONY_FORGEJO_WEBHOOK_SECRET`. Delivery and transition IDs MUST
+be provider-qualified. A verified Forgejo delivery MUST also match configured `tracker.owner/repo`
+before any intent ingestion or refresh. Head updates and review submissions are refresh-only
+intents and MUST still schedule targeted refresh. Reopens are brokered `reopen` transition
+requests followed by targeted refresh, so they are projected to `Human Review` rather than silently
+changing a canonical state. Journal replay MUST quarantine a
+hosted-Git ID whose provider differs from the current tracker before any external write.
 
 ## 12. Prompt Construction and Context Assembly
 
@@ -1943,8 +1985,9 @@ RECOMMENDED additional hardening for ports:
 - Do not log API tokens or secret env values.
 - Validate presence of secrets without printing them.
 - Resolve `SYMPHONY_TRACKER_WRITE_TOKEN` only in the broker process.
-- Remove `GITHUB_TOKEN`, `GH_TOKEN`, and `SYMPHONY_TRACKER_WRITE_TOKEN` from worker environments and
-  use an empty worker `GH_CONFIG_DIR`.
+- Remove `GITHUB_TOKEN`, `GH_TOKEN`, `FORGEJO_TOKEN`, `SYMPHONY_TRACKER_WRITE_TOKEN`, and every
+  configured `$VAR_NAME` write-token source from worker environments and use an empty worker
+  `GH_CONFIG_DIR`. A Forgejo worker MAY receive only the explicitly configured read token.
 - Keep repository push credentials separate from tracker API credentials. Operations needing tracker
   write permission, including automated comments and merge, MUST use the broker.
 
@@ -2258,7 +2301,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Invalid YAML front matter returns typed error
 - Front matter non-map returns typed error
 - Config defaults apply when OPTIONAL values are missing
-- `tracker.kind` validation enforces currently supported kinds (`linear`, `github`)
+- `tracker.kind` validation enforces currently supported kinds (`linear`, `github`, `forgejo`)
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
 - `~` path expansion works

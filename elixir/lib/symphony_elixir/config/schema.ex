@@ -50,12 +50,17 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:read_api_key, :string)
       field(:write_api_key, :string)
+      # Internal provenance used only to strip configured write credentials from workers.
+      field(:write_api_key_envs, {:array, :string}, default: [])
       field(:project_slug, :string)
       field(:owner, :string)
       field(:repo, :string)
       field(:assignee, :string)
+      field(:bot_login, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress", "Reworking"])
+
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
+
       field(:state_labels, :map, default: %{})
     end
 
@@ -74,6 +79,7 @@ defmodule SymphonyElixir.Config.Schema do
           :owner,
           :repo,
           :assignee,
+          :bot_login,
           :active_states,
           :terminal_states,
           :state_labels
@@ -376,7 +382,10 @@ defmodule SymphonyElixir.Config.Schema do
       if model in @allowed_models do
         errors
       else
-        [{:task_profiles, "profile #{profile_key} model must be one of #{Enum.join(@allowed_models, "|")}, got #{model}"} | errors]
+        [
+          {:task_profiles, "profile #{profile_key} model must be one of #{Enum.join(@allowed_models, "|")}, got #{model}"}
+          | errors
+        ]
       end
     end
 
@@ -390,7 +399,10 @@ defmodule SymphonyElixir.Config.Schema do
       if effort in @reasoning_efforts do
         errors
       else
-        [{:task_profiles, "profile #{profile_key} effort must be one of #{Enum.join(@reasoning_efforts, "|")}"} | errors]
+        [
+          {:task_profiles, "profile #{profile_key} effort must be one of #{Enum.join(@reasoning_efforts, "|")}"}
+          | errors
+        ]
       end
     end
 
@@ -428,7 +440,14 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
-    @hook_fields [:after_sync_local_files, :after_create, :before_run, :after_run, :before_remove, :timeout_ms]
+    @hook_fields [
+      :after_sync_local_files,
+      :after_create,
+      :before_run,
+      :after_run,
+      :before_remove,
+      :timeout_ms
+    ]
 
     @primary_key false
     embedded_schema do
@@ -505,6 +524,7 @@ defmodule SymphonyElixir.Config.Schema do
       embedded_schema do
         field(:enabled, :boolean, default: false)
         field(:webhook_url, :string)
+
         field(:notify_states, {:array, :string}, default: ["Human Review", "Done", "Canceled", "Cancelled", "Closed", "Duplicate"])
       end
 
@@ -524,6 +544,7 @@ defmodule SymphonyElixir.Config.Schema do
       embedded_schema do
         field(:enabled, :boolean, default: false)
         field(:command, :string, default: "cmux")
+
         field(:notify_states, {:array, :string}, default: ["Human Review", "Done", "Canceled", "Cancelled", "Closed", "Duplicate"])
       end
 
@@ -764,17 +785,23 @@ defmodule SymphonyElixir.Config.Schema do
             settings.tracker.write_api_key,
             System.get_env("SYMPHONY_TRACKER_WRITE_TOKEN") || legacy_tracker_api_key
           ),
+        write_api_key_envs: secret_setting_env_names(settings.tracker.write_api_key, settings.tracker.api_key),
         read_api_key:
           resolve_secret_setting(
             settings.tracker.read_api_key,
             System.get_env("SYMPHONY_TRACKER_READ_TOKEN")
           ),
-        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE")),
+        bot_login: resolve_tracker_bot_login(tracker_kind, settings.tracker.bot_login)
     }
 
     workspace = %{
       settings.workspace
-      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces")),
+      | root:
+          resolve_path_value(
+            settings.workspace.root,
+            Path.join(System.tmp_dir!(), "symphony_workspaces")
+          ),
         source: resolve_path_value(settings.workspace.source, nil)
     }
 
@@ -839,17 +866,44 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defp resolve_tracker_endpoint("forgejo", endpoint) do
+    case resolve_secret_setting(endpoint, nil) do
+      "https://api.linear.app/graphql" -> nil
+      value -> value
+    end
+  end
+
   defp resolve_tracker_endpoint(_kind, endpoint) do
     resolve_secret_setting(endpoint, nil)
   end
 
   defp resolve_tracker_api_key("github", configured) do
-    resolve_secret_setting(configured, System.get_env("GITHUB_TOKEN") || System.get_env("GH_TOKEN"))
+    resolve_secret_setting(
+      configured,
+      System.get_env("GITHUB_TOKEN") || System.get_env("GH_TOKEN")
+    )
+  end
+
+  defp resolve_tracker_api_key("forgejo", configured) do
+    resolve_secret_setting(configured, System.get_env("FORGEJO_TOKEN"))
   end
 
   defp resolve_tracker_api_key(_kind, configured) do
     resolve_secret_setting(configured, System.get_env("LINEAR_API_KEY"))
   end
+
+  defp resolve_tracker_bot_login("github", configured) do
+    resolve_secret_setting(
+      configured,
+      System.get_env("SYMPHONY_GITHUB_BOT_LOGIN") || "symphony[bot]"
+    )
+  end
+
+  defp resolve_tracker_bot_login("forgejo", configured) do
+    resolve_secret_setting(configured, System.get_env("SYMPHONY_FORGEJO_BOT_LOGIN") || "symphony")
+  end
+
+  defp resolve_tracker_bot_login(_kind, configured), do: resolve_secret_setting(configured, nil)
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->
@@ -886,6 +940,19 @@ defmodule SymphonyElixir.Config.Schema do
       resolved -> resolved
     end
   end
+
+  defp secret_setting_env_names(values) when is_list(values) do
+    values
+    |> Enum.flat_map(fn value ->
+      case env_reference_name(value) do
+        {:ok, env_name} -> [env_name]
+        :error -> []
+      end
+    end)
+    |> Enum.uniq()
+  end
+
+  defp secret_setting_env_names(first, second), do: secret_setting_env_names([first, second])
 
   defp resolve_path_value(nil, default), do: default
 

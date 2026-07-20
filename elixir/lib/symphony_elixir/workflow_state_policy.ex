@@ -96,6 +96,10 @@ defmodule SymphonyElixir.WorkflowStatePolicy do
   defp transition_target("Merging", %TransitionIntent{kind: :merge_ready}), do: "Done"
   defp transition_target("Merging", %TransitionIntent{kind: :merge_observed}), do: "Done"
 
+  defp transition_target(current_state, %TransitionIntent{kind: :children_completed}) do
+    if terminal_state?(current_state), do: current_state, else: "Done"
+  end
+
   defp transition_target(current_state, %TransitionIntent{kind: :closed_unmerged}) do
     if terminal_state?(current_state), do: current_state, else: "Canceled"
   end

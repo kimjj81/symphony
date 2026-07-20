@@ -204,7 +204,11 @@ defmodule SymphonyElixir.GitHub.WebhookProcessor do
   end
 
   defp self_write?(payload) do
-    expected_login = System.get_env("SYMPHONY_GITHUB_BOT_LOGIN") || "symphony[bot]"
+    expected_login =
+      case Config.settings() do
+        {:ok, %{tracker: %{kind: "github", bot_login: login}}} when is_binary(login) and login != "" -> login
+        _ -> System.get_env("SYMPHONY_GITHUB_BOT_LOGIN") || "symphony[bot]"
+      end
 
     case Map.get(payload, "sender", %{}) do
       %{"login" => login} when is_binary(login) ->

@@ -5,24 +5,9 @@ defmodule SymphonyElixir.GitHub.Client do
 
   require Logger
 
-  alias SymphonyElixir.{Config, Tracker.Issue}
+  alias SymphonyElixir.{Config, HostedGit, Tracker.Issue}
 
   @per_page 100
-  @default_state_labels %{
-    "Todo" => "sym:todo",
-    "Planned" => "sym:planned",
-    "In Progress" => "sym:in-progress",
-    "Review" => "sym:review",
-    "Reviewing" => "sym:reviewing",
-    "Human Review" => "sym:human-review",
-    "Waiting" => "sym:waiting",
-    "Rework" => "sym:rework",
-    "Reworking" => "sym:reworking",
-    "Merging" => "sym:merging",
-    "Done" => "sym:done",
-    "Canceled" => "sym:canceled",
-    "Duplicate" => "sym:duplicate"
-  }
   @label_meta %{
     "sym:todo" => {"ededed", "Symphony should triage or prepare this item."},
     "sym:planned" => {"bfd4ff", "Human-approved work ready for Symphony implementation."},
@@ -37,15 +22,6 @@ defmodule SymphonyElixir.GitHub.Client do
     "sym:done" => {"8250df", "Completed successfully."},
     "sym:canceled" => {"8c959f", "Closed without completion."},
     "sym:duplicate" => {"8c959f", "Duplicate work item."}
-  }
-  @request_labels %{
-    "sym:request-planned" => "Planned",
-    "sym:request-rework" => "Rework",
-    "sym:request-merging" => "Merging",
-    "sym:request-human-review" => "Human Review",
-    "sym:request-canceled" => "Canceled",
-    "sym:request-duplicate" => "Duplicate",
-    "sym:request-reopen" => "Human Review"
   }
   @request_label_meta %{
     "sym:request-planned" => {"bfd4ff", "Request that Symphony move this item to Planned."},
@@ -64,22 +40,17 @@ defmodule SymphonyElixir.GitHub.Client do
   ]
 
   @spec default_state_labels() :: map()
-  def default_state_labels, do: @default_state_labels
+  def default_state_labels, do: HostedGit.default_state_labels()
 
   @spec request_labels() :: map()
-  def request_labels, do: @request_labels
+  def request_labels, do: HostedGit.request_labels()
 
   @spec managed_label_metadata() :: map()
   def managed_label_metadata, do: Map.merge(@label_meta, @request_label_meta)
 
   @spec classify_managed_label(String.t()) :: {:request, String.t()} | {:state, String.t()} | :unmanaged
   def classify_managed_label(label) when is_binary(label) do
-    normalized = normalize_label(label)
-
-    case Enum.find(@request_labels, fn {request_label, _state} -> normalize_label(request_label) == normalized end) do
-      {_request_label, state} -> {:request, state}
-      nil -> if state = state_for_label(label), do: {:state, state}, else: :unmanaged
-    end
+    HostedGit.classify_managed_label(label, Config.settings!().tracker.state_labels)
   end
 
   def classify_managed_label(_label), do: :unmanaged
@@ -899,7 +870,7 @@ defmodule SymphonyElixir.GitHub.Client do
     managed_labels =
       state_label_map()
       |> Map.values()
-      |> Kernel.++(Map.keys(@request_labels))
+      |> Kernel.++(Map.keys(HostedGit.request_labels()))
       |> Enum.map(&normalize_label/1)
       |> MapSet.new()
 
@@ -1325,7 +1296,7 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp issue_pull_request_specs(number, %Issue{} = issue, opts) when is_integer(number) do
-    sections = issue_pr_sections(issue.description || "")
+    sections = HostedGit.pull_request_sections(issue.description || "")
     parent_number = Keyword.get(opts, :parent_number)
 
     if length(sections) >= 2 do
@@ -1347,7 +1318,7 @@ defmodule SymphonyElixir.GitHub.Client do
         end)
 
       child_specs =
-        if parallel_pr_plan?(issue.description || "") do
+        if HostedGit.parallel_pull_request_plan?(issue.description || "") do
           {:ok, all_specs}
         else
           sequential_split_child_specs(number, all_specs)
@@ -1464,36 +1435,6 @@ defmodule SymphonyElixir.GitHub.Client do
       parent_number: parent_number,
       state: "Waiting"
     }
-  end
-
-  defp issue_pr_sections(description) when is_binary(description) do
-    regex = ~r/^###\s*PR\s*(\d+)\s*[:：.\-–—]?\s*(.*?)\s*$/im
-    matches = Regex.scan(regex, description, return: :index)
-
-    matches
-    |> Enum.with_index()
-    |> Enum.map(fn {[{start, length}, {number_start, number_length}, {title_start, title_length}], index} ->
-      body_start = start + length
-      body_end = next_match_start(matches, index, byte_size(description))
-
-      %{
-        number: description |> binary_part(number_start, number_length) |> String.to_integer(),
-        title: description |> binary_part(title_start, title_length) |> String.trim(),
-        body: description |> binary_part(body_start, body_end - body_start) |> String.trim()
-      }
-    end)
-    |> Enum.filter(&(&1.title != "" or &1.body != ""))
-  end
-
-  defp next_match_start(matches, index, fallback) do
-    case Enum.at(matches, index + 1) do
-      [{start, _length} | _captures] -> start
-      _ -> fallback
-    end
-  end
-
-  defp parallel_pr_plan?(description) when is_binary(description) do
-    Regex.match?(~r/(PR\s*진행\s*방식|실행\s*방식|execution\s*mode)\s*[:：-]?\s*(병렬|parallel)/iu, description)
   end
 
   defp issue_pull_request_title(%Issue{title: title}, %{integration?: true, number: number}) do
@@ -1713,16 +1654,10 @@ defmodule SymphonyElixir.GitHub.Client do
   defp maybe_put_params(opts, nil), do: opts
   defp maybe_put_params(opts, params), do: Keyword.put(opts, :params, params)
 
-  defp parse_issue_id("github:issue:" <> number), do: parse_number(number, :issue)
-  defp parse_issue_id("github:pr:" <> number), do: parse_number(number, :pull_request)
-  defp parse_issue_id("#" <> number), do: parse_number(number, :issue)
-  defp parse_issue_id("PR #" <> number), do: parse_number(number, :pull_request)
-  defp parse_issue_id(number), do: parse_number(number, nil)
-
-  defp parse_number(number, kind) when is_binary(number) do
-    case Integer.parse(number) do
-      {parsed, ""} when parsed > 0 -> {:ok, parsed, kind}
-      _ -> {:error, {:invalid_github_issue_id, number}}
+  defp parse_issue_id(id) do
+    case HostedGit.decode_id("github", id) do
+      {:ok, number, kind} -> {:ok, number, kind}
+      :error -> {:error, {:invalid_github_issue_id, id}}
     end
   end
 
@@ -1747,7 +1682,7 @@ defmodule SymphonyElixir.GitHub.Client do
       Config.settings!().tracker.state_labels
       |> normalize_string_map()
 
-    Map.merge(@default_state_labels, configured)
+    HostedGit.state_labels(configured)
   end
 
   defp label_to_state_map do
@@ -1783,8 +1718,8 @@ defmodule SymphonyElixir.GitHub.Client do
   defp issue_kind(%{"pull_request" => pull}) when is_map(pull), do: :pull_request
   defp issue_kind(_raw_issue), do: :issue
 
-  defp github_issue_id(:pull_request, number), do: "github:pr:#{number}"
-  defp github_issue_id(_kind, number), do: "github:issue:#{number}"
+  defp github_issue_id(:pull_request, number), do: HostedGit.encode_id("github", :pull_request, number)
+  defp github_issue_id(_kind, number), do: HostedGit.encode_id("github", :issue, number)
 
   defp github_identifier(:pull_request, number), do: "PR ##{number}"
   defp github_identifier(_kind, number), do: "##{number}"

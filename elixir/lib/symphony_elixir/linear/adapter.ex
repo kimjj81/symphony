@@ -7,6 +7,9 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   alias SymphonyElixir.Linear.Client
 
+  @spec preflight() :: :ok
+  def preflight, do: :ok
+
   @create_comment_mutation """
   mutation SymphonyCreateComment($issueId: String!, $body: String!) {
     commentCreate(input: {issueId: $issueId, body: $body}) {

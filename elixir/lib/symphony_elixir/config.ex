@@ -172,7 +172,7 @@ defmodule SymphonyElixir.Config do
 
   defp validate_tracker_kind(%{kind: nil}), do: {:error, :missing_tracker_kind}
 
-  defp validate_tracker_kind(%{kind: kind}) when kind not in ["linear", "github", "memory"] do
+  defp validate_tracker_kind(%{kind: kind}) when kind not in ["linear", "github", "forgejo", "memory"] do
     {:error, {:unsupported_tracker_kind, kind}}
   end
 
@@ -180,6 +180,7 @@ defmodule SymphonyElixir.Config do
 
   defp validate_tracker_semantics(:ok, %{kind: "linear"} = tracker), do: validate_linear_tracker(tracker)
   defp validate_tracker_semantics(:ok, %{kind: "github"} = tracker), do: validate_github_tracker(tracker)
+  defp validate_tracker_semantics(:ok, %{kind: "forgejo"} = tracker), do: validate_forgejo_tracker(tracker)
   defp validate_tracker_semantics(:ok, _tracker), do: :ok
   defp validate_tracker_semantics(error, _tracker), do: error
 
@@ -194,6 +195,45 @@ defmodule SymphonyElixir.Config do
   defp validate_github_tracker(%{owner: owner}) when not is_binary(owner), do: {:error, :missing_github_owner}
   defp validate_github_tracker(%{repo: repo}) when not is_binary(repo), do: {:error, :missing_github_repo}
   defp validate_github_tracker(_tracker), do: :ok
+
+  defp validate_forgejo_tracker(%{api_key: api_key}) when not is_binary(api_key),
+    do: {:error, :missing_tracker_api_token}
+
+  defp validate_forgejo_tracker(%{api_key: api_key} = tracker) do
+    if String.trim(api_key) == "",
+      do: {:error, :missing_tracker_api_token},
+      else: validate_forgejo_endpoint(tracker)
+  end
+
+  defp validate_forgejo_endpoint(%{endpoint: endpoint}) when not is_binary(endpoint),
+    do: {:error, :missing_forgejo_endpoint}
+
+  defp validate_forgejo_endpoint(%{endpoint: endpoint} = tracker) do
+    uri = URI.parse(String.trim(endpoint))
+
+    if uri.scheme in ["http", "https"] and is_binary(uri.host) and uri.host != "" and
+         String.ends_with?(String.trim_trailing(uri.path || "", "/"), "/api/v1") do
+      validate_forgejo_repository(tracker)
+    else
+      {:error, {:invalid_forgejo_endpoint, endpoint}}
+    end
+  end
+
+  defp validate_forgejo_repository(%{owner: owner}) when not is_binary(owner),
+    do: {:error, :missing_forgejo_owner}
+
+  defp validate_forgejo_repository(%{owner: owner} = tracker) do
+    if String.trim(owner) == "",
+      do: {:error, :missing_forgejo_owner},
+      else: validate_forgejo_repo(tracker)
+  end
+
+  defp validate_forgejo_repo(%{repo: repo}) when not is_binary(repo),
+    do: {:error, :missing_forgejo_repo}
+
+  defp validate_forgejo_repo(%{repo: repo}) do
+    if String.trim(repo) == "", do: {:error, :missing_forgejo_repo}, else: :ok
+  end
 
   defp format_config_error(reason) do
     case reason do

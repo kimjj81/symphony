@@ -92,7 +92,16 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, opts) do
+    case start_turn(
+           port,
+           thread_id,
+           prompt,
+           issue,
+           workspace,
+           approval_policy,
+           turn_sandbox_policy,
+           opts
+         ) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -259,7 +268,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp worker_environment(gh_config_dir) do
     scrubbed =
-      ~w(GITHUB_TOKEN GH_TOKEN SYMPHONY_TRACKER_WRITE_TOKEN LINEAR_API_KEY)
+      worker_write_token_envs()
       |> Enum.map(&{String.to_charlist(&1), false})
 
     base =
@@ -277,32 +286,53 @@ defmodule SymphonyElixir.Codex.AppServer do
         |> Enum.reject(fn {name, _value} -> name == ~c"GH_TOKEN" end)
         |> then(&[{~c"GH_TOKEN", String.to_charlist(token)} | &1])
 
+      %{kind: "forgejo", read_api_key: token} when is_binary(token) and token != "" ->
+        base
+        |> Enum.reject(fn {name, _value} -> name == ~c"FORGEJO_TOKEN" end)
+        |> then(&[{~c"FORGEJO_TOKEN", String.to_charlist(token)} | &1])
+
       _ ->
         base
     end
   end
 
   defp remote_worker_environment(gh_config_dir) do
-    unset = "env -u GITHUB_TOKEN -u GH_TOKEN -u SYMPHONY_TRACKER_WRITE_TOKEN -u LINEAR_API_KEY"
+    # Names were validated by worker_write_token_envs/0, so they can be emitted
+    # as shell identifiers without quoting while preserving a readable command.
+    unset = "env" <> Enum.map_join(worker_write_token_envs(), "", &" -u #{&1}")
     config_dir = "GH_CONFIG_DIR=#{shell_escape(gh_config_dir)}"
 
     git_credentials =
       "GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=''"
 
-    case Config.settings!().tracker do
-      %{kind: "github", read_api_key: token} when is_binary(token) and token != "" ->
-        Enum.join([unset, config_dir, git_credentials, "GH_TOKEN=#{shell_escape(token)}"], " ")
-
-      _ ->
-        Enum.join([unset, config_dir, git_credentials], " ")
-    end
+    # SSH exposes the remote command to local process inspection. A worker does
+    # not need tracker credentials to perform its task, so remote workers never
+    # receive even the optional read token. Local workers may still receive it
+    # through an inherited environment entry without placing it in argv.
+    Enum.join([unset, config_dir, git_credentials], " ")
   end
+
+  defp worker_write_token_envs do
+    configured = Config.settings!().tracker.write_api_key_envs
+
+    (~w(GITHUB_TOKEN GH_TOKEN FORGEJO_TOKEN SYMPHONY_TRACKER_READ_TOKEN SYMPHONY_TRACKER_WRITE_TOKEN LINEAR_API_KEY SYMPHONY_FORGEJO_WEBHOOK_SECRET SYMPHONY_GITHUB_WEBHOOK_SECRET) ++
+       configured)
+    |> Enum.filter(&valid_environment_name?/1)
+    |> Enum.uniq()
+  end
+
+  defp valid_environment_name?(name) when is_binary(name),
+    do: String.match?(name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
+
+  defp valid_environment_name?(_name), do: false
 
   defp worker_gh_config_dir(root \\ System.tmp_dir!()) do
     Path.join(root, "symphony-worker-gh-config-#{System.unique_integer([:positive, :monotonic])}")
   end
 
-  defp remove_worker_gh_config_dir(path) when is_binary(path), do: File.rm_rf(path) |> then(fn _ -> :ok end)
+  defp remove_worker_gh_config_dir(path) when is_binary(path),
+    do: File.rm_rf(path) |> then(fn _ -> :ok end)
+
   defp remove_worker_gh_config_dir(_path), do: :ok
 
   defp port_metadata(port, worker_host) when is_port(port) do
@@ -385,7 +415,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
+  defp start_thread(port, workspace, %{
+         approval_policy: approval_policy,
+         thread_sandbox: thread_sandbox
+       }) do
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
@@ -409,7 +442,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, opts) do
+  defp start_turn(
+         port,
+         thread_id,
+         prompt,
+         issue,
+         workspace,
+         approval_policy,
+         turn_sandbox_policy,
+         opts
+       ) do
     params =
       %{
         "threadId" => thread_id,
@@ -948,7 +990,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     }
   end
 
-  defp dynamic_tool_output(%{"contentItems" => [%{"text" => text} | _]}) when is_binary(text), do: text
+  defp dynamic_tool_output(%{"contentItems" => [%{"text" => text} | _]}) when is_binary(text),
+    do: text
+
   defp dynamic_tool_output(result), do: Jason.encode!(result, pretty: true)
 
   defp dynamic_tool_content_items(output) when is_binary(output) do
@@ -970,7 +1014,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          metadata,
          auto_approve_policy
        ) do
-    if auto_approve_all?(auto_approve_policy) or auto_approve_command?(payload, auto_approve_policy) do
+    if auto_approve_all?(auto_approve_policy) or
+         auto_approve_command?(payload, auto_approve_policy) do
       approve_or_require(port, id, decision, payload, payload_string, on_message, metadata, true)
     else
       approve_or_require(port, id, decision, payload, payload_string, on_message, metadata, false)
@@ -1011,7 +1056,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp fallback_command(command, _payload), do: command
 
   defp normalize_command(%{} = command) do
-    binary_command = map_value(command, ["parsedCmd", :parsedCmd, "command", :command, "cmd", :cmd])
+    binary_command =
+      map_value(command, ["parsedCmd", :parsedCmd, "command", :command, "cmd", :cmd])
+
     args = map_value(command, ["args", :args, "argv", :argv])
 
     if is_binary(binary_command) and is_list(args) do
@@ -1139,7 +1186,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
-  defp tool_request_user_input_approval_answers(%{"questions" => questions}) when is_list(questions) do
+  defp tool_request_user_input_approval_answers(%{"questions" => questions})
+       when is_list(questions) do
     answers =
       Enum.reduce_while(questions, %{}, fn question, acc ->
         case tool_request_user_input_approval_answer(question) do
@@ -1187,7 +1235,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp tool_request_user_input_unavailable_answers(%{"questions" => questions}) when is_list(questions) do
+  defp tool_request_user_input_unavailable_answers(%{"questions" => questions})
+       when is_list(questions) do
     answers =
       Enum.reduce_while(questions, %{}, fn question, acc ->
         case tool_request_user_input_question_id(question) do
@@ -1244,7 +1293,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       |> String.trim()
       |> String.downcase()
 
-    String.starts_with?(normalized_label, "approve") or String.starts_with?(normalized_label, "allow")
+    String.starts_with?(normalized_label, "approve") or
+      String.starts_with?(normalized_label, "allow")
   end
 
   defp await_response(port, request_id) do
@@ -1335,7 +1385,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do
-    message = metadata |> Map.merge(details) |> Map.put(:event, event) |> Map.put(:timestamp, DateTime.utc_now())
+    message =
+      metadata
+      |> Map.merge(details)
+      |> Map.put(:event, event)
+      |> Map.put(:timestamp, DateTime.utc_now())
+
     on_message.(message)
   end
 
@@ -1362,7 +1417,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp default_on_message(_message), do: :ok
 
   defp tool_call_name(params) when is_map(params) do
-    case Map.get(params, "tool") || Map.get(params, :tool) || Map.get(params, "name") || Map.get(params, :name) do
+    case Map.get(params, "tool") || Map.get(params, :tool) || Map.get(params, "name") ||
+           Map.get(params, :name) do
       name when is_binary(name) ->
         case String.trim(name) do
           "" -> nil

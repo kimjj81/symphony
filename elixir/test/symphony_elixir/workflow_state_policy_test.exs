@@ -42,6 +42,14 @@ defmodule SymphonyElixir.WorkflowStatePolicyTest do
                WorkflowStatePolicy.decide("Reviewing", intent)
     end
 
+    test "derives parent completion without bypassing terminal-state semantics" do
+      assert {:ok, "Done"} =
+               WorkflowStatePolicy.target_state("Human Review", intent(:children_completed))
+
+      assert {:ok, "Done"} =
+               WorkflowStatePolicy.target_state("Done", intent(:children_completed))
+    end
+
     test "keeps terminal states monotonic when a stale worker outcome arrives" do
       intent = intent(:clean_review, expected_state: "Reviewing")
 

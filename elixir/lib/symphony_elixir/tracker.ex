@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Tracker do
 
   alias SymphonyElixir.{Config, StateManager, Tracker.Issue, TransitionIntent}
 
+  @callback preflight() :: :ok | {:error, term()}
   @callback fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
@@ -21,6 +22,20 @@ defmodule SymphonyElixir.Tracker do
   @callback merge_pull_request(String.t(), String.t()) ::
               {:applied, map()} | {:conflict, map()} | {:error, map()}
 
+  @spec preflight() :: :ok | {:error, term()}
+  def preflight, do: adapter().preflight()
+
+  @doc """
+  Returns whether dispatch or a broker-owned write may proceed.
+
+  Forgejo's supported-major check is deliberately applied at every write and
+  dispatch boundary. Reads remain available for dashboards and recovery.
+  """
+  @spec write_ready?() :: :ok | {:error, term()}
+  def write_ready? do
+    if Config.settings!().tracker.kind == "forgejo", do: preflight(), else: :ok
+  end
+
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues do
     adapter().fetch_candidate_issues()
@@ -33,27 +48,35 @@ defmodule SymphonyElixir.Tracker do
 
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids) do
-    adapter().fetch_issue_states_by_ids(issue_ids)
+    with :ok <- validate_issue_providers(issue_ids) do
+      adapter().fetch_issue_states_by_ids(issue_ids)
+    end
   end
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
-    adapter().create_comment(issue_id, body)
+    with :ok <- validate_issue_provider(issue_id), :ok <- write_ready?() do
+      adapter().create_comment(issue_id, body)
+    end
   end
 
   @spec create_comment_once(String.t(), String.t(), String.t()) ::
           :applied | :already_applied | {:error, term()}
   def create_comment_once(issue_id, body, marker) do
-    adapter().create_comment_once(issue_id, body, marker)
+    with :ok <- validate_issue_provider(issue_id), :ok <- write_ready?() do
+      adapter().create_comment_once(issue_id, body, marker)
+    end
   end
 
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   @deprecated "Submit a TransitionIntent through StateManager.request/1 instead"
   def update_issue_state(issue_id, state_name) do
-    if Config.settings!().state_manager.mode == "authoritative" do
-      request_legacy_state_transition(issue_id, state_name)
-    else
-      adapter().update_issue_state(issue_id, state_name)
+    with :ok <- validate_issue_provider(issue_id), :ok <- write_ready?() do
+      if Config.settings!().state_manager.mode == "authoritative" do
+        request_legacy_state_transition(issue_id, state_name)
+      else
+        adapter().update_issue_state(issue_id, state_name)
+      end
     end
   end
 
@@ -63,18 +86,28 @@ defmodule SymphonyElixir.Tracker do
           | {:conflict, map()}
           | {:partial_failure, map()}
   def apply_state_projection(issue_id, expected_state, target_state) do
-    adapter().apply_state_projection(issue_id, expected_state, target_state)
+    case {validate_issue_provider(issue_id), write_ready?()} do
+      {:ok, :ok} -> adapter().apply_state_projection(issue_id, expected_state, target_state)
+      {:ok, {:error, reason}} -> {:conflict, %{issue_id: issue_id, reason: reason}}
+      {{:error, reason}, _} -> {:conflict, %{issue_id: issue_id, reason: reason}}
+    end
   end
 
   @spec create_pull_request_for_issue(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
   def create_pull_request_for_issue(%Issue{} = issue) do
-    adapter().create_pull_request_for_issue(issue)
+    with :ok <- validate_issue_provider(issue.id), :ok <- write_ready?() do
+      adapter().create_pull_request_for_issue(issue)
+    end
   end
 
   @spec merge_pull_request(String.t(), String.t()) ::
           {:applied, map()} | {:conflict, map()} | {:error, map()}
   def merge_pull_request(issue_id, expected_head_oid) do
-    adapter().merge_pull_request(issue_id, expected_head_oid)
+    case {validate_issue_provider(issue_id), write_ready?()} do
+      {:ok, :ok} -> adapter().merge_pull_request(issue_id, expected_head_oid)
+      {:ok, {:error, reason}} -> {:error, %{stage: :preflight, reason: reason}}
+      {{:error, reason}, _} -> {:error, %{stage: :validate, reason: reason}}
+    end
   end
 
   @spec adapter() :: module()
@@ -82,9 +115,36 @@ defmodule SymphonyElixir.Tracker do
     case Config.settings!().tracker.kind do
       "linear" -> SymphonyElixir.Linear.Adapter
       "github" -> SymphonyElixir.GitHub.Adapter
+      "forgejo" -> SymphonyElixir.Forgejo.Adapter
       "memory" -> SymphonyElixir.Tracker.Memory
     end
   end
+
+  defp validate_issue_providers(issue_ids) when is_list(issue_ids) do
+    Enum.reduce_while(issue_ids, :ok, fn issue_id, :ok ->
+      case validate_issue_provider(issue_id) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp validate_issue_provider(issue_id) when is_binary(issue_id) do
+    current_provider = Config.settings!().tracker.kind
+
+    case {current_provider, issue_provider(issue_id)} do
+      {"memory", _provider} -> :ok
+      {_current, nil} -> :ok
+      {provider, provider} -> :ok
+      {current, provider} -> {:error, {:tracker_provider_mismatch, provider, current, issue_id}}
+    end
+  end
+
+  defp validate_issue_provider(_issue_id), do: :ok
+
+  defp issue_provider("github:" <> _rest), do: "github"
+  defp issue_provider("forgejo:" <> _rest), do: "forgejo"
+  defp issue_provider(_issue_id), do: nil
 
   defp request_legacy_state_transition(issue_id, state_name) do
     case fetch_issue_states_by_ids([issue_id]) do

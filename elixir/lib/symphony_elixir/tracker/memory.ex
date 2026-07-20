@@ -8,6 +8,9 @@ defmodule SymphonyElixir.Tracker.Memory do
   alias SymphonyElixir.Config
   alias SymphonyElixir.Tracker.Issue
 
+  @spec preflight() :: :ok
+  def preflight, do: :ok
+
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     {:ok, issue_entries()}

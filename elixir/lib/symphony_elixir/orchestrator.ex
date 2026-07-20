@@ -158,6 +158,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         {:error, reason} ->
           Logger.warning("Targeted issue refresh failed: issue_id=#{issue_id} reason=#{inspect(reason)}")
+
           state
       end
 
@@ -341,6 +342,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_transition_effect_retry_result(state, transition_id, _attempt, {:error, reason}) do
     if String.starts_with?(transition_id, "effect-retry-exhausted:") do
       Logger.error("Exhausted retry for a handoff transition transition_id=#{transition_id} reason=#{inspect(reason)}")
+
       state
     else
       handoff_exhausted_transition_effect(state, transition_id, reason)
@@ -375,6 +377,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
 
+    # Tracker reads deliberately remain available when Forgejo preflight is not
+    # ready.  `Tracker.write_ready?/0` fences every broker write and dispatch
+    # effect, while polling keeps the dashboard and journal recovery useful.
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues() do
       choose_issues(issues, state)
@@ -397,6 +402,27 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, :missing_github_repo} ->
         Logger.error("GitHub repo missing in WORKFLOW.md")
+        state
+
+      {:error, :missing_forgejo_endpoint} ->
+        Logger.error("Forgejo API endpoint missing in WORKFLOW.md")
+        state
+
+      {:error, {:invalid_forgejo_endpoint, endpoint}} ->
+        Logger.error("Forgejo API endpoint must end in /api/v1: #{inspect(endpoint)}")
+        state
+
+      {:error, :missing_forgejo_owner} ->
+        Logger.error("Forgejo owner missing in WORKFLOW.md")
+        state
+
+      {:error, :missing_forgejo_repo} ->
+        Logger.error("Forgejo repo missing in WORKFLOW.md")
+        state
+
+      {:error, {:unsupported_forgejo_major, actual, expected}} ->
+        Logger.error("Unsupported Forgejo API major=#{inspect(actual)} expected=#{expected}; dispatch remains disabled")
+
         state
 
       {:error, :missing_tracker_kind} ->
@@ -499,7 +525,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
-  @spec mark_issue_in_progress_for_dispatch_for_test(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
+  @spec mark_issue_in_progress_for_dispatch_for_test(Issue.t()) ::
+          {:ok, Issue.t()} | {:error, term()}
   def mark_issue_in_progress_for_dispatch_for_test(%Issue{} = issue) do
     mark_issue_for_dispatch(issue)
   end
@@ -511,7 +538,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
-  @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
+  @spec select_worker_host_for_test(term(), String.t() | nil) ::
+          String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
   end
@@ -631,6 +659,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       true ->
         Logger.debug("Targeted issue refresh skipped non-dispatchable issue: #{issue_context(issue)} state=#{inspect(issue.state)}")
+
         state
     end
   end
@@ -648,7 +677,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp notify_issue_state_transition(%State{} = state, _issue), do: state
 
-  defp maybe_notify_issue_state_transition(%State{} = state, %Issue{} = issue, previous_state, running_entry) do
+  defp maybe_notify_issue_state_transition(
+         %State{} = state,
+         %Issue{} = issue,
+         previous_state,
+         running_entry
+       ) do
     transition_key = state_transition_key(previous_state, issue.state)
 
     if notify_state_transition?(previous_state, issue.state, transition_key, running_entry) do
@@ -668,7 +702,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp notify_latest_issue_state_after_agent_completion(issue_id, running_entry) when is_binary(issue_id) do
+  defp notify_latest_issue_state_after_agent_completion(issue_id, running_entry)
+       when is_binary(issue_id) do
     case Tracker.fetch_issue_states_by_ids([issue_id]) do
       {:ok, [%Issue{} = latest_issue | _]} ->
         previous_state =
@@ -681,7 +716,12 @@ defmodule SymphonyElixir.Orchestrator do
 
         transition_key = state_transition_key(previous_state, latest_issue.state)
 
-        if notify_state_transition?(previous_state, latest_issue.state, transition_key, running_entry) do
+        if notify_state_transition?(
+             previous_state,
+             latest_issue.state,
+             transition_key,
+             running_entry
+           ) do
           send_state_transition_notifications(latest_issue, previous_state, latest_issue.state)
         end
 
@@ -692,6 +732,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.debug("Skipping completion notification for issue_id=#{issue_id}; state refresh failed: #{inspect(reason)}")
+
         :ok
     end
   end
@@ -838,6 +879,7 @@ defmodule SymphonyElixir.Orchestrator do
         |> Task.Supervisor.children()
         |> Enum.each(fn child_pid ->
           Logger.warning("Fencing worker task inherited across orchestrator restart pid=#{inspect(child_pid)}")
+
           terminate_task(child_pid)
         end)
 
@@ -907,7 +949,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
 
   defp should_prepare_pull_request_for_issue?(
-         %Issue{id: id, identifier: identifier, title: title, state: state_name, kind: :issue} = issue,
+         %Issue{id: id, identifier: identifier, title: title, state: state_name, kind: :issue} =
+           issue,
          %State{} = state,
          active_states,
          terminal_states
@@ -917,9 +960,14 @@ defmodule SymphonyElixir.Orchestrator do
       issue_available_for_pull_request_preparation?(issue, state)
   end
 
-  defp should_prepare_pull_request_for_issue?(_issue, _state, _active_states, _terminal_states), do: false
+  defp should_prepare_pull_request_for_issue?(_issue, _state, _active_states, _terminal_states),
+    do: false
 
-  defp planned_github_source_issue?(%Issue{state: state_name, kind: :issue} = issue, active_states, terminal_states) do
+  defp planned_github_source_issue?(
+         %Issue{state: state_name, kind: :issue} = issue,
+         active_states,
+         terminal_states
+       ) do
     github_tracker?() and
       normalize_issue_state(state_name) == "planned" and
       issue_routable_to_worker?(issue) and
@@ -930,7 +978,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp planned_github_source_issue?(_issue, _active_states, _terminal_states), do: false
 
-  defp issue_available_for_pull_request_preparation?(%Issue{id: id}, %State{running: running, claimed: claimed}) do
+  defp issue_available_for_pull_request_preparation?(%Issue{id: id}, %State{
+         running: running,
+         claimed: claimed
+       }) do
     !MapSet.member?(claimed, id) and !Map.has_key?(running, id)
   end
 
@@ -1022,7 +1073,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp normalize_issue_state(_state_name), do: ""
 
-  defp github_tracker?, do: Config.settings!().tracker.kind == "github"
+  defp github_tracker?, do: Config.settings!().tracker.kind in ["github", "forgejo"]
 
   defp terminal_state_set do
     Config.settings!().tracker.terminal_states
@@ -1039,7 +1090,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
-    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
+    case Tracker.write_ready?() do
+      :ok ->
+        dispatch_issue_when_ready(state, issue, attempt, preferred_worker_host)
+
+      {:error, reason} ->
+        Logger.warning("Skipping dispatch because tracker write readiness failed for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp dispatch_issue_when_ready(%State{} = state, issue, attempt, preferred_worker_host) do
+    case revalidate_issue_for_dispatch(
+           issue,
+           &Tracker.fetch_issue_states_by_ids/1,
+           terminal_state_set()
+         ) do
       {:ok, %Issue{} = refreshed_issue} ->
         case mark_issue_for_dispatch(refreshed_issue) do
           {:ok, dispatch_issue} ->
@@ -1047,11 +1113,13 @@ defmodule SymphonyElixir.Orchestrator do
 
           {:error, reason} ->
             Logger.warning("Skipping dispatch; failed to mark issue for dispatch for #{issue_context(refreshed_issue)}: #{inspect(reason)}")
+
             state
         end
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
+
         state
 
       {:skip, %Issue{} = refreshed_issue} ->
@@ -1061,11 +1129,23 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
+
         state
     end
   end
 
   defp prepare_pull_request_for_issue(%State{} = state, %Issue{} = issue) do
+    case Tracker.write_ready?() do
+      :ok ->
+        prepare_pull_request_when_ready(state, issue)
+
+      {:error, reason} ->
+        Logger.warning("Skipping pull request preparation because tracker write readiness failed for #{issue_context(issue)}: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp prepare_pull_request_when_ready(%State{} = state, %Issue{} = issue) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
 
@@ -1092,6 +1172,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:skip, :missing} ->
         Logger.info("Skipping pull request preparation; issue no longer active or visible: #{issue_context(issue)}")
+
         state
 
       {:skip, %Issue{} = refreshed_issue} ->
@@ -1103,6 +1184,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Skipping pull request preparation; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
+
         state
     end
   end
@@ -1164,24 +1246,28 @@ defmodule SymphonyElixir.Orchestrator do
     case apply_dispatch_transition(intent, issue) do
       {:ok, _applied} ->
         Logger.info("Moved planned source issue to Human Review after pull request preparation: #{issue_context(issue)}")
+
         :ok
 
       other ->
         reason = if match?({:error, _}, other), do: elem(other, 1), else: other
+
         Logger.warning("Failed to move planned source issue to Human Review after pull request preparation for #{issue_context(issue)}: #{inspect(reason)}")
+
         {:error, reason}
     end
   end
 
   defp move_issue_to_human_review_after_pull_request(_issue, _comment_body), do: :ok
 
-  defp handle_pull_request_preparation_error(%Issue{} = issue, {:github_no_planned_sub_issue, _parent_number}) do
+  defp handle_pull_request_preparation_error(%Issue{} = issue, {provider, _parent_number})
+       when provider in [:github_no_planned_sub_issue, :forgejo_no_planned_child_issue] do
     Logger.info("Moving planned parent issue with no planned sub-issue to Human Review: #{issue_context(issue)}")
 
     body = """
-    Symphony가 이 이슈의 native sub-issue를 확인했지만 `sym:planned` 상태의 열린 sub-issue를 찾지 못했습니다.
+    Symphony가 이 이슈의 native sub-issue 또는 Forgejo parent-label 하위 이슈를 확인했지만 `sym:planned` 상태의 열린 하위 이슈를 찾지 못했습니다.
 
-    부모 이슈에서는 직접 구현 PR을 만들지 않습니다. 구현할 sub-issue에 `sym:planned`를 적용한 뒤 다시 진행해 주세요.
+    부모 이슈에서는 직접 구현 PR을 만들지 않습니다. 구현할 하위 이슈에 `sym:planned`를 적용한 뒤 다시 진행해 주세요.
     """
 
     move_issue_to_human_review_after_pull_request(issue, body)
@@ -1191,7 +1277,8 @@ defmodule SymphonyElixir.Orchestrator do
     Logger.warning("Skipping pull request preparation for #{issue_context(issue)}: #{inspect(reason)}")
   end
 
-  defp request_pull_request_refresh(%Issue{id: pull_request_id}) when is_binary(pull_request_id) do
+  defp request_pull_request_refresh(%Issue{id: pull_request_id})
+       when is_binary(pull_request_id) do
     send(self(), {:refresh_issue, pull_request_id})
     :ok
   end
@@ -1214,6 +1301,7 @@ defmodule SymphonyElixir.Orchestrator do
     case select_worker_host(state, preferred_worker_host) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
+
         state
 
       worker_host ->
@@ -1271,6 +1359,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Unable to reserve worker dispatch for #{issue_context(issue)}: #{inspect(reason)}")
+
         state
     end
   end
@@ -1280,7 +1369,12 @@ defmodule SymphonyElixir.Orchestrator do
            run_agent_for_orchestrator(issue, recipient, attempt, worker_host)
          end) do
       {:ok, pid} ->
-        _ = journal_record(dispatch_lease_id, :verified, %{issue_id: issue.id, worker_pid: inspect(pid)})
+        _ =
+          journal_record(dispatch_lease_id, :verified, %{
+            issue_id: issue.id,
+            worker_pid: inspect(pid)
+          })
+
         ref = Process.monitor(pid)
         state = cancel_cleanup_retry(state, issue.id)
 
@@ -1367,7 +1461,12 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <-
            normalize_journal_record(journal_record(dispatch_lease_id, :received, %{issue_id: issue.id, attempt: attempt})),
          :ok <-
-           normalize_journal_record(journal_record(dispatch_lease_id, :decided, %{issue_id: issue.id, effect: :worker_dispatch})) do
+           normalize_journal_record(
+             journal_record(dispatch_lease_id, :decided, %{
+               issue_id: issue.id,
+               effect: :worker_dispatch
+             })
+           ) do
       reserve_worker_dispatch_effect(dispatch_lease_id, issue, attempt)
     end
   end
@@ -1499,7 +1598,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_transition_id(%Issue{} = issue) do
-    revision = issue.updated_at || (issue.metadata && (issue.metadata["head_oid"] || issue.metadata[:head_oid])) || issue.state
+    revision =
+      issue.updated_at ||
+        (issue.metadata && (issue.metadata["head_oid"] || issue.metadata[:head_oid])) ||
+        issue.state
+
     transition_id("dispatch", issue.id, "#{issue.state}:#{revision}")
   end
 
@@ -1520,7 +1623,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp transition_id(prefix, issue_id, state_name) do
-    normalized_state = state_name |> to_string() |> normalize_issue_state() |> String.replace(" ", "-")
+    normalized_state =
+      state_name |> to_string() |> normalize_issue_state() |> String.replace(" ", "-")
+
     "#{prefix}:#{issue_id}:#{normalized_state}"
   end
 
@@ -1537,7 +1642,8 @@ defmodule SymphonyElixir.Orchestrator do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
 
-    if Config.settings!().state_manager.mode == "authoritative" and next_attempt > @max_failure_retry_attempts do
+    if Config.settings!().state_manager.mode == "authoritative" and
+         next_attempt > @max_failure_retry_attempts do
       handoff_exhausted_retry(state, issue_id, next_attempt, metadata)
     else
       schedule_retry_timer(state, issue_id, next_attempt, previous_retry, metadata)
@@ -1596,11 +1702,14 @@ defmodule SymphonyElixir.Orchestrator do
     case apply_transition_intent(state, intent) do
       {{:ok, _applied}, next_state} ->
         Logger.warning("Retry budget exhausted; handed off issue_id=#{issue_id} attempts=#{attempt - 1}")
+
         %{next_state | retry_attempts: Map.delete(next_state.retry_attempts, issue_id)}
 
       {result, next_state} ->
         _ = schedule_transition_effect_retry(result, intent.id)
+
         Logger.error("Retry budget exhausted but handoff failed issue_id=#{issue_id} result=#{inspect(result)}")
+
         %{next_state | retry_attempts: Map.delete(next_state.retry_attempts, issue_id)}
     end
   end
@@ -1651,11 +1760,13 @@ defmodule SymphonyElixir.Orchestrator do
 
       :error ->
         Logger.error("Transition effect handoff lacks journal snapshot transition_id=#{transition_id}")
+
         state
     end
   end
 
-  defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
+  defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token)
+       when is_reference(retry_token) do
     case Map.get(state.retry_attempts, issue_id) do
       %{attempt: attempt, retry_token: ^retry_token} = retry_entry ->
         metadata = %{
@@ -1701,7 +1812,12 @@ defmodule SymphonyElixir.Orchestrator do
 
         state =
           state
-          |> attempt_terminal_workspace_cleanup(issue_id, issue.identifier, metadata[:worker_host], 1)
+          |> attempt_terminal_workspace_cleanup(
+            issue_id,
+            issue.identifier,
+            metadata[:worker_host],
+            1
+          )
           |> release_issue_claim(issue_id)
 
         {:noreply, state}
@@ -1738,6 +1854,7 @@ defmodule SymphonyElixir.Orchestrator do
     case cleanup_issue_workspace(identifier, worker_host) do
       :ok ->
         Logger.info("Removed terminal issue workspace issue_id=#{issue_id} issue_identifier=#{identifier} worker_host=#{worker_host_for_log(worker_host)}")
+
         state
 
       {:error, reason} ->
@@ -1749,8 +1866,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp attempt_terminal_workspace_cleanup(state, _issue_id, _identifier, _worker_host, _retry_attempt),
-    do: state
+  defp attempt_terminal_workspace_cleanup(
+         state,
+         _issue_id,
+         _identifier,
+         _worker_host,
+         _retry_attempt
+       ),
+       do: state
 
   defp schedule_cleanup_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_integer(attempt) and attempt > 0 and is_map(metadata) do
@@ -1807,6 +1930,7 @@ defmodule SymphonyElixir.Orchestrator do
           handle_terminal_cleanup_retry(state, issue_id, identifier, worker_host, next_attempt)
         else
           Logger.info("Canceled terminal workspace cleanup retry because issue is no longer terminal issue_id=#{issue_id} issue_identifier=#{identifier} state=#{inspect(issue.state)}")
+
           state
         end
 
@@ -1862,6 +1986,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+
         state
     end
   end
@@ -1895,7 +2020,8 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | claimed: MapSet.delete(state.claimed, issue_id)}
   end
 
-  defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
+  defp retry_delay(attempt, metadata)
+       when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     if metadata[:delay_type] == :continuation and attempt == 1 do
       @continuation_retry_delay_ms
     else
@@ -1905,7 +2031,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp failure_retry_delay(attempt) do
     max_delay_power = min(attempt - 1, 10)
-    min(@failure_retry_base_ms * (1 <<< max_delay_power), Config.settings!().agent.max_retry_backoff_ms)
+
+    min(
+      @failure_retry_base_ms * (1 <<< max_delay_power),
+      Config.settings!().agent.max_retry_backoff_ms
+    )
   end
 
   defp normalize_retry_attempt(attempt) when is_integer(attempt) and attempt > 0, do: attempt
@@ -1977,7 +2107,8 @@ defmodule SymphonyElixir.Orchestrator do
     |> elem(0)
   end
 
-  defp running_worker_host_count(running, worker_host) when is_map(running) and is_binary(worker_host) do
+  defp running_worker_host_count(running, worker_host)
+       when is_map(running) and is_binary(worker_host) do
     Enum.count(running, fn
       {_issue_id, %{worker_host: ^worker_host}} -> true
       _ -> false
@@ -2067,10 +2198,13 @@ defmodule SymphonyElixir.Orchestrator do
   def request_tracker_intent(intent, server \\ __MODULE__) when is_map(intent) do
     case Map.get(intent, :kind) || Map.get(intent, "kind") do
       :projection_echo ->
-        {:noop, :projection_echo}
+        record_refresh_only_tracker_intent(intent, :projection_echo)
 
       :state_projection_drift ->
         safe_orchestrator_call(server, {:projection_drift, intent})
+
+      kind when kind in [:head_updated, :review_submitted] ->
+        record_refresh_only_tracker_intent(intent, kind)
 
       _ ->
         with {:ok, transition_intent} <- transition_intent_from_tracker_event(intent) do
@@ -2079,6 +2213,42 @@ defmodule SymphonyElixir.Orchestrator do
           catch
             :exit, _reason -> :unavailable
           end
+        end
+    end
+  end
+
+  # Refresh-only tracker facts still need a durable receipt.  Otherwise a
+  # replayed signed webhook can repeatedly queue targeted refreshes despite
+  # having no state transition to deduplicate through StateManager.
+  defp record_refresh_only_tracker_intent(intent, kind) do
+    id = intent_id(intent)
+    digest = payload_digest(intent)
+
+    data = %{
+      issue_id: intent_value(intent, :issue_id),
+      source: tracker_event_source(intent),
+      kind: kind,
+      payload_digest: digest,
+      refresh_only: true
+    }
+
+    case journal_snapshot(id) do
+      {:ok, %{phase: :verified, data: %{payload_digest: ^digest}}} ->
+        {:noop, :already_applied}
+
+      {:ok, %{data: %{payload_digest: existing}}} when is_binary(existing) ->
+        {:error, {:tracker_delivery_payload_mismatch, id}}
+
+      {:ok, _pending} ->
+        {:error, {:tracker_delivery_in_progress, id}}
+
+      :error ->
+        with :ok <- normalize_journal_record(journal_record(id, :received, data)),
+             :ok <- normalize_journal_record(journal_record(id, :decided, data)),
+             :ok <- normalize_journal_record(journal_record(id, :verified, data)) do
+          {:noop, kind}
+        else
+          {:error, reason} -> {:error, reason}
         end
     end
   end
@@ -2095,7 +2265,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  @spec request_issue_refresh_after(GenServer.server(), String.t(), non_neg_integer()) :: :ok | :unavailable
+  @spec request_issue_refresh_after(GenServer.server(), String.t(), non_neg_integer()) ::
+          :ok | :unavailable
   def request_issue_refresh_after(server, issue_id, delay_ms)
       when is_binary(issue_id) and is_integer(delay_ms) and delay_ms >= 0 do
     case Process.whereis(server) do
@@ -2234,7 +2405,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp schedule_transition_effect_retry({:error, reason}, transition_id) do
-    Process.send_after(self(), {:retry_transition_effect, transition_id, 1}, @transition_effect_retry_ms)
+    Process.send_after(
+      self(),
+      {:retry_transition_effect, transition_id, 1},
+      @transition_effect_retry_ms
+    )
+
     {:error, {:transition_retry_scheduled, reason}}
   end
 
@@ -2245,19 +2421,28 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, current_issue} ->
         apply_transition_intent_from_issue(state, mode, intent, current_issue)
 
-      {:error, reason} when mode == "authoritative" and elem(intent.kind, 0) == :operator_request ->
-        case quarantine_unreadable_operator_request(intent, reason) do
-          result when result in [:applied, :already_applied] ->
-            finalize_quarantined_operator_intent(state, intent, reason, result)
-
-          {:error, effect_reason} ->
-            {{:error, {:quarantine_failed, effect_reason}}, state}
-        end
-
       {:error, reason} ->
-        {{:error, reason}, state}
+        maybe_quarantine_unreadable_intent(state, mode, intent, reason)
     end
   end
+
+  defp maybe_quarantine_unreadable_intent(
+         state,
+         "authoritative",
+         %TransitionIntent{kind: {:operator_request, _}} = intent,
+         reason
+       ) do
+    case quarantine_unreadable_operator_request(intent, reason) do
+      result when result in [:applied, :already_applied] ->
+        finalize_quarantined_operator_intent(state, intent, reason, result)
+
+      {:error, effect_reason} ->
+        {{:error, {:quarantine_failed, effect_reason}}, state}
+    end
+  end
+
+  defp maybe_quarantine_unreadable_intent(state, _mode, _intent, reason),
+    do: {{:error, reason}, state}
 
   defp finalize_quarantined_operator_intent(state, intent, reason, result) do
     data = %{
@@ -2299,12 +2484,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp validate_worker_causation(
-         %TransitionIntent{source: :worker, metadata: %{dispatch_transition_id: dispatch_id}} = intent,
+         %TransitionIntent{source: :worker, metadata: %{dispatch_transition_id: dispatch_id}} =
+           intent,
          current_issue
        )
        when is_binary(dispatch_id) and dispatch_id != "" do
     latest_dispatch_id = latest_dispatch_transition_id_for_issue(intent.issue_id)
-    live_head_oid = current_issue.metadata && (current_issue.metadata["head_oid"] || current_issue.metadata[:head_oid])
+
+    live_head_oid =
+      current_issue.metadata &&
+        (current_issue.metadata["head_oid"] || current_issue.metadata[:head_oid])
 
     cond do
       latest_dispatch_id != dispatch_id ->
@@ -2361,24 +2550,45 @@ defmodule SymphonyElixir.Orchestrator do
   defp validate_operator_request_labels(
          "authoritative",
          %TransitionIntent{
-           source: :github_webhook,
+           source: source,
            kind: {:operator_request, _},
            metadata: %{kind: :operator_transition_requested}
          } = intent,
          issue
-       ) do
-    request_labels = Config.settings!().state_manager.human_intent_labels |> Map.values() |> MapSet.new()
-    observed = Enum.filter(issue.labels || [], &MapSet.member?(request_labels, &1))
-    expected_label = intent.metadata[:label]
+       )
+       when source in [:github_webhook, :forgejo_webhook] do
+    request_labels =
+      Config.settings!().state_manager.human_intent_labels
+      |> Map.values()
+      |> Enum.map(&normalize_operator_label/1)
+      |> MapSet.new()
+
+    observed =
+      (issue.labels || [])
+      |> Enum.filter(&MapSet.member?(request_labels, normalize_operator_label(&1)))
+
+    expected_label = intent.metadata[:label] |> normalize_operator_label()
 
     case observed do
-      [^expected_label] -> :ok
-      [] -> stale_request_delivery_or_rejection(issue, expected_label)
-      labels -> {:rejected, {:ambiguous_request_labels, expected_label, Enum.sort(labels)}}
+      [label] ->
+        if normalize_operator_label(label) == expected_label,
+          do: :ok,
+          else: {:rejected, {:request_label_mismatch, expected_label, label}}
+
+      [] ->
+        stale_request_delivery_or_rejection(issue, expected_label)
+
+      labels ->
+        {:rejected, {:ambiguous_request_labels, expected_label, Enum.sort(labels)}}
     end
   end
 
   defp validate_operator_request_labels(_mode, _intent, _issue), do: :ok
+
+  defp normalize_operator_label(label) when is_binary(label),
+    do: label |> String.trim() |> String.downcase()
+
+  defp normalize_operator_label(_label), do: ""
 
   defp quarantine_unreadable_operator_request(intent, reason) do
     marker = "<!-- sym-transition:#{intent.id}:quarantine -->"
@@ -2397,9 +2607,14 @@ defmodule SymphonyElixir.Orchestrator do
     case committed_state_for_issue(issue_id) do
       {:ok, committed_state} ->
         case Tracker.apply_state_projection(issue_id, :any, committed_state) do
-          projection when elem(projection, 0) in [:applied, :already_applied] -> comment_result
-          {:conflict, snapshot} -> {:error, {:quarantine_projection_conflict, snapshot}}
-          {:partial_failure, details} -> {:error, {:quarantine_projection_partial_failure, details}}
+          projection when elem(projection, 0) in [:applied, :already_applied] ->
+            comment_result
+
+          {:conflict, snapshot} ->
+            {:error, {:quarantine_projection_conflict, snapshot}}
+
+          {:partial_failure, details} ->
+            {:error, {:quarantine_projection_partial_failure, details}}
         end
 
       :error ->
@@ -2409,8 +2624,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp stale_request_delivery_or_rejection(issue, expected_label) do
     case committed_state_for_issue(issue.id) do
-      {:ok, committed_state} when committed_state == issue.state -> {:noop, :stale_request_delivery}
-      _ -> {:rejected, {:missing_request_label, expected_label}}
+      {:ok, committed_state} when committed_state == issue.state ->
+        {:noop, :stale_request_delivery}
+
+      _ ->
+        {:rejected, {:missing_request_label, expected_label}}
     end
   end
 
@@ -2422,7 +2640,12 @@ defmodule SymphonyElixir.Orchestrator do
     finalize_non_effect_decision(state, mode, intent, :conflict, snapshot)
   end
 
-  defp apply_transition_decision(state, "authoritative", %TransitionIntent{kind: {:operator_request, _}} = intent, {:rejected, reason}) do
+  defp apply_transition_decision(
+         state,
+         "authoritative",
+         %TransitionIntent{kind: {:operator_request, _}} = intent,
+         {:rejected, reason}
+       ) do
     reconciliation_result(state, intent, reason)
   end
 
@@ -2463,7 +2686,9 @@ defmodule SymphonyElixir.Orchestrator do
                transition_plan_data(plan, %{mode: "shadow", shadow_readback: readback})
              )
            ) do
-      applied = AppliedTransition.from_plan(plan, metadata: %{mode: "shadow", shadow_readback: readback})
+      applied =
+        AppliedTransition.from_plan(plan, metadata: %{mode: "shadow", shadow_readback: readback})
+
       {{:ok, applied}, %{state | last_transition: applied}}
     else
       {:error, reason} ->
@@ -2482,7 +2707,9 @@ defmodule SymphonyElixir.Orchestrator do
     if journal_phase_reached?(plan.id, :projection_applied) do
       :ok
     else
-      Tracker.adapter().update_issue_state(plan.issue_id, plan.to_state)
+      with :ok <- Tracker.write_ready?() do
+        Tracker.adapter().update_issue_state(plan.issue_id, plan.to_state)
+      end
     end
   end
 
@@ -2508,14 +2735,26 @@ defmodule SymphonyElixir.Orchestrator do
     case fetch_transition_issue(plan.issue_id) do
       {:ok, %{state: state}} when state == plan.to_state ->
         with :ok <-
-               normalize_journal_record(journal_record(plan.id, :projection_applied, %{mode: "shadow", agreement: true, state: state})) do
+               normalize_journal_record(
+                 journal_record(plan.id, :projection_applied, %{
+                   mode: "shadow",
+                   agreement: true,
+                   state: state
+                 })
+               ) do
           {:ok, %{agreement: true, state: state}}
         end
 
       {:ok, issue} ->
-        mismatch = %{mode: "shadow", agreement: false, expected_state: plan.to_state, state: issue.state}
+        mismatch = %{
+          mode: "shadow",
+          agreement: false,
+          expected_state: plan.to_state,
+          state: issue.state
+        }
 
-        with :ok <- normalize_journal_record(journal_record(plan.id, :projection_applied, mismatch)),
+        with :ok <-
+               normalize_journal_record(journal_record(plan.id, :projection_applied, mismatch)),
              :ok <- normalize_journal_record(journal_record(plan.id, :verified, mismatch)) do
           {:error, {:shadow_policy_mismatch, plan.to_state, issue.state}}
         end
@@ -2581,13 +2820,44 @@ defmodule SymphonyElixir.Orchestrator do
          :ok <- apply_required_transition_comment(plan),
          :ok <- apply_transition_broker_effects(plan),
          {:ok, projection_metadata} <- apply_tracker_projection(plan),
-         :ok <- normalize_journal_record(journal_record(plan.id, :verified, Map.put(transition_plan_data(plan), :projection, projection_metadata))) do
+         {:ok, next_state} <- maybe_complete_forgejo_parent(state, plan),
+         :ok <-
+           normalize_journal_record(
+             journal_record(
+               plan.id,
+               :verified,
+               Map.put(transition_plan_data(plan), :projection, projection_metadata)
+             )
+           ) do
       applied = AppliedTransition.from_plan(plan, metadata: %{projection: projection_metadata})
-      {{:ok, applied}, %{state | last_transition: applied}}
+      {{:ok, applied}, %{next_state | last_transition: applied}}
     else
+      {:deferred, handoff_metadata} ->
+        finalize_deferred_parent_completion(state, plan, handoff_metadata)
+
       {:conflict, snapshot} ->
         _ = journal_retry(plan, {:conflict, snapshot})
         {{:conflict, snapshot}, %{state | transition_conflicts: state.transition_conflicts + 1}}
+
+      {:error, reason} ->
+        _ = journal_retry(plan, reason)
+        {{:error, reason}, state}
+    end
+  end
+
+  defp finalize_deferred_parent_completion(state, plan, handoff_metadata) do
+    case normalize_journal_record(
+           journal_record(
+             plan.id,
+             :verified,
+             transition_plan_data(plan, %{parent_completion_handoff: handoff_metadata})
+           )
+         ) do
+      :ok ->
+        # The requested terminal projection was intentionally superseded by
+        # the journaled Human Review handoff. Treating it as a retry would
+        # replay an obsolete Done plan after the parent already moved.
+        {{:noop, {:parent_completion_deferred, handoff_metadata.transition_id}}, state}
 
       {:error, reason} ->
         _ = journal_retry(plan, reason)
@@ -2609,9 +2879,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp ensure_transition_received(%TransitionIntent{} = intent, mode)
        when mode in ["shadow", "authoritative"] do
     case journal_snapshot(intent.id) do
-      {:ok, %{phase: :verified}} -> {:noop, :already_applied}
-      {:ok, _pending} -> :ok
-      :error -> normalize_journal_record(journal_record(intent.id, :received, transition_intent_data(intent)))
+      {:ok, %{phase: :verified}} ->
+        {:noop, :already_applied}
+
+      {:ok, _pending} ->
+        :ok
+
+      :error ->
+        normalize_journal_record(journal_record(intent.id, :received, transition_intent_data(intent)))
     end
   end
 
@@ -2762,15 +3037,95 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_tracker_projection_effect(plan) do
     case Tracker.apply_state_projection(plan.issue_id, plan.from_state, plan.to_state) do
-      {:applied, metadata} -> record_projection_applied(plan, metadata, :applied)
-      {:already_applied, metadata} -> record_projection_applied(plan, metadata, :already_applied)
-      {:conflict, snapshot} -> {:conflict, snapshot}
-      {:partial_failure, details} -> {:error, {:projection_partial_failure, details}}
+      {:applied, metadata} ->
+        record_projection_applied(plan, metadata, :applied)
+
+      {:already_applied, metadata} ->
+        record_projection_applied(plan, metadata, :already_applied)
+
+      {:conflict, %{reason: {:forgejo_parent_completion_deferred, _number}} = snapshot} ->
+        defer_forgejo_parent_completion(plan, snapshot)
+
+      {:conflict, snapshot} ->
+        {:conflict, snapshot}
+
+      {:partial_failure, details} ->
+        {:error, {:projection_partial_failure, details}}
+    end
+  end
+
+  defp defer_forgejo_parent_completion(plan, snapshot) do
+    with {:ok, issue} <- fetch_transition_issue(plan.issue_id),
+         intent = %TransitionIntent{
+           id: transition_id("parent-terminal-deferred", issue.id, issue.state),
+           issue_id: issue.id,
+           source: :orchestrator,
+           actor: "symphony",
+           expected_state: issue.state,
+           kind: :handoff_required,
+           work_item_kind: issue.kind,
+           causation_id: plan.id,
+           comment_body: "Symphony가 아직 완료되지 않은 Forgejo 하위 이슈를 확인했습니다. 부모 이슈의 완료는 모든 하위 이슈가 종료된 뒤 별도 전이로 처리합니다."
+         },
+         {:ok, _} <- apply_dispatch_transition(intent, issue) do
+      {:deferred, %{snapshot: snapshot, transition_id: intent.id}}
+    else
+      {:error, reason} -> {:error, {:parent_completion_handoff_failed, reason}}
+      other -> {:error, {:parent_completion_handoff_failed, other}}
+    end
+  end
+
+  defp maybe_complete_forgejo_parent(state, %{issue_id: issue_id, to_state: target, id: causation_id})
+       when is_binary(issue_id) do
+    if Config.settings!().tracker.kind == "forgejo" and terminal_issue_state?(target, terminal_state_set()) do
+      complete_forgejo_parent_after_child(state, issue_id, causation_id)
+    else
+      {:ok, state}
+    end
+  end
+
+  defp complete_forgejo_parent_after_child(state, child_id, causation_id) do
+    with {:ok, %Issue{kind: :issue, metadata: metadata}} <- fetch_transition_issue(child_id),
+         parent_number when is_integer(parent_number) <- metadata[:parent_number] || metadata["parent_number"],
+         {:ok, %Issue{} = parent} <- fetch_transition_issue("forgejo:issue:#{parent_number}") do
+      intent = %TransitionIntent{
+        id: transition_id("parent-children-completed", parent.id, parent.state),
+        issue_id: parent.id,
+        source: :orchestrator,
+        actor: "symphony",
+        expected_state: parent.state,
+        kind: :children_completed,
+        work_item_kind: parent.kind,
+        causation_id: causation_id
+      }
+
+      case apply_dispatch_transition(intent, parent) do
+        {:ok, _} ->
+          {:ok, state}
+
+        {:noop, :already_applied} ->
+          {:ok, state}
+
+        {:conflict, snapshot} ->
+          {:error, {:parent_completion_transition_conflict, snapshot}}
+
+        {:error, reason} ->
+          {:error, {:parent_completion_transition_failed, reason}}
+
+        other ->
+          {:error, {:parent_completion_transition_failed, other}}
+      end
+    else
+      # A child without a declared Forgejo parent is a normal terminal
+      # transition.  A malformed relationship is already rejected by the
+      # Forgejo adapter during normalization.
+      _ -> {:ok, state}
     end
   end
 
   defp record_projection_applied(plan, metadata, status) do
-    with :ok <- normalize_journal_record(journal_record(plan.id, :projection_applied, %{projection: metadata})) do
+    with :ok <-
+           normalize_journal_record(journal_record(plan.id, :projection_applied, %{projection: metadata})) do
       {:ok, Map.put(metadata, :status, status)}
     end
   end
@@ -2923,7 +3278,21 @@ defmodule SymphonyElixir.Orchestrator do
     handoff_ambiguous_worker_dispatch(state, lease, issue_id)
   end
 
-  defp replay_pending_transition(
+  defp replay_pending_transition(snapshot, state) do
+    case replay_provider_mismatch(snapshot) do
+      nil ->
+        replay_pending_transition_for_provider(snapshot, state)
+
+      mismatch ->
+        Logger.error("Quarantined transition journal entry after tracker provider change transition_id=#{snapshot.transition_id} reason=#{inspect(mismatch)}")
+
+        _ = quarantine_provider_mismatch(snapshot, mismatch)
+
+        %{state | transition_conflicts: state.transition_conflicts + 1}
+    end
+  end
+
+  defp replay_pending_transition_for_provider(
          %{
            transition_id: "worker-dispatch:" <> _rest,
            phase: :projection_applied,
@@ -2932,17 +3301,77 @@ defmodule SymphonyElixir.Orchestrator do
          state
        ) do
     Logger.warning("Recovered an ambiguous worker dispatch lease; fail-closed issue_id=#{issue_id}")
+
     handoff_ambiguous_worker_dispatch(state, lease, issue_id)
   end
 
-  defp replay_pending_transition(%{transition_id: "worker-dispatch:" <> _rest}, state), do: state
+  defp replay_pending_transition_for_provider(
+         %{transition_id: "worker-dispatch:" <> _rest},
+         state
+       ),
+       do: state
 
-  defp replay_pending_transition(snapshot, state) do
+  defp replay_pending_transition_for_provider(snapshot, state) do
     {result, next_state} = resume_transition_snapshot(snapshot, state)
     log_replay_result(snapshot.transition_id, result)
     _ = schedule_transition_effect_retry(result, snapshot.transition_id)
     next_state
   end
+
+  defp replay_provider_mismatch(%{data: %{issue_id: issue_id}}) when is_binary(issue_id) do
+    current = Config.settings!().tracker.kind
+
+    if current == "memory" do
+      nil
+    else
+      case issue_id do
+        "github:" <> _rest when current != "github" ->
+          {:tracker_provider_mismatch, "github", current, issue_id}
+
+        "forgejo:" <> _rest when current != "forgejo" ->
+          {:tracker_provider_mismatch, "forgejo", current, issue_id}
+
+        _ ->
+          nil
+      end
+    end
+  end
+
+  defp replay_provider_mismatch(_snapshot), do: nil
+
+  defp quarantine_provider_mismatch(snapshot, mismatch) do
+    data = %{
+      issue_id: snapshot.data[:issue_id],
+      quarantined: true,
+      reason: mismatch
+    }
+
+    with :ok <- advance_quarantine_phase(snapshot.transition_id, snapshot.phase, :decided, data),
+         :ok <-
+           advance_quarantine_phase(
+             snapshot.transition_id,
+             snapshot.phase,
+             :projection_applied,
+             data
+           ) do
+      normalize_journal_record(journal_record(snapshot.transition_id, :verified, data))
+    end
+  end
+
+  defp advance_quarantine_phase(_transition_id, current, :decided, _data)
+       when current in [:decided, :required_comment_applied, :projection_applied, :retrying],
+       do: :ok
+
+  defp advance_quarantine_phase(transition_id, :received, :decided, data),
+    do: normalize_journal_record(journal_record(transition_id, :decided, data))
+
+  defp advance_quarantine_phase(_transition_id, current, :projection_applied, _data)
+       when current in [:projection_applied, :retrying],
+       do: :ok
+
+  defp advance_quarantine_phase(transition_id, current, :projection_applied, data)
+       when current in [:received, :decided, :required_comment_applied],
+       do: normalize_journal_record(journal_record(transition_id, :projection_applied, data))
 
   defp handoff_ambiguous_worker_dispatch(state, lease, issue_id) do
     intent = %TransitionIntent{
@@ -3093,7 +3522,7 @@ defmodule SymphonyElixir.Orchestrator do
     attributes = %{
       id: to_string(id),
       issue_id: issue_id,
-      source: :github_webhook,
+      source: tracker_event_source(intent),
       actor: intent_value(intent, :actor),
       kind: tracker_event_transition_kind(event_kind, intent),
       head_oid: intent_value(intent, :head_oid),
@@ -3111,10 +3540,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp intent_value(intent, key), do: Map.get(intent, key) || Map.get(intent, Atom.to_string(key))
 
   defp intent_id(intent) do
-    case intent_value(intent, :delivery_id) || intent_value(intent, :id) do
-      id when is_binary(id) and id != "" -> id
-      _ -> "tracker-payload:#{payload_digest(intent)}"
-    end
+    source = tracker_event_source(intent)
+
+    raw_id =
+      case intent_value(intent, :delivery_id) || intent_value(intent, :id) do
+        id when is_binary(id) and id != "" -> id
+        _ -> "payload:#{payload_digest(intent)}"
+      end
+
+    "#{source}:#{raw_id}"
   end
 
   defp payload_digest(intent) do
@@ -3123,22 +3557,37 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp tracker_work_item_kind("github:pr:" <> _number), do: :pull_request
+  defp tracker_work_item_kind("forgejo:pr:" <> _number), do: :pull_request
   defp tracker_work_item_kind(_issue_id), do: :issue
+
+  defp tracker_event_source(intent) do
+    case intent_value(intent, :source) do
+      source when source in [:github_webhook, :forgejo_webhook] -> source
+      "github_webhook" -> :github_webhook
+      "forgejo_webhook" -> :forgejo_webhook
+      _ -> nil
+    end
+  end
 
   defp tracker_event_transition_kind(:operator_transition_requested, intent),
     do: {:operator_request, Map.get(intent, :label) || Map.get(intent, "label")}
 
   defp tracker_event_transition_kind(:pull_request_closed, intent) do
-    if Map.get(intent, :merged) || Map.get(intent, "merged"), do: :merge_observed, else: :closed_unmerged
+    if Map.get(intent, :merged) || Map.get(intent, "merged"),
+      do: :merge_observed,
+      else: :closed_unmerged
   end
 
   defp tracker_event_transition_kind(:issue_closed, _intent), do: {:operator_request, :canceled}
-  defp tracker_event_transition_kind(:review_feedback_detected, _intent), do: {:operator_request, :rework}
+
+  defp tracker_event_transition_kind(:review_feedback_detected, _intent),
+    do: {:operator_request, :rework}
+
   defp tracker_event_transition_kind(:projection_echo, _intent), do: nil
   defp tracker_event_transition_kind(:state_projection_drift, _intent), do: nil
   defp tracker_event_transition_kind(:head_updated, _intent), do: nil
   defp tracker_event_transition_kind(:review_submitted, _intent), do: nil
-  defp tracker_event_transition_kind(:item_reopened, _intent), do: nil
+  defp tracker_event_transition_kind(:item_reopened, _intent), do: {:operator_request, :reopen}
   defp tracker_event_transition_kind(_kind, _intent), do: nil
 
   defp safe_orchestrator_call(server, message) do
@@ -3220,8 +3669,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp committed_state_for_issue(_issue_id), do: :error
 
-  defp verified_state_for_issue(%{phase: :verified, data: %{issue_id: issue_id, to_state: state}}, issue_id),
-    do: {:ok, state}
+  defp verified_state_for_issue(
+         %{phase: :verified, data: %{issue_id: issue_id, to_state: state}},
+         issue_id
+       ),
+       do: {:ok, state}
 
   defp verified_state_for_issue(_event, _issue_id), do: nil
 

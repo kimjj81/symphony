@@ -15,7 +15,7 @@ _In this [demo video](.github/media/symphony-demo.mp4), Symphony monitors a Line
 Symphony is the sole automated authority for workflow state. Coding agents return semantic outcomes
 such as implementation complete, review findings, or merge ready; they do not mutate workflow labels
 or publish automated transition comments themselves. Symphony serializes those outcomes, records
-external effects in a durable journal, and projects one verified state to GitHub or Linear.
+external effects in a durable journal, and projects one verified state to GitHub, Forgejo, or Linear.
 
 Operators continue to work in the tracker. Human comments are unchanged, and state changes are
 requested with workflow-configured request labels such as `sym:request-planned`; Symphony validates

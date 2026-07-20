@@ -99,10 +99,13 @@ defmodule SymphonyElixir.TestSupport do
           tracker_kind: "linear",
           tracker_endpoint: "https://api.linear.app/graphql",
           tracker_api_token: "token",
+          tracker_read_api_token: nil,
+          tracker_write_api_token: nil,
           tracker_project_slug: "project",
           tracker_owner: nil,
           tracker_repo: nil,
           tracker_assignee: nil,
+          tracker_bot_login: nil,
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           tracker_state_labels: %{},
@@ -158,10 +161,13 @@ defmodule SymphonyElixir.TestSupport do
     tracker_kind = Keyword.get(config, :tracker_kind)
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
+    tracker_read_api_token = Keyword.get(config, :tracker_read_api_token)
+    tracker_write_api_token = Keyword.get(config, :tracker_write_api_token)
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
     tracker_owner = Keyword.get(config, :tracker_owner)
     tracker_repo = Keyword.get(config, :tracker_repo)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
+    tracker_bot_login = Keyword.get(config, :tracker_bot_login)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     tracker_state_labels = Keyword.get(config, :tracker_state_labels)
@@ -221,10 +227,13 @@ defmodule SymphonyElixir.TestSupport do
         "  kind: #{yaml_value(tracker_kind)}",
         "  endpoint: #{yaml_value(tracker_endpoint)}",
         "  api_key: #{yaml_value(tracker_api_token)}",
+        "  read_api_key: #{yaml_value(tracker_read_api_token)}",
+        "  write_api_key: #{yaml_value(tracker_write_api_token)}",
         "  project_slug: #{yaml_value(tracker_project_slug)}",
         "  owner: #{yaml_value(tracker_owner)}",
         "  repo: #{yaml_value(tracker_repo)}",
         "  assignee: #{yaml_value(tracker_assignee)}",
+        "  bot_login: #{yaml_value(tracker_bot_login)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "  state_labels: #{yaml_value(tracker_state_labels)}",

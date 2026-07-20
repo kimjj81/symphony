@@ -103,6 +103,25 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
     assert Enum.count(history, &(&1.phase == :verified)) == 1
   end
 
+  test "refresh-only Forgejo delivery facts are journaled and reject payload reuse", %{journal: journal} do
+    intent = %{
+      source: :forgejo_webhook,
+      kind: :head_updated,
+      delivery_id: "forgejo-delivery-42:1",
+      issue_id: "forgejo:pr:42",
+      head_oid: "head-one"
+    }
+
+    assert {:noop, :head_updated} = Orchestrator.request_tracker_intent(intent)
+    assert {:noop, :already_applied} = Orchestrator.request_tracker_intent(intent)
+
+    assert {:ok, %{phase: :verified, data: %{refresh_only: true}}} =
+             TransitionJournal.snapshot(journal, "forgejo_webhook:forgejo-delivery-42:1")
+
+    assert {:error, {:tracker_delivery_payload_mismatch, "forgejo_webhook:forgejo-delivery-42:1"}} =
+             Orchestrator.request_tracker_intent(%{intent | head_oid: "head-two"})
+  end
+
   test "a stale expected state returns a conflict without tracker writes", %{journal: journal} do
     issue = issue("github:pr:stale", "Rework")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
@@ -252,6 +271,37 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
     assert {:ok, %{phase: :verified}} = TransitionJournal.snapshot(journal, id)
   end
 
+  test "startup replay quarantines a journal entry from a different hosted-git provider", %{journal: journal} do
+    id = "transition-provider-mismatch"
+
+    assert {:ok, _} =
+             TransitionJournal.record(journal, id, :received, %{
+               issue_id: "github:issue:91",
+               source: :worker,
+               kind: :implementation_complete
+             })
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "forgejo",
+      tracker_endpoint: "https://forgejo.example/api/v1",
+      tracker_owner: "acme",
+      tracker_repo: "widgets",
+      tracker_write_api_token: "forgejo-write"
+    )
+
+    Application.put_env(:symphony_elixir, :forgejo_request_fun, fn _opts ->
+      flunk("provider-mismatched replay must not call Forgejo")
+    end)
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :forgejo_request_fun) end)
+
+    assert {:noreply, %{transition_conflicts: 1}} =
+             Orchestrator.handle_continue(:replay_transition_journal, empty_state())
+
+    assert {:ok, %{phase: :verified, data: %{quarantined: true}}} =
+             TransitionJournal.snapshot(journal, id)
+  end
+
   test "multiple live request labels are quarantined and reconciled" do
     issue = %{issue("github:pr:request-conflict", "Review") | labels: ["sym:request-rework", "sym:request-merging"]}
     issue_id = issue.id
@@ -272,6 +322,25 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
     assert_receive {:memory_tracker_comment_once, ^issue_id, body, _marker}
     assert body =~ "상태 전이를 적용하지 않았습니다"
     assert_receive {:memory_tracker_state_projection, ^issue_id, "Review", "Review"}
+  end
+
+  test "accepts a mixed-case Forgejo request label through authoritative validation" do
+    issue = %{issue("forgejo:pr:request-case", "Human Review") | labels: ["SYM:REQUEST-MERGING"]}
+    issue_id = issue.id
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    intent =
+      intent("transition-request-case", issue,
+        source: :forgejo_webhook,
+        actor: "maintainer",
+        kind: {:operator_request, :merging},
+        metadata: %{kind: :operator_transition_requested, label: "SYM:REQUEST-MERGING"}
+      )
+
+    assert {:reply, {:ok, %{to_state: "Merging"}}, _state} =
+             Orchestrator.handle_call({:transition_request, intent}, {self(), make_ref()}, empty_state())
+
+    assert_receive {:memory_tracker_state_projection, ^issue_id, "Human Review", "Merging"}
   end
 
   test "an unreadable operator request is quarantined and journaled as verified", %{

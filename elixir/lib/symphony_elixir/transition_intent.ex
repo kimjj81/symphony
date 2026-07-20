@@ -22,6 +22,7 @@ defmodule SymphonyElixir.TransitionIntent do
           | :closed_unmerged
           | :blocked
           | :handoff_required
+          | :children_completed
           | {:operator_request, atom() | String.t()}
 
   @enforce_keys [:id, :issue_id, :source, :kind]

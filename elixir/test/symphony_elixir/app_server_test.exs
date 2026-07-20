@@ -305,7 +305,11 @@ defmodule SymphonyElixir.AppServerTest do
       policy_cases = [
         %{"type" => "dangerFullAccess"},
         %{"type" => "externalSandbox", "profile" => "remote-ci"},
-        %{"type" => "workspaceWrite", "writableRoots" => ["relative/path"], "networkAccess" => true},
+        %{
+          "type" => "workspaceWrite",
+          "writableRoots" => ["relative/path"],
+          "networkAccess" => true
+        },
         %{"type" => "futureSandbox", "nested" => %{"flag" => true}}
       ]
 
@@ -414,7 +418,11 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Validate selected turn profile", issue, model: "gpt-5.6-terra", effort: "high")
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Validate selected turn profile", issue,
+                 model: "gpt-5.6-terra",
+                 effort: "high"
+               )
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
@@ -772,7 +780,8 @@ defmodule SymphonyElixir.AppServerTest do
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
 
-                 payload["id"] == 99 and get_in(payload, ["result", "decision"]) == "acceptForSession"
+                 payload["id"] == 99 and
+                   get_in(payload, ["result", "decision"]) == "acceptForSession"
                else
                  false
                end
@@ -870,7 +879,12 @@ defmodule SymphonyElixir.AppServerTest do
                    |> Jason.decode!()
 
                  payload["id"] == 110 and
-                   get_in(payload, ["result", "answers", "mcp_tool_call_approval_call-717", "answers"]) ==
+                   get_in(payload, [
+                     "result",
+                     "answers",
+                     "mcp_tool_call_approval_call-717",
+                     "answers"
+                   ]) ==
                      ["Approve this Session"]
                else
                  false
@@ -1380,7 +1394,11 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert_received {:tool_called, "linear_graphql", %{"query" => "query Viewer { viewer { id } }"}}
 
-      assert_received {:app_server_message, %{event: :tool_call_failed, payload: %{"params" => %{"tool" => "linear_graphql"}}}}
+      assert_received {:app_server_message,
+                       %{
+                         event: :tool_call_failed,
+                         payload: %{"params" => %{"tool" => "linear_graphql"}}
+                       }}
     after
       File.rm_rf(test_root)
     end
@@ -1444,7 +1462,8 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Validate newline-delimited buffering", issue)
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Validate newline-delimited buffering", issue)
     after
       File.rm_rf(test_root)
     end
@@ -1590,6 +1609,7 @@ defmodule SymphonyElixir.AppServerTest do
                AppServer.run(workspace, "Capture malformed protocol line", issue, on_message: on_message)
 
       assert_received {:app_server_message, %{event: :malformed, payload: "{\"method\":\"turn/completed\""}}
+
       assert_received {:app_server_message, %{event: :turn_completed}}
     after
       File.rm_rf(test_root)
@@ -1605,10 +1625,12 @@ defmodule SymphonyElixir.AppServerTest do
 
     previous_path = System.get_env("PATH")
     previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_custom_write_token = System.get_env("CUSTOM_FORGEJO_WRITE_TOKEN")
 
     on_exit(fn ->
       restore_env("PATH", previous_path)
       restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      restore_env("CUSTOM_FORGEJO_WRITE_TOKEN", previous_custom_write_token)
     end)
 
     try do
@@ -1619,6 +1641,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.mkdir_p!(test_root)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
       System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+      System.put_env("CUSTOM_FORGEJO_WRITE_TOKEN", "forgejo-custom-broker-write")
 
       File.write!(fake_ssh, """
       #!/bin/sh
@@ -1655,7 +1678,13 @@ defmodule SymphonyElixir.AppServerTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: "/remote/workspaces",
-        codex_command: "fake-remote-codex app-server"
+        codex_command: "fake-remote-codex app-server",
+        tracker_kind: "forgejo",
+        tracker_endpoint: "https://forgejo.example/api/v1",
+        tracker_owner: "acme",
+        tracker_repo: "widgets",
+        tracker_read_api_token: "forgejo-read-only",
+        tracker_write_api_token: "$CUSTOM_FORGEJO_WRITE_TOKEN"
       )
 
       issue = %Issue{
@@ -1686,7 +1715,16 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "mkdir -p"
       assert argv_line =~ "symphony-worker-gh-config-"
       assert argv_line =~ "trap "
-      assert argv_line =~ "env -u GITHUB_TOKEN -u GH_TOKEN"
+      assert argv_line =~ "env -u GITHUB_TOKEN -u GH_TOKEN -u FORGEJO_TOKEN -u SYMPHONY_TRACKER_READ_TOKEN"
+      assert argv_line =~ "-u SYMPHONY_TRACKER_WRITE_TOKEN"
+      assert argv_line =~ "-u LINEAR_API_KEY"
+      assert argv_line =~ "-u CUSTOM_FORGEJO_WRITE_TOKEN"
+      assert argv_line =~ "-u SYMPHONY_FORGEJO_WEBHOOK_SECRET"
+      assert argv_line =~ "-u SYMPHONY_GITHUB_WEBHOOK_SECRET"
+      refute argv_line =~ "FORGEJO_TOKEN="
+      refute argv_line =~ "SYMPHONY_TRACKER_READ_TOKEN="
+      refute argv_line =~ "forgejo-read-only"
+      refute argv_line =~ "forgejo-custom-broker-write"
       assert argv_line =~ "fake-remote-codex app-server"
 
       expected_turn_policy = %{
@@ -1729,5 +1767,194 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "local workers receive only the provider read-token alias" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-local-credentials-#{System.unique_integer([:positive])}"
+      )
+
+    credential_envs = [
+      "GH_TOKEN",
+      "GITHUB_TOKEN",
+      "FORGEJO_TOKEN",
+      "SYMPHONY_TRACKER_READ_TOKEN",
+      "SYMPHONY_TRACKER_WRITE_TOKEN",
+      "SYMPHONY_FORGEJO_WEBHOOK_SECRET",
+      "SYMPHONY_GITHUB_WEBHOOK_SECRET",
+      "CUSTOM_FORGEJO_WRITE_TOKEN",
+      "SYMP_TEST_LOCAL_ENV_TRACE"
+    ]
+
+    previous_env = Map.new(credential_envs, &{&1, System.get_env(&1)})
+
+    on_exit(fn ->
+      Enum.each(previous_env, fn {name, value} -> restore_env(name, value) end)
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-LOCAL-CREDENTIALS")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "worker.env")
+
+      File.mkdir_p!(workspace)
+
+      System.put_env("GH_TOKEN", "github-parent-token")
+      System.put_env("GITHUB_TOKEN", "github-legacy-token")
+      System.put_env("FORGEJO_TOKEN", "forgejo-legacy-write-token")
+      System.put_env("SYMPHONY_TRACKER_READ_TOKEN", "forgejo-read-only-token")
+      System.put_env("SYMPHONY_TRACKER_WRITE_TOKEN", "tracker-write-token")
+      System.put_env("SYMPHONY_FORGEJO_WEBHOOK_SECRET", "forgejo-webhook-secret")
+      System.put_env("SYMPHONY_GITHUB_WEBHOOK_SECRET", "github-webhook-secret")
+      System.put_env("CUSTOM_FORGEJO_WRITE_TOKEN", "custom-write-token")
+      System.put_env("SYMP_TEST_LOCAL_ENV_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      {
+        printf 'GH_TOKEN=%s\\n' "${GH_TOKEN-unset}"
+        printf 'GITHUB_TOKEN=%s\\n' "${GITHUB_TOKEN-unset}"
+        printf 'FORGEJO_TOKEN=%s\\n' "${FORGEJO_TOKEN-unset}"
+        printf 'SYMPHONY_TRACKER_READ_TOKEN=%s\\n' "${SYMPHONY_TRACKER_READ_TOKEN-unset}"
+        printf 'SYMPHONY_TRACKER_WRITE_TOKEN=%s\\n' "${SYMPHONY_TRACKER_WRITE_TOKEN-unset}"
+        printf 'SYMPHONY_FORGEJO_WEBHOOK_SECRET=%s\\n' "${SYMPHONY_FORGEJO_WEBHOOK_SECRET-unset}"
+        printf 'SYMPHONY_GITHUB_WEBHOOK_SECRET=%s\\n' "${SYMPHONY_GITHUB_WEBHOOK_SECRET-unset}"
+        printf 'CUSTOM_FORGEJO_WRITE_TOKEN=%s\\n' "${CUSTOM_FORGEJO_WRITE_TOKEN-unset}"
+      } > "$SYMP_TEST_LOCAL_ENV_TRACE"
+
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-local-credentials"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-local-credentials"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        tracker_kind: "forgejo",
+        tracker_endpoint: "https://forgejo.example/api/v1",
+        tracker_owner: "acme",
+        tracker_repo: "widgets",
+        tracker_read_api_token: "$SYMPHONY_TRACKER_READ_TOKEN",
+        tracker_write_api_token: "$CUSTOM_FORGEJO_WRITE_TOKEN"
+      )
+
+      issue = %Issue{
+        id: "issue-local-credentials",
+        identifier: "MT-LOCAL-CREDENTIALS",
+        title: "Fence worker credentials",
+        state: "In Progress",
+        labels: []
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Inspect worker credentials", issue)
+
+      assert File.read!(trace_file) == """
+             GH_TOKEN=unset
+             GITHUB_TOKEN=unset
+             FORGEJO_TOKEN=forgejo-read-only-token
+             SYMPHONY_TRACKER_READ_TOKEN=unset
+             SYMPHONY_TRACKER_WRITE_TOKEN=unset
+             SYMPHONY_FORGEJO_WEBHOOK_SECRET=unset
+             SYMPHONY_GITHUB_WEBHOOK_SECRET=unset
+             CUSTOM_FORGEJO_WRITE_TOKEN=unset
+             """
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "standalone daemon clears custom tracker write tokens before launching Codex" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-daemon-credentials-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      state_dir = Path.join(test_root, "state")
+      env_file = Path.join(test_root, "appserver.env")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(state_dir, "daemon.env")
+      port = 40_000 + rem(System.unique_integer([:positive]), 10_000)
+
+      File.mkdir_p!(state_dir)
+      File.touch!(env_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      {
+        printf 'FORGEJO_TOKEN=%s\\n' "${FORGEJO_TOKEN-unset}"
+        printf 'SYMPHONY_TRACKER_READ_TOKEN=%s\\n' "${SYMPHONY_TRACKER_READ_TOKEN-unset}"
+        printf 'SYMPHONY_TRACKER_WRITE_TOKEN=%s\\n' "${SYMPHONY_TRACKER_WRITE_TOKEN-unset}"
+        printf 'CUSTOM_DAEMON_WRITE_TOKEN=%s\\n' "${CUSTOM_DAEMON_WRITE_TOKEN-unset}"
+        printf 'SYMPHONY_FORGEJO_WEBHOOK_SECRET=%s\\n' "${SYMPHONY_FORGEJO_WEBHOOK_SECRET-unset}"
+        printf 'HTTPS_PROXY=%s\\n' "${HTTPS_PROXY-unset}"
+      } > "$(dirname "$GH_CONFIG_DIR")/daemon.env"
+      sleep 2
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      {output, 0} =
+        System.cmd("bash", [Path.expand("../../scripts/codex-appserver-daemon.sh", __DIR__)],
+          env: [
+            {"CODEX_APPSERVER_ENV", env_file},
+            {"CODEX_APPSERVER_STATE_DIR", state_dir},
+            {"CODEX_APPSERVER_START_TIMEOUT_SEC", "0"},
+            {"CODEX_WS_PORT", Integer.to_string(port)},
+            {"CODEX_BIN", codex_binary},
+            {"SYMPHONY_TRACKER_KIND", "forgejo"},
+            {"SYMPHONY_TRACKER_READ_TOKEN", "forgejo-read-only-token"},
+            {"SYMPHONY_TRACKER_WRITE_TOKEN", "tracker-write-token"},
+            {"CUSTOM_DAEMON_WRITE_TOKEN", "custom-write-token"},
+            {"SYMPHONY_FORGEJO_WEBHOOK_SECRET", "forgejo-webhook-secret"},
+            {"HTTPS_PROXY", "https://proxy.example"}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert output =~ "INFO: booting codex app-server"
+
+      assert await_file!(trace_file) == """
+             FORGEJO_TOKEN=forgejo-read-only-token
+             SYMPHONY_TRACKER_READ_TOKEN=unset
+             SYMPHONY_TRACKER_WRITE_TOKEN=unset
+             CUSTOM_DAEMON_WRITE_TOKEN=unset
+             SYMPHONY_FORGEJO_WEBHOOK_SECRET=unset
+             HTTPS_PROXY=https://proxy.example
+             """
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp await_file!(path) do
+    Enum.reduce_while(1..40, nil, fn _attempt, _contents ->
+      case File.read(path) do
+        {:ok, contents} ->
+          {:halt, contents}
+
+        {:error, _reason} ->
+          Process.sleep(25)
+          {:cont, nil}
+      end
+    end)
   end
 end
