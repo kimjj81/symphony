@@ -1,5 +1,20 @@
 [
   {
+    "id": "ADR-20260720-0002-RKT",
+    "title": "Webhook registration does not gate runtime startup",
+    "tags": [
+      "orchestration",
+      "github",
+      "webhook",
+      "startup",
+      "reliability"
+    ],
+    "status": "Accepted",
+    "date": "2026-07-20",
+    "tldr": "Symphony starts independently of transient GitHub webhook registration failures and retries registration for the lifetime of the runtime process.",
+    "path": "docs/adr/ADR-20260720-0002-RKT-webhook-registration-does-not-gate-runtime-startup.md"
+  },
+  {
     "id": "ADR-20260719-0001-QNX",
     "title": "Symphony owns tracker workflow state",
     "tags": [

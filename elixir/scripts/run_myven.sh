@@ -17,14 +17,21 @@ export SYMPHONY_GITHUB_WEBHOOK_URL="${SYMPHONY_GITHUB_WEBHOOK_URL:-https://ghook
 
 ngrok_pid=""
 webhook_registration_pid=""
+symphony_pid=""
 
 cleanup() {
   status=$?
+  trap - INT TERM EXIT
   set +e
 
   if [ -n "$webhook_registration_pid" ]; then
     kill "$webhook_registration_pid" 2>/dev/null
     wait "$webhook_registration_pid" 2>/dev/null
+  fi
+
+  if [ -n "$symphony_pid" ]; then
+    kill "$symphony_pid" 2>/dev/null
+    wait "$symphony_pid" 2>/dev/null
   fi
 
   if [ -n "$ngrok_pid" ]; then
@@ -113,11 +120,10 @@ wait_for_symphony_api() {
 }
 
 register_github_webhook() {
-  require_command gh
-
   webhook_url="$1"
   repo="${SYMPHONY_GITHUB_WEBHOOK_REPO:-studiojin-dev/myven}"
   hook_id_file="${SYMPHONY_GITHUB_WEBHOOK_ID_FILE:-$HOME/.cache/symphony/myven-github-webhook-id}"
+  last_webhook_registration_error=""
   mkdir -p "$(dirname "$hook_id_file")"
 
   common_args=(
@@ -136,38 +142,119 @@ register_github_webhook() {
 
   if [ -s "$hook_id_file" ]; then
     hook_id="$(tr -d '\n' < "$hook_id_file")"
-    if gh api --method PATCH "repos/${repo}/hooks/${hook_id}" "${common_args[@]}" >/dev/null; then
+    if patch_output="$(gh api --method PATCH "repos/${repo}/hooks/${hook_id}" "${common_args[@]}" 2>&1)"; then
       printf 'Updated GitHub webhook %s -> %s\n' "$hook_id" "$webhook_url"
       return
     fi
+
+    last_webhook_registration_error="$patch_output"
+    printf '%s\n' "$patch_output" >&2
   fi
 
-  hook_id="$(gh api --method POST "repos/${repo}/hooks" "${common_args[@]}" --jq .id)"
+  if ! create_output="$(gh api --method POST "repos/${repo}/hooks" "${common_args[@]}" --jq .id 2>&1)"; then
+    last_webhook_registration_error="$create_output"
+    printf '%s\n' "$create_output" >&2
+    return 1
+  fi
+
+  hook_id="$create_output"
   printf '%s\n' "$hook_id" > "$hook_id_file"
   printf 'Created GitHub webhook %s -> %s\n' "$hook_id" "$webhook_url"
 }
 
+report_github_webhook_status() {
+  message="$1"
+  printf '%s\n' "$message" >&2
+  printf '%s\n' "$message" >&3
+}
+
+register_github_webhook_with_retry() {
+  webhook_url="$1"
+  retry_seconds="${SYMPHONY_GITHUB_WEBHOOK_RETRY_SECONDS:-30}"
+  attempt=1
+  retry_sleep_pid=""
+
+  trap 'if [ -n "$retry_sleep_pid" ]; then kill "$retry_sleep_pid" 2>/dev/null; fi; exit 0' INT TERM
+
+  while ! register_github_webhook "$webhook_url"; do
+    case "$last_webhook_registration_error" in
+      *"HTTP 503"*)
+        failure_summary="GitHub API 장애 감지(HTTP 503)"
+        ;;
+      *"HTTP 5"[0-9][0-9]*)
+        failure_summary="GitHub API 서버 장애 감지(HTTP 5xx)"
+        ;;
+      *)
+        failure_summary="GitHub webhook 등록 실패"
+        ;;
+    esac
+
+    report_github_webhook_status \
+      "WARNING: ${failure_summary}; Symphony는 계속 실행 중이며 ${retry_seconds}초 후 재시도합니다 (시도 ${attempt})."
+    attempt=$((attempt + 1))
+    sleep "$retry_seconds" &
+    retry_sleep_pid=$!
+    wait "$retry_sleep_pid"
+    retry_sleep_pid=""
+  done
+
+  failed_attempts=$((attempt - 1))
+  if [ "$failed_attempts" -eq 0 ]; then
+    report_github_webhook_status "INFO: GitHub webhook 등록 완료."
+  else
+    report_github_webhook_status \
+      "INFO: GitHub webhook 등록 복구 완료 (실패 ${failed_attempts}회 후)."
+  fi
+}
+
 register_github_webhook_after_symphony_starts() {
   wait_for_symphony_api
-  register_github_webhook "${NGROK_URL}/api/v1/github/webhook"
+  register_github_webhook_with_retry "${NGROK_URL}/api/v1/github/webhook"
 }
 
 register_fixed_github_webhook() {
-  ensure_github_webhook_secret
-  register_github_webhook "$SYMPHONY_GITHUB_WEBHOOK_URL"
+  register_github_webhook_with_retry "$SYMPHONY_GITHUB_WEBHOOK_URL"
+}
+
+start_github_webhook_registration() {
+  webhook_registration_log="${SYMPHONY_GITHUB_WEBHOOK_REGISTRATION_LOG:-$HOME/.cache/symphony/myven-github-webhook-registration.log}"
+  mkdir -p "$(dirname "$webhook_registration_log")"
+  printf 'GitHub webhook registration log: %s\n' "$webhook_registration_log"
+
+  "$@" 3>&2 > "$webhook_registration_log" 2>&1 &
+  webhook_registration_pid=$!
+}
+
+run_symphony_managed() {
+  mise exec -- ./bin/symphony ./WORKFLOW.myven.md --port "$SYMPHONY_PORT" --i-understand-that-this-will-be-running-without-the-usual-guardrails &
+  symphony_pid=$!
+
+  if wait "$symphony_pid"; then
+    symphony_status=0
+  else
+    symphony_status=$?
+  fi
+
+  symphony_pid=""
+  return "$symphony_status"
 }
 
 mise trust
 mise install
 mise exec -- mix build
 
+trap cleanup INT TERM EXIT
+
 case "${SYMPHONY_GITHUB_WEBHOOK_MODE:-}" in
   ""|none)
     exec mise exec -- ./bin/symphony ./WORKFLOW.myven.md --port "$SYMPHONY_PORT" --i-understand-that-this-will-be-running-without-the-usual-guardrails
     ;;
   fixed|ghook|relay)
-    register_fixed_github_webhook
-    exec mise exec -- ./bin/symphony ./WORKFLOW.myven.md --port "$SYMPHONY_PORT" --i-understand-that-this-will-be-running-without-the-usual-guardrails
+    require_command gh
+    ensure_github_webhook_secret
+    start_github_webhook_registration register_fixed_github_webhook
+    run_symphony_managed
+    exit $?
     ;;
   ngrok)
     ;;
@@ -177,16 +264,8 @@ case "${SYMPHONY_GITHUB_WEBHOOK_MODE:-}" in
     ;;
 esac
 
-trap cleanup INT TERM EXIT
-
 ensure_github_webhook_secret
 start_ngrok
-
-webhook_registration_log="${SYMPHONY_GITHUB_WEBHOOK_REGISTRATION_LOG:-$HOME/.cache/symphony/myven-github-webhook-registration.log}"
-mkdir -p "$(dirname "$webhook_registration_log")"
-printf 'GitHub webhook registration log: %s\n' "$webhook_registration_log"
-
-register_github_webhook_after_symphony_starts > "$webhook_registration_log" 2>&1 &
-webhook_registration_pid=$!
-
-mise exec -- ./bin/symphony ./WORKFLOW.myven.md --port "$SYMPHONY_PORT" --i-understand-that-this-will-be-running-without-the-usual-guardrails
+require_command gh
+start_github_webhook_registration register_github_webhook_after_symphony_starts
+run_symphony_managed
