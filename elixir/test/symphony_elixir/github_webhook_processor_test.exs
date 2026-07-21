@@ -83,6 +83,68 @@ defmodule SymphonyElixir.GitHubWebhookProcessorTest do
              )
   end
 
+  test "continues targeted refresh after state-less drift is accepted as a no-effect receipt" do
+    test_pid = self()
+
+    payload = %{
+      "action" => "labeled",
+      "pull_request" => %{"number" => 549},
+      "label" => %{"name" => "sym:waiting"},
+      "sender" => %{"login" => "maintainer", "type" => "User"}
+    }
+
+    assert {:ok, %{issue_id: "github:pr:549"}} =
+             WebhookProcessor.handle_event("pull_request", payload,
+               tracker_kind: "github",
+               intent_fun: fn intent ->
+                 send(test_pid, {:intent, intent})
+                 {:noop, :canonical_state_unavailable}
+               end,
+               refresh_fun: fn issue_id ->
+                 send(test_pid, {:refresh, issue_id})
+                 {:ok, %{issue_id: issue_id}}
+               end
+             )
+
+    assert_receive {:intent, %{kind: :state_projection_drift, issue_id: "github:pr:549"}}
+    assert_receive {:refresh, "github:pr:549"}
+  end
+
+  test "retries targeted refresh when a verified delivery is redelivered" do
+    test_pid = self()
+
+    payload = %{
+      "action" => "labeled",
+      "pull_request" => %{"number" => 549},
+      "label" => %{"name" => "sym:waiting"},
+      "sender" => %{"login" => "maintainer", "type" => "User"}
+    }
+
+    intent_fun = fn intent ->
+      send(test_pid, {:intent, intent})
+      {:noop, :already_applied}
+    end
+
+    refresh_fun = fn issue_id ->
+      count = Process.get(:github_refresh_count, 0)
+      Process.put(:github_refresh_count, count + 1)
+      send(test_pid, {:refresh, issue_id})
+      if count == 0, do: {:error, :unavailable}, else: {:ok, %{issue_id: issue_id}}
+    end
+
+    opts = [tracker_kind: "github", intent_fun: intent_fun, refresh_fun: refresh_fun]
+
+    assert {:error, :unavailable} =
+             WebhookProcessor.handle_event("pull_request", payload, opts)
+
+    assert_receive {:refresh, "github:pr:549"}
+
+    assert {:ok, %{issue_id: "github:pr:549"}} =
+             WebhookProcessor.handle_event("pull_request", payload, opts)
+
+    assert_receive {:refresh, "github:pr:549"}
+  end
+
   test "ignores unrelated actions without refreshing" do
     test_pid = self()
     payload = %{"action" => "opened", "pull_request" => %{"number" => 259}}

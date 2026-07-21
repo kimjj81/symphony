@@ -1,5 +1,21 @@
 [
   {
+    "id": "ADR-20260721-0005-QXB",
+    "title": "Acknowledge state-less webhook drift",
+    "tags": [
+      "orchestration",
+      "github",
+      "forgejo",
+      "webhook",
+      "nats",
+      "reliability"
+    ],
+    "status": "Accepted",
+    "date": "2026-07-21",
+    "tldr": "Symphony journals state-label drift without committed state as a no-effect receipt so permanent semantic conditions are acknowledged without suppressing retries for transient failures.",
+    "path": "docs/adr/ADR-20260721-0005-QXB-acknowledge-state-less-webhook-drift.md"
+  },
+  {
     "id": "ADR-20260721-0004-WEP",
     "title": "Preflight does not authorize worker execution",
     "tags": [

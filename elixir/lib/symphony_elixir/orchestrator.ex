@@ -2331,6 +2331,15 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, %{phase: :verified, data: %{payload_digest: ^digest}}} ->
         {:noop, :already_applied}
 
+      {:ok,
+       %{
+         phase: phase,
+         data: %{payload_digest: ^digest, refresh_only: true}
+       }} ->
+        with :ok <- complete_refresh_only_receipt(id, phase, data) do
+          {:noop, kind}
+        end
+
       {:ok, %{data: %{payload_digest: existing}}} when is_binary(existing) ->
         {:error, {:tracker_delivery_payload_mismatch, id}}
 
@@ -2339,14 +2348,25 @@ defmodule SymphonyElixir.Orchestrator do
 
       :error ->
         with :ok <- normalize_journal_record(journal_record(id, :received, data)),
-             :ok <- normalize_journal_record(journal_record(id, :decided, data)),
-             :ok <- normalize_journal_record(journal_record(id, :verified, data)) do
+             :ok <- complete_refresh_only_receipt(id, :received, data) do
           {:noop, kind}
-        else
-          {:error, reason} -> {:error, reason}
         end
     end
   end
+
+  defp complete_refresh_only_receipt(id, phase, data) when phase in [:received, :retrying] do
+    with :ok <- normalize_journal_record(journal_record(id, :decided, data)) do
+      complete_refresh_only_receipt(id, :decided, data)
+    end
+  end
+
+  defp complete_refresh_only_receipt(id, :decided, data),
+    do: normalize_journal_record(journal_record(id, :verified, data))
+
+  defp complete_refresh_only_receipt(_id, :verified, _data), do: :ok
+
+  defp complete_refresh_only_receipt(_id, phase, _data),
+    do: {:error, {:invalid_refresh_only_receipt_phase, phase}}
 
   @spec request_refresh_after(GenServer.server(), non_neg_integer()) :: :ok | :unavailable
   def request_refresh_after(server, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
@@ -3719,6 +3739,16 @@ defmodule SymphonyElixir.Orchestrator do
         reconcile_live_projection_drift(state, issue_id, observed_state, committed_state)
 
       :error ->
+        reconcile_projection_drift_without_committed_state(state, intent)
+    end
+  end
+
+  defp reconcile_projection_drift_without_committed_state(state, intent) do
+    case tracker_event_source(intent) do
+      source when source in [:github_webhook, :forgejo_webhook] ->
+        {record_refresh_only_tracker_intent(intent, :canonical_state_unavailable), state}
+
+      _ ->
         {{:error, :canonical_state_unavailable}, state}
     end
   end

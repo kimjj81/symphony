@@ -294,6 +294,93 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
     assert_receive {:memory_tracker_state_projection, "github:pr:open-terminal-label", "Done", "Merging"}
   end
 
+  test "webhook drift without committed state is journaled as a no-effect receipt", %{
+    journal: journal
+  } do
+    intent = %{
+      source: :github_webhook,
+      kind: :state_projection_drift,
+      delivery_id: "orphan-drift-delivery",
+      issue_id: "github:pr:orphan-drift",
+      observed_state: "Waiting"
+    }
+
+    assert {:reply, {:noop, :canonical_state_unavailable}, state} =
+             Orchestrator.handle_call(
+               {:projection_drift, intent},
+               {self(), make_ref()},
+               empty_state()
+             )
+
+    assert {:reply, {:noop, :already_applied}, ^state} =
+             Orchestrator.handle_call(
+               {:projection_drift, intent},
+               {self(), make_ref()},
+               state
+             )
+
+    assert {:ok,
+            %{
+              phase: :verified,
+              data: %{
+                issue_id: "github:pr:orphan-drift",
+                kind: :canonical_state_unavailable,
+                refresh_only: true
+              }
+            }} =
+             TransitionJournal.snapshot(
+               journal,
+               "github_webhook:orphan-drift-delivery"
+             )
+
+    refute_receive {:memory_tracker_comment_once, "github:pr:orphan-drift", _, _}
+    refute_receive {:memory_tracker_state_projection, "github:pr:orphan-drift", _, _}
+  end
+
+  test "state-less drift resumes partial no-effect receipts", %{journal: journal} do
+    for phase <- [:received, :decided] do
+      delivery_id = "partial-orphan-drift-#{phase}"
+
+      intent = %{
+        source: :github_webhook,
+        kind: :state_projection_drift,
+        delivery_id: delivery_id,
+        issue_id: "github:pr:partial-orphan-drift",
+        observed_state: "Waiting"
+      }
+
+      transition_id = "github_webhook:#{delivery_id}"
+      digest = tracker_payload_digest(intent)
+
+      data = %{
+        issue_id: intent.issue_id,
+        source: :github_webhook,
+        kind: :canonical_state_unavailable,
+        payload_digest: digest,
+        refresh_only: true
+      }
+
+      assert {:ok, _} = TransitionJournal.record(journal, transition_id, :received, data)
+
+      if phase == :decided do
+        assert {:ok, _} = TransitionJournal.record(journal, transition_id, :decided, data)
+      end
+
+      assert {:reply, {:noop, :canonical_state_unavailable}, _state} =
+               Orchestrator.handle_call(
+                 {:projection_drift, intent},
+                 {self(), make_ref()},
+                 empty_state()
+               )
+
+      assert {:ok, %{phase: :verified, data: %{payload_digest: ^digest}}} =
+               TransitionJournal.snapshot(journal, transition_id)
+    end
+
+    refute_receive {:memory_tracker_comment_once, "github:pr:partial-orphan-drift", _, _}
+    refute_receive {:memory_tracker_state_projection, "github:pr:partial-orphan-drift", _, _}
+  end
+
   test "an invalid operator request is rejected and receives one reconciliation comment" do
     issue = issue("github:pr:invalid-request", "Todo")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
@@ -757,6 +844,11 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
                issue_id: issue_id,
                to_state: state
              })
+  end
+
+  defp tracker_payload_digest(intent) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(intent))
+    |> Base.encode16(case: :lower)
   end
 
   defp record_worker_lease!(journal, id, issue_id) do

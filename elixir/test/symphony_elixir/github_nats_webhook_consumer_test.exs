@@ -23,6 +23,44 @@ defmodule SymphonyElixir.GitHubNatsWebhookConsumerTest do
     assert_receive {:processed, "pull_request_review_comment", %{"action" => "created"}}
   end
 
+  test "acknowledges a successfully processed relay envelope" do
+    state = [
+      processor_fun: fn _event, _payload ->
+        {:ok, %{issue_id: "github:pr:549"}}
+      end
+    ]
+
+    message = %{
+      body:
+        Jason.encode!(%{
+          "event" => "pull_request",
+          "delivery_id" => "delivery-549",
+          "payload" => %{"action" => "labeled", "pull_request" => %{"number" => 549}}
+        })
+    }
+
+    assert {:ack, ^state} = NatsWebhookConsumer.handle_message(message, state)
+  end
+
+  test "keeps transient processor failures retryable" do
+    state = [
+      processor_fun: fn _event, _payload ->
+        {:error, :unavailable}
+      end
+    ]
+
+    message = %{
+      body:
+        Jason.encode!(%{
+          "event" => "pull_request",
+          "delivery_id" => "delivery-retry",
+          "payload" => %{"action" => "labeled", "pull_request" => %{"number" => 550}}
+        })
+    }
+
+    assert {:nack, ^state} = NatsWebhookConsumer.handle_message(message, state)
+  end
+
   test "rejects malformed envelopes" do
     assert {:error, :invalid_envelope} = NatsWebhookConsumer.handle_envelope(%{"payload" => %{}}, [])
     assert {:error, :invalid_envelope} = NatsWebhookConsumer.handle_envelope(%{"event" => "issues"}, [])
