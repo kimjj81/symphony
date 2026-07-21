@@ -948,6 +948,13 @@ defmodule SymphonyElixir.CoreTest do
       kind: :issue
     }
 
+    requested_issue = %{
+      todo_issue
+      | id: "github:issue:47",
+        identifier: "#47",
+        labels: ["sym:todo", "sym:request-planned"]
+    }
+
     planned_issue = %Issue{
       id: "github:issue:46",
       identifier: "#46",
@@ -957,6 +964,7 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     assert Orchestrator.should_dispatch_issue_for_test(todo_issue, state)
+    refute Orchestrator.should_dispatch_issue_for_test(requested_issue, state)
     refute Orchestrator.should_dispatch_issue_for_test(planned_issue, state)
     assert Orchestrator.should_prepare_pull_request_for_issue_for_test(planned_issue, state)
   end

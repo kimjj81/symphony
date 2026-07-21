@@ -467,6 +467,7 @@ defmodule SymphonyElixir.GitHub.Client do
                number: number,
                repository: github_repository(),
                node_id: raw_issue["node_id"],
+               physical_state: raw_issue["state"],
                merged: pull_merged?(pull_data),
                head_oid: get_in(pull_data || %{}, ["head", "sha"])
              },

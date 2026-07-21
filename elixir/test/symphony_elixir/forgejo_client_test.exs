@@ -56,6 +56,7 @@ defmodule SymphonyElixir.ForgejoClientTest do
     assert issue.branch_name == "symphony/_7"
     assert issue.metadata.head_oid == "abc123"
     assert issue.metadata.parent_number == 7
+    assert issue.metadata.physical_state == "open"
   end
 
   test "normalizes a merged pull request as Done even if an older state label remains" do
@@ -67,6 +68,7 @@ defmodule SymphonyElixir.ForgejoClientTest do
 
     assert {:ok, issue} = Client.normalize_issue_for_test(raw, :pull_request)
     assert issue.state == "Done"
+    assert issue.metadata.physical_state == "closed"
   end
 
   test "keeps a merged Merging pull in the state-manager path until sym:done is projected" do

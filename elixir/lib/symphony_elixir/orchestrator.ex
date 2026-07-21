@@ -938,6 +938,7 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
       !planned_github_source_issue?(issue, active_states, terminal_states) and
+      !human_intent_request_present?(issue) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
@@ -1039,6 +1040,18 @@ defmodule SymphonyElixir.Orchestrator do
        do: assigned_to_worker
 
   defp issue_routable_to_worker?(_issue), do: true
+
+  defp human_intent_request_present?(%Issue{labels: labels}) when is_list(labels) do
+    request_labels =
+      Config.settings!().state_manager.human_intent_labels
+      |> Map.values()
+      |> Enum.map(&normalize_operator_label/1)
+      |> MapSet.new()
+
+    Enum.any?(labels, &MapSet.member?(request_labels, normalize_operator_label(&1)))
+  end
+
+  defp human_intent_request_present?(_issue), do: false
 
   defp todo_issue_blocked_by_non_terminal?(
          %Issue{state: issue_state, blocked_by: blockers},
@@ -1509,7 +1522,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp matching_dispatch_transition_id(event, issue) do
     if event.phase == :verified and event.data[:issue_id] == issue.id and
          event.data[:to_state] == issue.state and
-         event.data[:kind] in [:dispatch_implementation, :dispatch_review, :dispatch_rework] do
+         event.data[:kind] in [
+           :dispatch_planning,
+           :dispatch_implementation,
+           :dispatch_review,
+           :dispatch_rework
+         ] do
       event.transition_id
     end
   end
@@ -1554,10 +1572,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp dispatch_intent_kind(state_name) do
     case normalize_issue_state(state_name) do
+      "todo" -> :dispatch_planning
       "planned" -> :dispatch_implementation
       "rework" -> :dispatch_rework
       "review" -> :dispatch_review
       _ -> nil
+    end
+  end
+
+  defp dispatch_marked_issue(%Issue{} = issue, :dispatch_planning) do
+    if Config.settings!().state_manager.mode in ["shadow", "authoritative"] do
+      record_planning_dispatch_receipt(issue)
+    else
+      {:ok, issue}
     end
   end
 
@@ -1596,6 +1623,74 @@ defmodule SymphonyElixir.Orchestrator do
         {:error, {:dispatch_transition_failed, other}}
     end
   end
+
+  defp record_planning_dispatch_receipt(%Issue{state: state_name} = issue) do
+    transition_id = dispatch_transition_id(issue)
+
+    data = %{
+      issue_id: issue.id,
+      source: :dispatch,
+      actor: "symphony",
+      from_state: state_name,
+      to_state: state_name,
+      kind: :dispatch_planning,
+      causation_id: issue.id,
+      work_item_kind: issue.kind,
+      head_oid: issue.metadata && (issue.metadata["head_oid"] || issue.metadata[:head_oid]),
+      effect: :dispatch_receipt
+    }
+
+    with :ok <- ensure_planning_dispatch_receipt(transition_id, data) do
+      Logger.info("Recorded planning dispatch receipt: #{issue_context(issue)} state=#{state_name}")
+
+      metadata =
+        issue.metadata
+        |> Kernel.||(%{})
+        |> Map.put("symphony_dispatch_state", state_name)
+        |> Map.put("symphony_transition_id", transition_id)
+
+      {:ok, %{issue | metadata: metadata}}
+    end
+  end
+
+  defp ensure_planning_dispatch_receipt(transition_id, data) do
+    case journal_snapshot(transition_id) do
+      {:ok, %{phase: :verified, data: %{issue_id: issue_id, kind: :dispatch_planning}}}
+      when issue_id == data.issue_id ->
+        :ok
+
+      {:ok, %{phase: :verified}} ->
+        {:error, {:dispatch_receipt_collision, transition_id}}
+
+      {:ok, snapshot} ->
+        complete_planning_dispatch_receipt(transition_id, snapshot.phase, data)
+
+      :error ->
+        with :ok <- normalize_journal_record(journal_record(transition_id, :received, data)) do
+          complete_planning_dispatch_receipt(transition_id, :received, data)
+        end
+    end
+  end
+
+  defp complete_planning_dispatch_receipt(transition_id, :received, data) do
+    with :ok <- normalize_journal_record(journal_record(transition_id, :decided, data)) do
+      complete_planning_dispatch_receipt(transition_id, :decided, data)
+    end
+  end
+
+  defp complete_planning_dispatch_receipt(transition_id, :retrying, data) do
+    with :ok <- normalize_journal_record(journal_record(transition_id, :decided, data)) do
+      complete_planning_dispatch_receipt(transition_id, :decided, data)
+    end
+  end
+
+  defp complete_planning_dispatch_receipt(transition_id, :decided, data),
+    do: normalize_journal_record(journal_record(transition_id, :verified, data))
+
+  defp complete_planning_dispatch_receipt(_transition_id, :verified, _data), do: :ok
+
+  defp complete_planning_dispatch_receipt(_transition_id, phase, _data),
+    do: {:error, {:invalid_dispatch_receipt_phase, phase}}
 
   defp dispatch_transition_id(%Issue{} = issue) do
     revision =
@@ -2541,7 +2636,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp dispatch_transition_id(event, issue_id) do
     dispatch_kind? =
-      event.data[:kind] in [:dispatch_implementation, :dispatch_review, :dispatch_rework]
+      event.data[:kind] in [
+        :dispatch_planning,
+        :dispatch_implementation,
+        :dispatch_review,
+        :dispatch_rework
+      ]
 
     if event.phase == :verified and event.data[:issue_id] == issue_id and dispatch_kind?,
       do: event.transition_id
@@ -3404,6 +3504,17 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp resume_transition_snapshot(%{data: %{effect: :dispatch_receipt}} = snapshot, state) do
+    case complete_planning_dispatch_receipt(
+           snapshot.transition_id,
+           snapshot.phase,
+           snapshot.data
+         ) do
+      :ok -> {{:noop, :dispatch_receipt_completed}, state}
+      {:error, reason} -> {{:error, reason}, state}
+    end
+  end
+
   defp resume_transition_snapshot(snapshot, state) do
     case snapshot.data[:handoff_transition_id] do
       handoff_id when is_binary(handoff_id) and handoff_id != "" ->
@@ -3614,11 +3725,17 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_live_projection_drift(state, issue_id, observed_state, committed_state) do
     case fetch_transition_issue(issue_id) do
-      {:ok, issue} when issue.state == committed_state ->
-        {{:noop, :projection_already_reconciled}, state}
+      {:ok, issue} ->
+        cond do
+          issue.state == committed_state ->
+            {{:noop, :projection_already_reconciled}, state}
 
-      {:ok, _issue} ->
-        apply_projection_drift_reconciliation(state, issue_id, observed_state, committed_state)
+          physically_terminal_issue?(issue) ->
+            {{:noop, :terminal_state}, state}
+
+          true ->
+            apply_projection_drift_reconciliation(state, issue_id, observed_state, committed_state)
+        end
 
       {:error, :transition_issue_not_found} ->
         apply_projection_drift_reconciliation(state, issue_id, observed_state, committed_state)
@@ -3626,6 +3743,14 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         {{:error, {:projection_drift_readback_failed, reason}}, state}
     end
+  end
+
+  defp physically_terminal_issue?(%Issue{metadata: metadata}) do
+    metadata = metadata || %{}
+    merged = metadata[:merged] || metadata["merged"]
+    physical_state = metadata[:physical_state] || metadata["physical_state"]
+
+    merged == true or physical_state in ["closed", :closed]
   end
 
   defp apply_projection_drift_reconciliation(state, issue_id, observed_state, committed_state) do
@@ -3828,6 +3953,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states) and
+      !human_intent_request_present?(issue) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
   end
 

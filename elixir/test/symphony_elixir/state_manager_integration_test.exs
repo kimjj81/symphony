@@ -174,6 +174,126 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
              TransitionJournal.snapshot(journal, "transition-terminal")
   end
 
+  test "Todo planning dispatch receives a verified causation without changing state", %{
+    journal: journal
+  } do
+    issue = %{
+      issue("github:issue:planning", "Todo")
+      | kind: :issue,
+        labels: ["sym:todo", "sym:request-planned"]
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    assert {:ok, %Issue{state: "Todo", labels: labels, metadata: metadata}} =
+             Orchestrator.mark_issue_in_progress_for_dispatch_for_test(issue)
+
+    dispatch_id = metadata["symphony_transition_id"]
+    assert is_binary(dispatch_id)
+    assert metadata["symphony_dispatch_state"] == "Todo"
+    assert labels == ["sym:todo", "sym:request-planned"]
+
+    assert {:ok,
+            %{
+              phase: :verified,
+              data: %{
+                issue_id: "github:issue:planning",
+                kind: :dispatch_planning,
+                from_state: "Todo",
+                to_state: "Todo"
+              }
+            }} = TransitionJournal.snapshot(journal, dispatch_id)
+
+    assert Orchestrator.worker_dispatch_lease_id_for_test(issue, nil) =~ dispatch_id
+    refute_receive {:memory_tracker_state_projection, "github:issue:planning", _, _}
+
+    request_intent =
+      intent("planning-request", issue,
+        source: :github_webhook,
+        actor: "maintainer",
+        kind: {:operator_request, :planned},
+        metadata: %{kind: :operator_transition_requested, label: "sym:request-planned"}
+      )
+
+    assert {:reply, {:ok, %AppliedTransition{from_state: "Todo", to_state: "Planned"}}, _state} =
+             Orchestrator.handle_call(
+               {:transition_request, request_intent},
+               {self(), make_ref()},
+               empty_state()
+             )
+
+    assert_receive {:memory_tracker_state_projection, "github:issue:planning", "Todo", "Planned"}
+  end
+
+  test "startup replay completes a pending planning dispatch receipt without tracker writes", %{
+    journal: journal
+  } do
+    transition_id = "dispatch:github:issue:planning-replay:todo"
+
+    assert {:ok, _event} =
+             TransitionJournal.record(journal, transition_id, :received, %{
+               issue_id: "github:issue:planning-replay",
+               source: :dispatch,
+               from_state: "Todo",
+               to_state: "Todo",
+               kind: :dispatch_planning,
+               effect: :dispatch_receipt
+             })
+
+    assert {:noreply, _state} =
+             Orchestrator.handle_continue(:replay_transition_journal, empty_state())
+
+    assert {:ok, %{phase: :verified, data: %{effect: :dispatch_receipt}}} =
+             TransitionJournal.snapshot(journal, transition_id)
+
+    refute_receive {:memory_tracker_state_projection, "github:issue:planning-replay", _, _}
+  end
+
+  test "projection drift never reopens a terminal live pull request", %{journal: journal} do
+    issue = %{
+      issue("github:pr:merged", "Done")
+      | metadata: %{merged: true, physical_state: "closed"}
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    record_verified_state!(journal, "merge-started", issue.id, "Merging")
+
+    state = empty_state()
+
+    assert {:reply, {:noop, :terminal_state}, ^state} =
+             Orchestrator.handle_call(
+               {:projection_drift, %{issue_id: issue.id, observed_state: nil}},
+               {self(), make_ref()},
+               state
+             )
+
+    refute_receive {:memory_tracker_comment_once, "github:pr:merged", _, _}
+    refute_receive {:memory_tracker_state_projection, "github:pr:merged", _, _}
+  end
+
+  test "projection drift restores a manually applied terminal label on an open pull request", %{
+    journal: journal
+  } do
+    issue = %{
+      issue("github:pr:open-terminal-label", "Done")
+      | metadata: %{merged: false, physical_state: "open"}
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    record_verified_state!(journal, "open-merge-started", issue.id, "Merging")
+
+    assert {:reply, {:ok, %{reconciled: true, state: "Merging"}}, _state} =
+             Orchestrator.handle_call(
+               {:projection_drift, %{issue_id: issue.id, observed_state: "Done"}},
+               {self(), make_ref()},
+               empty_state()
+             )
+
+    assert_receive {:memory_tracker_comment_once, "github:pr:open-terminal-label", _, _}
+
+    assert_receive {:memory_tracker_state_projection, "github:pr:open-terminal-label", "Done", "Merging"}
+  end
+
   test "an invalid operator request is rejected and receives one reconciliation comment" do
     issue = issue("github:pr:invalid-request", "Todo")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
@@ -621,6 +741,22 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
     assert {:ok, _} = TransitionJournal.record(journal, id, :received, %{issue_id: issue_id})
     assert {:ok, _} = TransitionJournal.record(journal, id, :decided, %{issue_id: issue_id, kind: kind})
     assert {:ok, _} = TransitionJournal.record(journal, id, :verified, %{issue_id: issue_id, kind: kind})
+  end
+
+  defp record_verified_state!(journal, id, issue_id, state) do
+    assert {:ok, _} = TransitionJournal.record(journal, id, :received, %{issue_id: issue_id})
+
+    assert {:ok, _} =
+             TransitionJournal.record(journal, id, :decided, %{
+               issue_id: issue_id,
+               to_state: state
+             })
+
+    assert {:ok, _} =
+             TransitionJournal.record(journal, id, :verified, %{
+               issue_id: issue_id,
+               to_state: state
+             })
   end
 
   defp record_worker_lease!(journal, id, issue_id) do

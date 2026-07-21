@@ -81,6 +81,12 @@ defmodule SymphonyElixir.WorkflowStatePolicyTest do
                  intent(:dispatch_review, expected_state: "Review", work_item_kind: :issue)
                )
 
+      assert {:rejected, {:invalid_transition, "Todo", :dispatch_planning}} =
+               WorkflowStatePolicy.decide(
+                 "Todo",
+                 intent(:dispatch_planning, expected_state: "Todo", work_item_kind: :issue)
+               )
+
       assert {:rejected, :missing_current_state} =
                WorkflowStatePolicy.decide(nil, intent(:clean_review))
 

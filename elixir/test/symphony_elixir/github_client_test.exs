@@ -377,6 +377,7 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert issue.identifier == "PR #7"
     assert issue.kind == :pull_request
     assert issue.state == "Review"
+    assert issue.metadata.physical_state == "open"
   end
 
   test "preserves explicit terminal labels on closed GitHub issues" do
@@ -457,7 +458,9 @@ defmodule SymphonyElixir.GitHubClientTest do
       {:get, "/repos/studiojin-dev/myven/pulls/56", github_response(200, %{"merged" => true})}
     ])
 
-    assert {:ok, [%{state: "Done"}]} = Client.fetch_issue_states_by_ids(["github:pr:56"])
+    assert {:ok, [%{state: "Done", metadata: %{physical_state: "closed", merged: true}}]} =
+             Client.fetch_issue_states_by_ids(["github:pr:56"])
+
     assert_github_responses_consumed()
   end
 

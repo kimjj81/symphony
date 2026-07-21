@@ -9,7 +9,8 @@ defmodule SymphonyElixir.TransitionIntent do
   @type work_item_kind :: :issue | :pull_request | nil
 
   @type kind ::
-          :dispatch_implementation
+          :dispatch_planning
+          | :dispatch_implementation
           | :dispatch_review
           | :dispatch_rework
           | :planning_complete

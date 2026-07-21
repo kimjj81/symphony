@@ -782,6 +782,7 @@ defmodule SymphonyElixir.Forgejo.Client do
         tracker: "forgejo",
         number: number,
         repository: repository(),
+        physical_state: raw["state"],
         merged: pull_merged?(raw),
         head_oid: get_in(raw, ["head", "sha"]),
         parent_number: parent
