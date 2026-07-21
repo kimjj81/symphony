@@ -32,8 +32,11 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     assert byte_size(rendered) == bytes
     assert rendered =~ "live_head: unknown"
     assert rendered =~ "thread-1 | thread-2"
+    refute rendered =~ "lane:"
+    refute rendered =~ "allowed_scope:"
+    refute rendered =~ "transitions:"
 
-    oversized_map = Map.put(brief, :lane, String.duplicate("x", 8_193))
+    oversized_map = Map.put(brief, :live_head, String.duplicate("x", 8_193))
 
     assert {:error, {:orchestration_brief_too_large, _size}} =
              OrchestrationBrief.normalize_for_test({:ok, oversized_map}, issue)
@@ -68,12 +71,9 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
 
     brief = %{
       "live_head" => "abc123",
-      "lane" => "Review",
       "unresolved_feedback" => [],
-      "allowed_scope" => ["agent runner"],
       "focused_verification" => ["mix test focused"],
-      "stop_conditions" => ["head drift"],
-      "transitions" => ["clean -> Human Review"]
+      "stop_conditions" => ["head drift"]
     }
 
     codex_binary = write_preflight_codex!(test_root, trace_file, {:completed, Jason.encode!(brief)})
@@ -89,6 +89,7 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
              OrchestrationBrief.generate(workspace, issue)
 
     assert rendered =~ "live_head: abc123"
+    refute rendered =~ "lane:"
     trace = File.read!(trace_file)
     assert trace =~ "outputSchema"
     assert trace =~ "thread/start"
@@ -104,12 +105,9 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
 
     brief = %{
       "live_head" => "legacy123",
-      "lane" => "Review",
       "unresolved_feedback" => [],
-      "allowed_scope" => ["legacy app-server"],
       "focused_verification" => ["mix test focused"],
-      "stop_conditions" => ["head drift"],
-      "transitions" => ["clean -> Human Review"]
+      "stop_conditions" => ["head drift"]
     }
 
     codex_binary =
@@ -148,9 +146,297 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     issue = %{review_issue("unknown-lane") | state: nil}
     fallback = OrchestrationBrief.fallback(issue)
 
-    assert fallback =~ "lane: unknown"
+    assert fallback =~ "live_head: use the tracker head metadata"
     assert fallback =~ "tracker feedback already present in the workflow context"
     assert fallback =~ "do not query GitHub"
+    refute fallback =~ "lane:"
+  end
+
+  test "implementation authority overrides a contradictory preflight snapshot" do
+    test_root = test_root("implementation-authority")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+
+    outcome = %{
+      "kind" => "implementation_complete",
+      "summary_ko" => "COMPLETE: 구현을 마쳤습니다.",
+      "evidence" => ["focused test passed"],
+      "head_oid" => "head-550",
+      "findings" => []
+    }
+
+    codex_binary = write_worker_outcome_codex!(test_root, trace_file, Jason.encode!(outcome))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true,
+      tracker_active_states: ["Review", "Reviewing", "Rework", "Reworking", "Merging"]
+    )
+
+    enable_authoritative_mode!()
+
+    issue = %{
+      review_issue("implementation-authority")
+      | state: "In Progress",
+        labels: ["sym:in-progress"],
+        metadata: %{
+          "symphony_dispatch_state" => "Planned",
+          "symphony_transition_id" => "dispatch-550"
+        }
+    }
+
+    parent = self()
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               brief_generator: fn _workspace, brief_issue ->
+                 send(parent, {:brief_lane, brief_issue.state})
+
+                 {:ok, "lane: handoff_required\nallowed_scope: read-only preflight\ntransitions: handoff to a human"}
+               end,
+               state_manager_requester: fn intent ->
+                 send(parent, {:worker_outcome, intent})
+                 {:ok, %{}}
+               end
+             )
+
+    assert_receive {:brief_lane, "Planned"}
+
+    assert_receive {:worker_outcome,
+                    %SymphonyElixir.TransitionIntent{
+                      expected_state: "In Progress",
+                      kind: :implementation_complete,
+                      causation_id: "dispatch-550"
+                    }}
+
+    trace = File.read!(trace_file)
+    assert trace =~ "Execution mode: implementation"
+    assert trace =~ "Permitted structured outcomes: implementation_complete, blocked, handoff_required"
+    assert trace =~ "bootstrap commit with no implementation diff is the starting point"
+    assert trace =~ "\"implementation_complete\""
+    refute trace =~ "\"clean_review\""
+  end
+
+  test "a Planned issue projected to In Progress receives the implementation contract" do
+    test_root = test_root("planned-issue-implementation")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+
+    outcome = %{
+      "kind" => "implementation_complete",
+      "summary_ko" => "COMPLETE: 일반 issue 구현을 마쳤습니다.",
+      "evidence" => ["focused test passed"],
+      "head_oid" => nil,
+      "findings" => []
+    }
+
+    codex_binary = write_worker_outcome_codex!(test_root, trace_file, Jason.encode!(outcome))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true
+    )
+
+    enable_authoritative_mode!()
+
+    issue = %{
+      implementation_issue("planned-issue-implementation")
+      | state: "In Progress",
+        labels: ["sym:in-progress"],
+        metadata: %{
+          "symphony_dispatch_state" => "Planned",
+          "symphony_transition_id" => "dispatch-issue-529"
+        }
+    }
+
+    parent = self()
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               brief_generator: fn _workspace, brief_issue ->
+                 send(parent, {:brief_lane, brief_issue.state})
+                 {:ok, "live_head: unknown\nunresolved_feedback: none"}
+               end,
+               state_manager_requester: fn intent ->
+                 send(parent, {:worker_outcome, intent})
+                 {:ok, %{}}
+               end
+             )
+
+    assert_receive {:brief_lane, "Planned"}
+
+    assert_receive {:worker_outcome,
+                    %SymphonyElixir.TransitionIntent{
+                      expected_state: "In Progress",
+                      kind: :implementation_complete,
+                      work_item_kind: :issue,
+                      causation_id: "dispatch-issue-529"
+                    }}
+
+    trace = File.read!(trace_file)
+    assert trace =~ "Execution mode: implementation"
+    assert trace =~ "\"implementation_complete\""
+    refute trace =~ "\"planning_complete\""
+  end
+
+  test "an In Progress issue without dispatch metadata receives the implementation contract" do
+    test_root = test_root("in-progress-issue-implementation")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+
+    outcome = %{
+      "kind" => "implementation_complete",
+      "summary_ko" => "COMPLETE: 이미 진행 중인 일반 issue 구현을 마쳤습니다.",
+      "evidence" => ["focused test passed"],
+      "head_oid" => nil,
+      "findings" => []
+    }
+
+    codex_binary = write_worker_outcome_codex!(test_root, trace_file, Jason.encode!(outcome))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true
+    )
+
+    enable_authoritative_mode!()
+
+    issue = %{
+      implementation_issue("in-progress-issue-implementation")
+      | state: "In Progress",
+        labels: ["sym:in-progress"],
+        metadata: %{"symphony_transition_id" => "dispatch-issue-530"}
+    }
+
+    parent = self()
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               brief_generator: fn _workspace, brief_issue ->
+                 send(parent, {:brief_lane, brief_issue.state})
+                 {:ok, "live_head: unknown\nunresolved_feedback: none"}
+               end,
+               state_manager_requester: fn intent ->
+                 send(parent, {:worker_outcome, intent})
+                 {:ok, %{}}
+               end
+             )
+
+    assert_receive {:brief_lane, "In Progress"}
+
+    assert_receive {:worker_outcome,
+                    %SymphonyElixir.TransitionIntent{
+                      expected_state: "In Progress",
+                      kind: :implementation_complete,
+                      work_item_kind: :issue,
+                      causation_id: "dispatch-issue-530"
+                    }}
+
+    assert File.read!(trace_file) =~ "Execution mode: implementation"
+  end
+
+  test "an unsupported authoritative lane hands off before preflight or worker start" do
+    test_root = test_root("unsupported-authoritative-lane")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+    codex_binary = write_fake_codex!(test_root, trace_file)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true
+    )
+
+    enable_authoritative_mode!()
+
+    issue = %{
+      implementation_issue("unsupported-authoritative-lane")
+      | state: "Waiting",
+        labels: ["sym:waiting"],
+        metadata: %{"symphony_transition_id" => "dispatch-waiting"}
+    }
+
+    parent = self()
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               brief_generator: fn _workspace, _brief_issue ->
+                 send(parent, :unexpected_preflight)
+                 {:ok, "should not run"}
+               end,
+               state_manager_requester: fn intent ->
+                 send(parent, {:execution_contract_handoff, intent})
+                 {:ok, %{}}
+               end
+             )
+
+    refute_receive :unexpected_preflight
+
+    assert_receive {:execution_contract_handoff,
+                    %SymphonyElixir.TransitionIntent{
+                      id: "execution-contract-handoff:github:issue:unsupported-authoritative-lane:dispatch-waiting",
+                      source: :orchestrator,
+                      expected_state: "Waiting",
+                      kind: :handoff_required,
+                      work_item_kind: :issue,
+                      causation_id: "dispatch-waiting",
+                      comment_body: body
+                    }}
+
+    assert body =~ "preflight와 작업 에이전트를 시작하지 않고"
+    assert body =~ "unsupported_execution_lane"
+    refute File.exists?(trace_file)
+  end
+
+  test "an unsupported legacy lane hands off before preflight or worker start" do
+    test_root = test_root("unsupported-legacy-lane")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+    codex_binary = write_fake_codex!(test_root, trace_file)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true
+    )
+
+    issue = %{
+      implementation_issue("unsupported-legacy-lane")
+      | state: "Waiting",
+        labels: ["sym:waiting"]
+    }
+
+    parent = self()
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               brief_generator: fn _workspace, _brief_issue ->
+                 send(parent, :unexpected_preflight)
+                 {:ok, "should not run"}
+               end,
+               tracker_commenter: fn issue_id, body ->
+                 send(parent, {:handoff_comment, issue_id, body})
+                 :ok
+               end,
+               tracker_state_updater: fn issue_id, state ->
+                 send(parent, {:handoff_state, issue_id, state})
+                 :ok
+               end
+             )
+
+    refute_receive :unexpected_preflight
+    assert_receive {:handoff_comment, "github:issue:unsupported-legacy-lane", body}
+    assert body =~ "지원하지 않는 Symphony 실행 lane"
+    assert_receive {:handoff_state, "github:issue:unsupported-legacy-lane", "Human Review"}
+    refute File.exists?(trace_file)
   end
 
   test "clean review uses one brief and one fresh worker thread before Human Review" do
@@ -461,7 +747,7 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
 
     assert_receive {:brief_lane, "Rework"}
     trace = File.read!(trace_file)
-    assert trace =~ "lane: Rework"
+    assert trace =~ "Execution mode: rework"
     assert trace =~ "State: Rework"
     assert trace =~ "tracker feedback already present in the workflow context"
     assert trace =~ "return the matching semantic outcome"
@@ -526,7 +812,7 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     assert trace =~ "Verification tier: full"
     assert trace =~ "full local verification bundle"
     assert trace =~ "Symphony validates required CI"
-    assert trace =~ "lane: Merging"
+    assert trace =~ "Execution mode: merge"
     assert count_lines(trace, "RUN:") == 1
   end
 
@@ -540,6 +826,19 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
       kind: :pull_request,
       url: "https://example.test/pull/#{suffix}",
       labels: ["sym:review"]
+    }
+  end
+
+  defp implementation_issue(suffix) do
+    %Issue{
+      id: "github:issue:#{suffix}",
+      identifier: "Issue ##{suffix}",
+      title: "Implement approved change",
+      description: "Implement the approved issue scope",
+      state: "Planned",
+      kind: :issue,
+      url: "https://example.test/issues/#{suffix}",
+      labels: ["sym:planned"]
     }
   end
 
@@ -636,6 +935,52 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
           ;;
         *'"method":"turn/start"'*)
           printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-preflight"}}}'
+          printf '%s\n' '#{notification}'
+          ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+    codex_binary
+  end
+
+  defp write_worker_outcome_codex!(test_root, trace_file, outcome) do
+    codex_binary = Path.join(test_root, "fake-worker-outcome-codex")
+
+    notification =
+      [
+        Jason.encode!(%{
+          "method" => "item/completed",
+          "params" => %{"item" => %{"type" => "agentMessage", "text" => outcome}}
+        }),
+        Jason.encode!(%{
+          "method" => "turn/completed",
+          "params" => %{
+            "turn" => %{
+              "id" => "turn-worker",
+              "items" => [],
+              "status" => "completed"
+            }
+          }
+        })
+      ]
+      |> Enum.join("\n")
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    trace_file=#{inspect(trace_file)}
+    while IFS= read -r line; do
+      printf 'JSON:%s\n' "$line" >> "$trace_file"
+      case "$line" in
+        *'"method":"initialize"'*)
+          printf '%s\n' '{"id":1,"result":{}}'
+          ;;
+        *'"method":"thread/start"'*)
+          printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-worker"}}}'
+          ;;
+        *'"method":"turn/start"'*)
+          printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-worker"}}}'
           printf '%s\n' '#{notification}'
           ;;
       esac

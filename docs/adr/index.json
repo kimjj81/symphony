@@ -1,5 +1,19 @@
 [
   {
+    "id": "ADR-20260721-0004-WEP",
+    "title": "Preflight does not authorize worker execution",
+    "tags": [
+      "orchestration",
+      "state-machine",
+      "codex",
+      "reliability"
+    ],
+    "status": "Accepted",
+    "date": "2026-07-21",
+    "tldr": "Symphony derives each worker's execution mode and permitted outcome from tracker state; the read-only preflight supplies evidence only.",
+    "path": "docs/adr/ADR-20260721-0004-WEP-preflight-does-not-authorize-worker-execution.md"
+  },
+  {
     "id": "ADR-20260720-0003-FJV",
     "title": "Forgejo is a first-class tracker provider",
     "tags": [

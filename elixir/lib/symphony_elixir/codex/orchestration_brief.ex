@@ -14,21 +14,15 @@ defmodule SymphonyElixir.Codex.OrchestrationBrief do
     "additionalProperties" => false,
     "required" => [
       "live_head",
-      "lane",
       "unresolved_feedback",
-      "allowed_scope",
       "focused_verification",
-      "stop_conditions",
-      "transitions"
+      "stop_conditions"
     ],
     "properties" => %{
       "live_head" => %{"type" => ["string", "null"]},
-      "lane" => %{"type" => "string"},
       "unresolved_feedback" => %{"type" => "array", "items" => %{"type" => "string"}},
-      "allowed_scope" => %{"type" => "array", "items" => %{"type" => "string"}},
       "focused_verification" => %{"type" => "array", "items" => %{"type" => "string"}},
-      "stop_conditions" => %{"type" => "array", "items" => %{"type" => "string"}},
-      "transitions" => %{"type" => "array", "items" => %{"type" => "string"}}
+      "stop_conditions" => %{"type" => "array", "items" => %{"type" => "string"}}
     }
   }
 
@@ -51,13 +45,10 @@ defmodule SymphonyElixir.Codex.OrchestrationBrief do
       end
 
     """
-    lane: #{issue.state || "unknown"}
     live_head: use the tracker head metadata already supplied; stop before writes if it is unknown
     unresolved_feedback: #{unresolved_feedback}
-    allowed_scope: make the smallest change required by the current lane; do not expand scope
     focused_verification: run git diff --check and only tests or static checks directly covering changed files
-    stop_conditions: stop on remote-head drift, interactive-only requirements, or missing credible focused verification
-    transitions: clean review -> Human Review; findings -> Rework; completed rework -> Review
+    stop_conditions: report remote-head drift, interactive-only requirements, or missing credible focused verification as facts; do not choose an execution lane or semantic outcome
     """
     |> String.trim()
   end
@@ -117,12 +108,17 @@ defmodule SymphonyElixir.Codex.OrchestrationBrief do
 
     """
     You are Symphony's read-only orchestration preflight agent. Do not edit files, run tests, post
-    comments, change labels, push, or merge. Read the workflow below, the relevant local
-    conductor/review/GitHub-review skill entrypoints and references exactly once, and current live
-    pull-request feedback when available. Return only the requested compact structured result.
-    Prefer the current live head and unresolved feedback over stale workpad text. The result must be
-    actionable without reopening those long skill or reference documents and must stay below
-    #{@max_bytes} bytes.
+    comments, change labels, push, or merge. Your read-only sandbox applies only to this preflight
+    turn. You do not decide the downstream worker's execution lane, write authority, allowed scope,
+    tracker transition, or semantic outcome; Symphony derives those deterministically from the
+    tracker item.
+
+    Read the workflow below, the relevant local conductor/review/GitHub-review skill entrypoints
+    and references exactly once, and current live pull-request feedback when available. Return only
+    the requested compact evidence snapshot: live head, unresolved feedback, focused verification,
+    and factual stop conditions. Prefer the current live head and unresolved feedback over stale
+    workpad text. The result must be actionable without reopening those long skill or reference
+    documents and must stay below #{@max_bytes} bytes.
 
     WORKFLOW AND TRACKER CONTEXT
     #{rendered_workflow}
@@ -162,13 +158,10 @@ defmodule SymphonyElixir.Codex.OrchestrationBrief do
 
   defp render(brief) do
     [
-      {"lane", Map.get(brief, "lane") || Map.get(brief, :lane)},
       {"live_head", Map.get(brief, "live_head") || Map.get(brief, :live_head)},
       {"unresolved_feedback", Map.get(brief, "unresolved_feedback") || Map.get(brief, :unresolved_feedback)},
-      {"allowed_scope", Map.get(brief, "allowed_scope") || Map.get(brief, :allowed_scope)},
       {"focused_verification", Map.get(brief, "focused_verification") || Map.get(brief, :focused_verification)},
-      {"stop_conditions", Map.get(brief, "stop_conditions") || Map.get(brief, :stop_conditions)},
-      {"transitions", Map.get(brief, "transitions") || Map.get(brief, :transitions)}
+      {"stop_conditions", Map.get(brief, "stop_conditions") || Map.get(brief, :stop_conditions)}
     ]
     |> Enum.map_join("\n", fn {key, value} -> "#{key}: #{format_value(value)}" end)
   end
