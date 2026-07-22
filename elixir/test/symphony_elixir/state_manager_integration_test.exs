@@ -3,6 +3,38 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
 
   alias SymphonyElixir.{AppliedTransition, TransitionIntent, TransitionJournal}
 
+  defmodule MissingCanonicalStateHostedGitClient do
+    def preflight, do: :ok
+    def fetch_issue_states_by_ids(_issue_ids), do: {:error, :missing_canonical_state}
+
+    def create_comment_once(issue_id, body, marker) do
+      send(self(), {:missing_canonical_state_comment, issue_id, body, marker})
+      :applied
+    end
+
+    def apply_state_projection(issue_id, expected_state, target_state) do
+      send(self(), {:missing_canonical_state_projection, issue_id, expected_state, target_state})
+      {:applied, %{issue_id: issue_id, state: target_state}}
+    end
+  end
+
+  defmodule AmbiguousCanonicalStateHostedGitClient do
+    def preflight, do: :ok
+
+    def fetch_issue_states_by_ids(_issue_ids),
+      do: {:error, {:ambiguous_state_labels, ["Review", "Reviewing"]}}
+
+    def create_comment_once(issue_id, body, marker) do
+      send(self(), {:ambiguous_canonical_state_comment, issue_id, body, marker})
+      :applied
+    end
+
+    def apply_state_projection(issue_id, expected_state, target_state) do
+      send(self(), {:ambiguous_canonical_state_projection, issue_id, expected_state, target_state})
+      {:applied, %{issue_id: issue_id, state: target_state}}
+    end
+  end
+
   setup do
     journal_root =
       Path.join(
@@ -27,7 +59,7 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
 
     on_exit(fn -> File.rm_rf!(journal_root) end)
 
-    {:ok, journal: journal}
+    {:ok, journal: journal, journal_path: journal_path}
   end
 
   test "authoritative request comments once, projects, and verifies the journal", %{journal: journal} do
@@ -577,6 +609,85 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
              TransitionJournal.snapshot(journal, intent.id)
   end
 
+  test "untracked Codex review feedback is a verified no-effect decision", %{
+    journal: journal,
+    journal_path: journal_path
+  } do
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :github_client_module)
+      Application.delete_env(:symphony_elixir, :forgejo_client_module)
+    end)
+
+    for {tracker_kind, source, issue_id, client_module_key} <- [
+          {"github", :github_webhook, "github:pr:untracked-review", :github_client_module},
+          {"forgejo", :forgejo_webhook, "forgejo:pr:untracked-review", :forgejo_client_module}
+        ] do
+      configure_authoritative_hosted_git_tracker!(tracker_kind, journal_path)
+      Application.put_env(:symphony_elixir, client_module_key, MissingCanonicalStateHostedGitClient)
+
+      intent = %TransitionIntent{
+        id: "#{source}-untracked-review",
+        issue_id: issue_id,
+        source: source,
+        actor: "chatgpt-codex-connector",
+        kind: {:operator_request, :rework},
+        causation_id: "#{source}-delivery",
+        metadata: %{kind: :review_feedback_detected}
+      }
+
+      assert {:reply, {:noop, :untracked_review_feedback}, _state} =
+               Orchestrator.handle_call(
+                 {:transition_request, intent},
+                 {self(), make_ref()},
+                 empty_state()
+               )
+
+      refute_receive {:missing_canonical_state_comment, ^issue_id, _, _}
+      refute_receive {:missing_canonical_state_projection, ^issue_id, _, _}
+
+      assert {:ok, %{phase: :verified, data: %{result: :noop, reason: ":untracked_review_feedback"}}} =
+               TransitionJournal.snapshot(journal, intent.id)
+    end
+  end
+
+  test "ambiguous Codex review feedback remains quarantined", %{journal_path: journal_path} do
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :github_client_module)
+      Application.delete_env(:symphony_elixir, :forgejo_client_module)
+    end)
+
+    for {tracker_kind, source, issue_id, client_module_key} <- [
+          {"github", :github_webhook, "github:pr:ambiguous-review", :github_client_module},
+          {"forgejo", :forgejo_webhook, "forgejo:pr:ambiguous-review", :forgejo_client_module}
+        ] do
+      configure_authoritative_hosted_git_tracker!(tracker_kind, journal_path)
+      Application.put_env(:symphony_elixir, client_module_key, AmbiguousCanonicalStateHostedGitClient)
+
+      intent = %TransitionIntent{
+        id: "#{source}-ambiguous-review",
+        issue_id: issue_id,
+        source: source,
+        actor: "chatgpt-codex-connector",
+        kind: {:operator_request, :rework},
+        causation_id: "#{source}-ambiguous-delivery",
+        metadata: %{kind: :review_feedback_detected}
+      }
+
+      expected_reason =
+        {:quarantined, {:transition_issue_fetch_failed, {:ambiguous_state_labels, ["Review", "Reviewing"]}}}
+
+      assert {:reply, {:rejected, ^expected_reason}, _state} =
+               Orchestrator.handle_call(
+                 {:transition_request, intent},
+                 {self(), make_ref()},
+                 empty_state()
+               )
+
+      assert_receive {:ambiguous_canonical_state_comment, ^issue_id, _, _}
+      refute_receive {:ambiguous_canonical_state_projection, ^issue_id, _, _}
+    end
+  end
+
   test "a non-operator policy rejection is a verified decision", %{journal: journal} do
     issue = issue("github:pr:invalid-worker-kind", "Reviewing")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
@@ -886,5 +997,31 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
 
     File.write!(workflow_path, updated)
     :ok = WorkflowStore.force_reload()
+  end
+
+  defp configure_authoritative_hosted_git_tracker!("github", journal_path) do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    enable_authoritative_mode!(journal_path)
+  end
+
+  defp configure_authoritative_hosted_git_tracker!("forgejo", journal_path) do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "forgejo",
+      tracker_endpoint: "https://forgejo.example/api/v1",
+      tracker_api_token: "token",
+      tracker_owner: "acme",
+      tracker_repo: "widgets",
+      tracker_project_slug: nil
+    )
+
+    enable_authoritative_mode!(journal_path)
   end
 end

@@ -30,12 +30,33 @@ defmodule SymphonyElixir.HostedGit do
     "sym:request-duplicate" => "Duplicate",
     "sym:request-reopen" => "Human Review"
   }
+  @default_codex_review_bot_logins [
+    "chatgpt-codex-connector",
+    "chatgpt-codex-connector[bot]",
+    "codex",
+    "codex[bot]"
+  ]
 
   @spec default_state_labels() :: %{String.t() => String.t()}
   def default_state_labels, do: @default_state_labels
 
   @spec request_labels() :: %{String.t() => String.t()}
   def request_labels, do: @request_labels
+
+  @doc """
+  Returns whether a pull-request review-comment webhook was authored by a
+  configured Codex review bot.
+  """
+  @spec codex_review_comment?(map()) :: boolean()
+  def codex_review_comment?(%{"comment" => comment} = payload) when is_map(comment) do
+    case review_comment_login(Map.get(comment, "user")) ||
+           review_comment_login(Map.get(payload, "sender")) do
+      nil -> false
+      login -> login in codex_review_bot_logins()
+    end
+  end
+
+  def codex_review_comment?(_payload), do: false
 
   @spec request_labels(map() | nil) :: %{String.t() => String.t()}
   def request_labels(configured) do
@@ -169,6 +190,33 @@ defmodule SymphonyElixir.HostedGit do
   end
 
   defp normalize_string_map(_configured), do: %{}
+
+  defp codex_review_bot_logins do
+    case System.get_env("SYMPHONY_CODEX_REVIEW_BOT_LOGINS") do
+      nil ->
+        @default_codex_review_bot_logins
+
+      logins ->
+        logins
+        |> String.split(",", trim: true)
+        |> Enum.map(&(String.trim(&1) |> String.downcase()))
+    end
+  end
+
+  defp review_comment_login(actor) when is_map(actor) do
+    case Map.get(actor, "login") do
+      login when is_binary(login) ->
+        case login |> String.trim() |> String.downcase() do
+          "" -> nil
+          normalized -> normalized
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp review_comment_login(_actor), do: nil
 
   defp normalize(value), do: value |> to_string() |> String.trim() |> String.downcase()
 end

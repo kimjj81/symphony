@@ -3,14 +3,15 @@ defmodule SymphonyElixir.ForgejoWebhookProcessorTest do
 
   alias SymphonyElixir.Forgejo.WebhookProcessor
 
-  test "ingests pull request review comments and targets provider-qualified refreshes" do
+  test "ingests configured Codex pull request review comments and targets provider-qualified refreshes" do
     test_pid = self()
 
     payload = %{
       "action" => "created",
       "pull_request" => %{"number" => 259},
+      "comment" => %{"user" => %{"login" => "chatgpt-codex-connector"}},
       "repository" => %{"full_name" => "acme/widgets", "html_url" => "https://forgejo.example/acme/widgets"},
-      "sender" => %{"login" => "reviewer"}
+      "sender" => %{"login" => "chatgpt-codex-connector"}
     }
 
     result =
@@ -41,9 +42,63 @@ defmodule SymphonyElixir.ForgejoWebhookProcessorTest do
                       kind: :review_feedback_detected,
                       issue_id: "forgejo:pr:259",
                       source: :forgejo_webhook,
-                      actor: "reviewer"
+                      actor: "chatgpt-codex-connector"
                     }}
 
+    assert_receive {:refresh, "forgejo:pr:259"}
+  end
+
+  test "ignores non-Codex review comments while retaining provider-qualified refreshes" do
+    test_pid = self()
+
+    payload = %{
+      "action" => "created",
+      "pull_request" => %{"number" => 259},
+      "comment" => %{"user" => %{"login" => "maintainer"}},
+      "repository" => %{"full_name" => "acme/widgets", "html_url" => "https://forgejo.example/acme/widgets"},
+      "sender" => %{"login" => "maintainer"}
+    }
+
+    assert {:ok, %{issue_id: "forgejo:pr:259"}} =
+             WebhookProcessor.handle_event("pull_request_review_comment", payload,
+               tracker_kind: "forgejo",
+               repository: "acme/widgets",
+               endpoint_origin: "https://forgejo.example/api/v1",
+               intent_fun: fn intent -> send(test_pid, {:intent, intent}) end,
+               refresh_fun: fn issue_id ->
+                 send(test_pid, {:refresh, issue_id})
+                 {:ok, %{queued: true, issue_id: issue_id}}
+               end
+             )
+
+    refute_receive {:intent, _}, 50
+    assert_receive {:refresh, "forgejo:pr:259"}
+  end
+
+  test "ignores malformed review-comment authors while retaining provider-qualified refreshes" do
+    test_pid = self()
+
+    payload = %{
+      "action" => "created",
+      "pull_request" => %{"number" => 259},
+      "comment" => %{"user" => "unexpected"},
+      "repository" => %{"full_name" => "acme/widgets", "html_url" => "https://forgejo.example/acme/widgets"},
+      "sender" => nil
+    }
+
+    assert {:ok, %{issue_id: "forgejo:pr:259"}} =
+             WebhookProcessor.handle_event("pull_request_review_comment", payload,
+               tracker_kind: "forgejo",
+               repository: "acme/widgets",
+               endpoint_origin: "https://forgejo.example/api/v1",
+               intent_fun: fn intent -> send(test_pid, {:intent, intent}) end,
+               refresh_fun: fn issue_id ->
+                 send(test_pid, {:refresh, issue_id})
+                 {:ok, %{queued: true, issue_id: issue_id}}
+               end
+             )
+
+    refute_receive {:intent, _}, 50
     assert_receive {:refresh, "forgejo:pr:259"}
   end
 

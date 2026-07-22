@@ -32,13 +32,6 @@ defmodule SymphonyElixir.GitHub.Client do
     "sym:request-duplicate" => {"8c959f", "Request that Symphony mark this item duplicate."},
     "sym:request-reopen" => {"bfd4ff", "Request that Symphony reopen this terminal item for human review."}
   }
-  @default_codex_review_bot_logins [
-    "chatgpt-codex-connector",
-    "chatgpt-codex-connector[bot]",
-    "codex",
-    "codex[bot]"
-  ]
-
   @spec default_state_labels() :: map()
   def default_state_labels, do: HostedGit.default_state_labels()
 
@@ -78,7 +71,7 @@ defmodule SymphonyElixir.GitHub.Client do
     |> Enum.uniq()
     |> Enum.reduce_while({:ok, []}, fn issue_id, {:ok, acc} ->
       case fetch_issue_by_id(issue_id) do
-        :skip -> {:cont, {:ok, acc}}
+        :skip -> {:halt, {:error, :missing_canonical_state}}
         {:ok, issue} -> {:cont, {:ok, [issue | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
@@ -160,7 +153,7 @@ defmodule SymphonyElixir.GitHub.Client do
   def queue_rework_from_review_comment("pull_request_review_comment", "created", payload)
       when is_map(payload) do
     with {:ok, number} <- pull_request_number(payload),
-         true <- codex_review_comment?(payload),
+         true <- HostedGit.codex_review_comment?(payload),
          {:ok, raw_issue} <- request(:get, "/issues/#{number}"),
          true <- eligible_pull_request_for_rework?(raw_issue),
          :ok <- update_issue_state(github_issue_id(:pull_request, number), "Rework") do
@@ -268,7 +261,7 @@ defmodule SymphonyElixir.GitHub.Client do
   def create_pull_request_for_issue(%Issue{kind: kind}), do: {:error, {:unsupported_github_issue_kind, kind}}
 
   @doc false
-  @spec normalize_issue_for_test(map()) :: {:ok, Issue.t()} | :skip
+  @spec normalize_issue_for_test(map()) :: {:ok, Issue.t()} | :skip | {:error, term()}
   def normalize_issue_for_test(raw_issue) when is_map(raw_issue) do
     normalize_issue(raw_issue)
   end
@@ -338,8 +331,19 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp normalize_issue_for_labels(raw_issue, {:ok, acc}) do
     case normalize_issue(raw_issue) do
-      {:ok, issue} -> {:cont, {:ok, [issue | acc]}}
-      :skip -> {:cont, {:ok, acc}}
+      {:ok, issue} ->
+        {:cont, {:ok, [issue | acc]}}
+
+      :skip ->
+        {:cont, {:ok, acc}}
+
+      {:error, {:ambiguous_state_labels, states}} ->
+        Logger.warning("Skipping GitHub candidate with ambiguous Symphony state labels number=#{inspect(raw_issue["number"])} states=#{inspect(states)}")
+
+        {:cont, {:ok, acc}}
+
+      {:error, reason} ->
+        {:halt, {:error, reason}}
     end
   end
 
@@ -403,32 +407,6 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp pull_request_number(_payload), do: {:error, :github_pull_request_number_missing}
 
-  defp codex_review_comment?(%{"comment" => comment} = payload) when is_map(comment) do
-    login =
-      comment
-      |> Map.get("user", Map.get(payload, "sender", %{}))
-      |> Map.get("login")
-      |> to_string()
-      |> String.downcase()
-
-    login in codex_review_bot_logins()
-  end
-
-  defp codex_review_comment?(_payload), do: false
-
-  @spec codex_review_bot_logins() :: [String.t()]
-  defp codex_review_bot_logins do
-    case System.get_env("SYMPHONY_CODEX_REVIEW_BOT_LOGINS") do
-      nil ->
-        @default_codex_review_bot_logins
-
-      logins ->
-        logins
-        |> String.split(",", trim: true)
-        |> Enum.map(&(String.trim(&1) |> String.downcase()))
-    end
-  end
-
   defp eligible_pull_request_for_rework?(raw_issue) when is_map(raw_issue) do
     Map.get(raw_issue, "state") == "open" and
       issue_kind(raw_issue) == :pull_request and
@@ -478,9 +456,8 @@ defmodule SymphonyElixir.GitHub.Client do
            }}
         end
 
-      {:error, {:ambiguous_state_labels, states}} ->
-        Logger.warning("Skipping GitHub issue with ambiguous Symphony state labels number=#{inspect(raw_issue["number"])} states=#{inspect(states)}")
-        :skip
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

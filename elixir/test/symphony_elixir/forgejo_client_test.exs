@@ -59,6 +59,28 @@ defmodule SymphonyElixir.ForgejoClientTest do
     assert issue.metadata.physical_state == "open"
   end
 
+  test "distinguishes missing and ambiguous canonical state labels during direct Forgejo lookup" do
+    stub_requests([
+      {:get, "/api/v1/repos/acme/widgets/pulls/24", response(200, raw_pull(24, "head-24", []))},
+      {:get, "/api/v1/repos/acme/widgets/pulls/25",
+       response(
+         200,
+         raw_pull(25, "head-25", [
+           %{"id" => 3, "name" => "sym:review"},
+           %{"id" => 4, "name" => "sym:reviewing"}
+         ])
+       )}
+    ])
+
+    assert {:error, :missing_canonical_state} = Client.fetch_issue_states_by_ids(["forgejo:pr:24"])
+
+    assert {:error, {:ambiguous_state_labels, states}} =
+             Client.fetch_issue_states_by_ids(["forgejo:pr:25"])
+
+    assert Enum.sort(states) == ["Review", "Reviewing"]
+    assert_requests_consumed()
+  end
+
   test "normalizes a merged pull request as Done even if an older state label remains" do
     raw =
       raw_pull(20, "merged-head", [%{"id" => 3, "name" => "sym:review"}], %{

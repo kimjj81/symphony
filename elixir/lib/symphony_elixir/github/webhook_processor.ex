@@ -5,7 +5,7 @@ defmodule SymphonyElixir.GitHub.WebhookProcessor do
 
   require Logger
 
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{Config, HostedGit}
   alias SymphonyElixir.GitHub.Client
   alias SymphonyElixirWeb.Presenter
 
@@ -121,8 +121,11 @@ defmodule SymphonyElixir.GitHub.WebhookProcessor do
      })}
   end
 
-  def normalize_intent("pull_request_review_comment" = event, "created" = action, payload) when is_map(payload),
-    do: {:ok, Map.put(intent_base(event, action, payload), :kind, :review_feedback_detected)}
+  def normalize_intent("pull_request_review_comment" = event, "created" = action, payload) when is_map(payload) do
+    if HostedGit.codex_review_comment?(payload),
+      do: {:ok, Map.put(intent_base(event, action, payload), :kind, :review_feedback_detected)},
+      else: :ignore
+  end
 
   def normalize_intent(_event, _action, _payload), do: :ignore
 

@@ -3,13 +3,14 @@ defmodule SymphonyElixir.GitHubWebhookProcessorTest do
 
   alias SymphonyElixir.GitHub.WebhookProcessor
 
-  test "ingests pull request review comments without mutating tracker state" do
+  test "ingests configured Codex pull request review comments without mutating tracker state" do
     test_pid = self()
 
     payload = %{
       "action" => "created",
       "pull_request" => %{"number" => 259},
-      "sender" => %{"login" => "reviewer"}
+      "comment" => %{"user" => %{"login" => "chatgpt-codex-connector"}},
+      "sender" => %{"login" => "chatgpt-codex-connector"}
     }
 
     result =
@@ -32,9 +33,57 @@ defmodule SymphonyElixir.GitHubWebhookProcessorTest do
                       kind: :review_feedback_detected,
                       issue_id: "github:pr:259",
                       source: :github_webhook,
-                      actor: "reviewer"
+                      actor: "chatgpt-codex-connector"
                     }}
 
+    assert_receive {:refresh, "github:pr:259"}
+  end
+
+  test "ignores non-Codex review comments while retaining targeted refresh" do
+    test_pid = self()
+
+    payload = %{
+      "action" => "created",
+      "pull_request" => %{"number" => 259},
+      "comment" => %{"user" => %{"login" => "maintainer"}},
+      "sender" => %{"login" => "maintainer"}
+    }
+
+    assert {:ok, %{issue_id: "github:pr:259"}} =
+             WebhookProcessor.handle_event("pull_request_review_comment", payload,
+               tracker_kind: "github",
+               intent_fun: fn intent -> send(test_pid, {:intent, intent}) end,
+               refresh_fun: fn issue_id ->
+                 send(test_pid, {:refresh, issue_id})
+                 {:ok, %{queued: true, issue_id: issue_id}}
+               end
+             )
+
+    refute_receive {:intent, _}, 50
+    assert_receive {:refresh, "github:pr:259"}
+  end
+
+  test "ignores malformed review-comment authors while retaining targeted refresh" do
+    test_pid = self()
+
+    payload = %{
+      "action" => "created",
+      "pull_request" => %{"number" => 259},
+      "comment" => %{"user" => nil},
+      "sender" => nil
+    }
+
+    assert {:ok, %{issue_id: "github:pr:259"}} =
+             WebhookProcessor.handle_event("pull_request_review_comment", payload,
+               tracker_kind: "github",
+               intent_fun: fn intent -> send(test_pid, {:intent, intent}) end,
+               refresh_fun: fn issue_id ->
+                 send(test_pid, {:refresh, issue_id})
+                 {:ok, %{queued: true, issue_id: issue_id}}
+               end
+             )
+
+    refute_receive {:intent, _}, 50
     assert_receive {:refresh, "github:pr:259"}
   end
 

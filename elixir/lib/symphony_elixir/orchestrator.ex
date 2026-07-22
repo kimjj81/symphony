@@ -2544,6 +2544,26 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_quarantine_unreadable_intent(
          state,
          "authoritative",
+         %TransitionIntent{
+           source: source,
+           kind: {:operator_request, :rework},
+           metadata: %{kind: :review_feedback_detected}
+         } = intent,
+         :missing_canonical_state
+       )
+       when source in [:github_webhook, :forgejo_webhook] do
+    finalize_non_effect_decision(
+      state,
+      "authoritative",
+      intent,
+      :noop,
+      :untracked_review_feedback
+    )
+  end
+
+  defp maybe_quarantine_unreadable_intent(
+         state,
+         "authoritative",
          %TransitionIntent{kind: {:operator_request, _}} = intent,
          reason
        ) do
@@ -3016,6 +3036,7 @@ defmodule SymphonyElixir.Orchestrator do
     case Tracker.fetch_issue_states_by_ids([issue_id]) do
       {:ok, [issue | _]} -> {:ok, issue}
       {:ok, []} -> {:error, :transition_issue_not_found}
+      {:error, :missing_canonical_state} -> {:error, :missing_canonical_state}
       {:error, reason} -> {:error, {:transition_issue_fetch_failed, reason}}
     end
   end

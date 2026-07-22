@@ -464,6 +464,74 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert_github_responses_consumed()
   end
 
+  test "reports an untracked GitHub pull request as missing canonical state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    issue = raw_pull_request_issue(57, [])
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/57", github_response(200, issue)},
+      {:get, "/repos/studiojin-dev/myven/pulls/57", github_response(200, %{"merged" => false})}
+    ])
+
+    assert {:error, :missing_canonical_state} = Client.fetch_issue_states_by_ids(["github:pr:57"])
+    assert_github_responses_consumed()
+  end
+
+  test "preserves ambiguous GitHub canonical state labels during direct lookup" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    issue = raw_pull_request_issue(59, [%{"name" => "sym:review"}, %{"name" => "sym:reviewing"}])
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/59", github_response(200, issue)},
+      {:get, "/repos/studiojin-dev/myven/pulls/59", github_response(200, %{"merged" => false})}
+    ])
+
+    assert {:error, {:ambiguous_state_labels, states}} = Client.fetch_issue_states_by_ids(["github:pr:59"])
+    assert Enum.sort(states) == ["Review", "Reviewing"]
+    assert_github_responses_consumed()
+  end
+
+  test "continues to skip ambiguous GitHub candidates during polling" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    ambiguous_issue = %{
+      "number" => 60,
+      "title" => "Ambiguous candidate",
+      "body" => "Two canonical labels",
+      "state" => "open",
+      "html_url" => "https://github.com/studiojin-dev/myven/pull/60",
+      "pull_request" => %{"url" => "https://api.github.com/repos/studiojin-dev/myven/pulls/60"},
+      "labels" => [%{"name" => "sym:review"}, %{"name" => "sym:reviewing"}]
+    }
+
+    stub_github_requests(self(), [
+      {:get, "/search/issues", github_response(200, %{"items" => [ambiguous_issue]})}
+    ])
+
+    assert {:ok, []} = Client.fetch_issues_by_states(["Review"])
+    assert_github_responses_consumed()
+  end
+
   test "fails closed when pull request detail cannot provide the live head" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",
@@ -1573,7 +1641,7 @@ defmodule SymphonyElixir.GitHubClientTest do
              })
   end
 
-  test "skips GitHub issues with ambiguous Symphony state labels" do
+  test "rejects GitHub issues with ambiguous Symphony state labels during direct normalization" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",
       tracker_api_token: "token",
@@ -1582,7 +1650,7 @@ defmodule SymphonyElixir.GitHubClientTest do
       tracker_project_slug: nil
     )
 
-    assert :skip =
+    assert {:error, {:ambiguous_state_labels, states}} =
              Client.normalize_issue_for_test(%{
                "number" => 9,
                "title" => "Conflicting state",
@@ -1591,6 +1659,8 @@ defmodule SymphonyElixir.GitHubClientTest do
                "html_url" => "https://github.com/studiojin-dev/myven/issues/9",
                "labels" => [%{"name" => "sym:review"}, %{"name" => "sym:reviewing"}]
              })
+
+    assert Enum.sort(states) == ["Review", "Reviewing"]
   end
 
   test "rejects ambiguous Symphony state labels" do

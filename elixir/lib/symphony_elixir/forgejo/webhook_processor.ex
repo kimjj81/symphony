@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Forgejo.WebhookProcessor do
 
   require Logger
 
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{Config, HostedGit}
   alias SymphonyElixir.Forgejo.Client
   alias SymphonyElixirWeb.Presenter
 
@@ -168,8 +168,11 @@ defmodule SymphonyElixir.Forgejo.WebhookProcessor do
     ]
   end
 
-  defp normalized_intents("pull_request_review_comment" = event, "created" = action, payload),
-    do: [Map.put(intent_base(event, action, payload), :kind, :review_feedback_detected)]
+  defp normalized_intents("pull_request_review_comment" = event, "created" = action, payload) do
+    if HostedGit.codex_review_comment?(payload),
+      do: [Map.put(intent_base(event, action, payload), :kind, :review_feedback_detected)],
+      else: []
+  end
 
   defp normalized_intents(_event, _action, _payload), do: []
 

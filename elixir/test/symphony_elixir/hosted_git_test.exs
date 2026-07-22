@@ -17,6 +17,39 @@ defmodule SymphonyElixir.HostedGitTest do
              {:request, "Planned"}
   end
 
+  test "recognizes only configured Codex review-bot comments" do
+    assert HostedGit.codex_review_comment?(%{
+             "comment" => %{"user" => %{"login" => "CHATGPT-CODEX-CONNECTOR"}}
+           })
+
+    refute HostedGit.codex_review_comment?(%{
+             "comment" => %{"user" => %{"login" => "maintainer"}}
+           })
+  end
+
+  test "handles malformed review-comment authors without raising" do
+    assert HostedGit.codex_review_comment?(%{
+             "comment" => %{"user" => nil},
+             "sender" => %{"login" => "chatgpt-codex-connector"}
+           })
+
+    assert HostedGit.codex_review_comment?(%{
+             "comment" => %{"user" => "unexpected"},
+             "sender" => %{"login" => "chatgpt-codex-connector"}
+           })
+
+    refute HostedGit.codex_review_comment?(%{
+             "comment" => %{"user" => %{"login" => "maintainer"}},
+             "sender" => %{"login" => "chatgpt-codex-connector"}
+           })
+
+    for user <- [nil, "unexpected", %{}, %{"login" => nil}, %{"login" => "  "}] do
+      refute HostedGit.codex_review_comment?(%{"comment" => %{"user" => user}, "sender" => nil})
+    end
+
+    refute HostedGit.codex_review_comment?(%{"comment" => "unexpected"})
+  end
+
   test "encodes provider-qualified IDs and decodes compatibility display IDs" do
     assert HostedGit.encode_id("forgejo", :issue, 12) == "forgejo:issue:12"
     assert HostedGit.encode_id("forgejo", :pull_request, 13) == "forgejo:pr:13"

@@ -1,7 +1,7 @@
 [
   {
     "id": "ADR-20260721-0005-QXB",
-    "title": "Acknowledge state-less webhook drift",
+    "title": "Acknowledge state-less webhook drift and untracked review feedback",
     "tags": [
       "orchestration",
       "github",
@@ -12,7 +12,7 @@
     ],
     "status": "Accepted",
     "date": "2026-07-21",
-    "tldr": "Symphony journals state-label drift without committed state as a no-effect receipt so permanent semantic conditions are acknowledged without suppressing retries for transient failures.",
+    "tldr": "Symphony journals configured-Codex review feedback as no-effect only when the live pull request has zero canonical state labels, while ambiguity and read failures remain quarantined or retryable.",
     "path": "docs/adr/ADR-20260721-0005-QXB-acknowledge-state-less-webhook-drift.md"
   },
   {

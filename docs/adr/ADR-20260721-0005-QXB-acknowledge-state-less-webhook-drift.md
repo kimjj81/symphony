@@ -1,9 +1,11 @@
-# ADR-20260721-0005-QXB: Acknowledge state-less webhook drift
+# ADR-20260721-0005-QXB: Acknowledge state-less webhook drift and untracked review feedback
 
 Tags: orchestration, github, forgejo, webhook, nats, reliability
 Status: Accepted
 Date: 2026-07-21
-TL;DR: Symphony journals state-label drift without committed state as a no-effect receipt so permanent semantic conditions are acknowledged without suppressing retries for transient failures.
+TL;DR: Symphony journals configured-Codex review feedback as no-effect only when the live pull request has zero canonical state labels, while ambiguity and read failures remain quarantined or retryable.
+
+Amended: 2026-07-22 — restrict automatic Rework signals to configured Codex review bots and distinguish zero canonical labels from conflicting labels and remote read failures.
 
 ## Context
 
@@ -14,6 +16,15 @@ manager. Reconciliation requires a previously verified canonical state in the tr
 A delivery can legitimately arrive without that history. The item may predate authoritative mode,
 the label event may be an intermediate tracker snapshot, or the item may never have received a
 Symphony transition. Retrying the same immutable delivery cannot create the missing history.
+
+Inline review replies are also delivered as pull-request review-comment webhooks. Only comments
+authored by a configured Codex review bot are automatic Rework signals; human replies and other
+bots must not be reinterpreted as state requests. A configured Codex review comment can still
+arrive on an untracked pull request with no canonical state label.
+
+Direct tracker reads must distinguish that zero-label condition from a pull request that cannot be
+read and from a pull request carrying multiple canonical labels. Treating all three as “not found”
+would incorrectly acknowledge tracker corruption or transport failure as harmless review feedback.
 
 The NATS consumer negatively acknowledges every ingestion error. A delivery with a running journal
 but no committed state was therefore redelivered indefinitely. With a pull batch size of one,
@@ -29,6 +40,15 @@ state, change labels, or publish a reconciliation comment in this case.
 This exception applies only to provider-qualified tracker webhook projection drift. Internal
 callers without a webhook source still receive `canonical_state_unavailable`, and operator request
 labels continue through the authoritative request validation and quarantine policy.
+
+For provider-qualified configured-Codex review feedback, Symphony MUST journal a verified no-effect
+decision with reason `untracked_review_feedback` only when the live pull request is readable and
+has zero canonical state labels (`missing_canonical_state`). It retains the normal targeted refresh
+and MUST NOT add a tracker comment, alter labels, restore a projection, or dispatch work. Multiple
+canonical state labels, a missing pull request, and tracker or transport errors are not no-effect
+conditions: they continue through the existing authoritative quarantine or retry path. This narrow
+exception does not apply to an explicit `sym:request-*` label: explicit operator requests with
+unreadable state continue through quarantine.
 
 Journal, orchestrator, tracker, and transport unavailability remain retryable errors. Malformed
 envelopes remain terminal immediately. This decision does not impose a global JetStream delivery
@@ -48,6 +68,10 @@ delivery is acknowledged.
   unrelated webhook traffic.
 - State-less drift is observable in the transition journal without granting it authority to choose
   or restore a workflow state.
+- Review replies cannot create accidental Rework transitions, and untracked Codex feedback cannot
+  flood a pull request with quarantine comments.
+- Conflicting canonical labels remain observable as tracker inconsistency instead of being silently
+  acknowledged as untracked feedback.
 - Partial no-effect receipts are crash-resumable and cannot become poison deliveries themselves.
 - A canonical state that becomes available after the delivery is acknowledged is discovered by the
   targeted refresh and regular polling rather than by replaying the old drift event.
@@ -56,5 +80,7 @@ delivery is acknowledged.
 
 ## Verification
 
-- Integration tests prove state-less webhook drift is journaled once and performs no tracker write.
+- GitHub and Forgejo client tests distinguish zero canonical labels from conflicting labels during
+  direct reads; StateManager tests prove only the former is journaled without tracker writes.
+- Unreadable explicit operator requests and ambiguous Codex review feedback remain quarantined.
 - Existing webhook, state-manager, and full Elixir verification suites remain green.

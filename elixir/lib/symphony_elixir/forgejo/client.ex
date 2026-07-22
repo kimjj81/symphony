@@ -83,7 +83,7 @@ defmodule SymphonyElixir.Forgejo.Client do
     |> Enum.reduce_while({:ok, []}, fn id, {:ok, acc} ->
       case fetch_issue(id) do
         {:ok, issue} -> {:cont, {:ok, [issue | acc]}}
-        :skip -> {:cont, {:ok, acc}}
+        :skip -> {:halt, {:error, :missing_canonical_state}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
