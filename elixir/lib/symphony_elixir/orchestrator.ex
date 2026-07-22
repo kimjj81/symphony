@@ -51,6 +51,8 @@ defmodule SymphonyElixir.Orchestrator do
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
+      publication_pending: MapSet.new(),
+      publication_resolved: MapSet.new(),
       retry_attempts: %{},
       cleanup_retries: %{},
       last_transition: nil,
@@ -179,34 +181,7 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
-        state =
-          case reason do
-            :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              notify_latest_issue_state_after_agent_completion(issue_id, running_entry)
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
-
-            _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
-
-              next_attempt = next_retry_attempt_from_running(running_entry)
-
-              schedule_issue_retry(state, issue_id, next_attempt, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}",
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
-          end
+        state = finalize_agent_down(state, reason, issue_id, running_entry, session_id)
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -256,6 +231,32 @@ defmodule SymphonyElixir.Orchestrator do
 
     Logger.info("Transition effect retry completed transition_id=#{transition_id} attempt=#{attempt} result=#{inspect(result)}")
 
+    {:noreply, state}
+  end
+
+  def handle_info({:retry_publication_effect, publication_id}, state) when is_binary(publication_id) do
+    state = resume_pending_publication(publication_id, state)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:publication_pending, issue_id, publication_id}, state)
+      when is_binary(issue_id) and is_binary(publication_id) do
+    state = %{state | publication_pending: MapSet.put(state.publication_pending, issue_id)}
+    Process.send_after(self(), {:retry_publication_effect, publication_id}, @transition_effect_retry_ms)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:publication_obsolete, issue_id, _publication_id}, state) when is_binary(issue_id) do
+    state = %{
+      state
+      | publication_pending: MapSet.put(state.publication_pending, issue_id),
+        publication_resolved: MapSet.put(state.publication_resolved, issue_id)
+    }
+
+    state = if Map.has_key?(state.running, issue_id), do: state, else: finalize_publication_issue(state, issue_id)
+    notify_dashboard()
     {:noreply, state}
   end
 
@@ -326,6 +327,53 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  defp finalize_agent_down(state, :normal, issue_id, running_entry, session_id) do
+    cond do
+      MapSet.member?(state.publication_resolved, issue_id) ->
+        Logger.info("Agent task completed with obsolete publication outcome issue_id=#{issue_id} session_id=#{session_id}")
+        finalize_publication_issue(state, issue_id)
+
+      MapSet.member?(state.publication_pending, issue_id) ->
+        Logger.info("Agent task completed with durable publication pending issue_id=#{issue_id} session_id=#{session_id}")
+        state
+
+      true ->
+        schedule_agent_continuation(state, issue_id, running_entry, session_id)
+    end
+  end
+
+  defp finalize_agent_down(state, reason, issue_id, running_entry, session_id) do
+    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+    next_attempt = next_retry_attempt_from_running(running_entry)
+    schedule_issue_retry(state, issue_id, next_attempt, agent_retry_metadata(running_entry, "agent exited: #{inspect(reason)}"))
+  end
+
+  defp schedule_agent_continuation(state, issue_id, running_entry, session_id) do
+    Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+    notify_latest_issue_state_after_agent_completion(issue_id, running_entry)
+
+    state
+    |> complete_issue(issue_id)
+    |> schedule_issue_retry(
+      issue_id,
+      next_retry_attempt_from_running(running_entry),
+      continuation_retry_metadata(running_entry)
+    )
+  end
+
+  defp continuation_retry_metadata(running_entry) do
+    agent_retry_metadata(running_entry, nil) |> Map.put(:delay_type, :continuation)
+  end
+
+  defp agent_retry_metadata(running_entry, error) do
+    %{
+      identifier: running_entry.identifier,
+      error: error,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path)
+    }
   end
 
   defp handle_transition_effect_retry_result(state, transition_id, attempt, {:error, _reason})
@@ -1367,8 +1415,20 @@ defmodule SymphonyElixir.Orchestrator do
         start_reserved_worker(state, issue, attempt, recipient, worker_host, dispatch_lease_id)
 
       {:noop, :already_reserved} ->
-        Logger.warning("Skipping duplicate durable worker dispatch for #{issue_context(issue)}")
-        %{state | claimed: MapSet.put(state.claimed, issue.id)}
+        if Map.has_key?(state.running, issue.id) do
+          Logger.debug("Ignoring duplicate worker dispatch while an agent is running for #{issue_context(issue)}")
+          state
+        else
+          next_attempt = next_unreserved_worker_dispatch_attempt(issue, attempt)
+
+          Logger.warning("Recovered duplicate durable worker dispatch for #{issue_context(issue)} by scheduling attempt=#{next_attempt}")
+
+          schedule_issue_retry(state, issue.id, next_attempt, %{
+            identifier: issue.identifier,
+            error: "worker dispatch lease was already reserved",
+            worker_host: worker_host
+          })
+        end
 
       {:error, reason} ->
         Logger.error("Unable to reserve worker dispatch for #{issue_context(issue)}: #{inspect(reason)}")
@@ -1468,6 +1528,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp worker_dispatch_lease_id(issue, attempt) do
     "worker-dispatch:#{worker_dispatch_transition_id(issue)}:attempt-#{normalize_retry_attempt(attempt)}"
+  end
+
+  defp next_unreserved_worker_dispatch_attempt(issue, attempt) do
+    attempt
+    |> normalize_retry_attempt()
+    |> Kernel.+(1)
+    |> Stream.iterate(&(&1 + 1))
+    |> Enum.find(fn candidate ->
+      case journal_snapshot(worker_dispatch_lease_id(issue, candidate)) do
+        {:ok, %{phase: phase}} when phase in [:projection_applied, :verified] -> false
+        _ -> true
+      end
+    end)
   end
 
   defp initialize_worker_dispatch_lease(dispatch_lease_id, issue, attempt) do
@@ -3359,10 +3432,18 @@ defmodule SymphonyElixir.Orchestrator do
   defp replay_pending_transitions(state) do
     case Process.whereis(TransitionJournal) do
       pid when is_pid(pid) ->
+        pending = TransitionJournal.pending(pid)
+        pending_publications = Enum.filter(pending, &publication_snapshot?/1)
+
+        state = claim_pending_publication_issues(state, pending_publications)
+
         state =
-          pid
-          |> TransitionJournal.pending()
+          pending
+          |> Enum.reject(&publication_snapshot?/1)
           |> Enum.reduce(state, &replay_pending_transition/2)
+
+        state =
+          Enum.reduce(pending_publications, state, &resume_publication_snapshot/2)
 
         recover_orphaned_worker_dispatches(pid, state)
 
@@ -3371,6 +3452,329 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp publication_snapshot?(%{transition_id: transition_id}) when is_binary(transition_id),
+    do: String.starts_with?(transition_id, "publication:")
+
+  defp publication_snapshot?(_snapshot), do: false
+
+  defp resume_pending_publication(publication_id, state) do
+    case journal_snapshot(publication_id) do
+      {:ok, %{phase: :verified, data: %{issue_id: issue_id}}} ->
+        finalize_publication_issue(state, issue_id)
+
+      {:ok, %{phase: :verified}} ->
+        state
+
+      {:ok, snapshot} ->
+        resume_publication_snapshot(snapshot, state)
+
+      :error ->
+        state
+    end
+  end
+
+  defp resume_publication_snapshot(snapshot, state) do
+    data = snapshot.data
+
+    cond do
+      data[:result] == :obsolete ->
+        verify_and_finalize_publication(state, snapshot.transition_id, data)
+
+      publication_state_transition_stale_causation?(data) ->
+        obsolete_and_finalize_publication(state, snapshot.transition_id, data)
+
+      publication_outcome_already_verified?(data) ->
+        verify_and_finalize_publication(state, snapshot.transition_id, data)
+
+      data[:result] == :handoff ->
+        resume_publication_handoff(state, snapshot, data, publication_handoff_reason(data), data[:provenance] || %{})
+
+      true ->
+        resume_workspace_publication(state, snapshot, data)
+    end
+  end
+
+  defp verify_and_finalize_publication(state, publication_id, data) do
+    _ = normalize_journal_record(journal_record(publication_id, :verified, data))
+    finalize_publication_issue(state, data[:issue_id])
+  end
+
+  defp obsolete_and_finalize_publication(state, publication_id, data) do
+    data = Map.merge(data, %{result: :obsolete, state_transition_result: ":noop, :stale_causation"})
+    verify_and_finalize_publication(state, publication_id, data)
+  end
+
+  defp resume_workspace_publication(state, snapshot, data) do
+    case publication_workspace_publish(data) do
+      {:ok, provenance} ->
+        resume_published_publication(state, snapshot, data, provenance)
+
+      {:handoff, reason, provenance} ->
+        resume_publication_handoff(state, snapshot, data, reason, provenance)
+
+      {result, reason, provenance} when result in [:retry, :error] ->
+        retry_publication_effect(state, snapshot.transition_id, data, reason, provenance)
+    end
+  end
+
+  defp resume_published_publication(state, snapshot, data, provenance) do
+    data = Map.merge(data, %{provenance: provenance, result: :published})
+    apply_publication_after_projection(state, snapshot, data, :published, provenance)
+  end
+
+  defp resume_publication_handoff(state, snapshot, data, reason, provenance) do
+    data =
+      Map.merge(data, %{
+        provenance: provenance,
+        result: :handoff,
+        reason: inspect(reason),
+        state_transition_id: data[:state_transition_id] || publication_handoff_transition_id(data)
+      })
+
+    apply_publication_after_projection(state, snapshot, data, {:handoff, reason}, provenance)
+  end
+
+  defp apply_publication_after_projection(state, snapshot, data, result, provenance) do
+    case advance_publication_phase(snapshot.transition_id, snapshot.phase, :projection_applied, data) do
+      :ok -> apply_recovered_publication_outcome(state, snapshot.transition_id, data, result, provenance)
+      {:error, reason} -> schedule_publication_retry(snapshot.transition_id, reason, state)
+    end
+  end
+
+  defp retry_publication_effect(state, publication_id, data, reason, provenance) do
+    data = publication_retry_data(data, reason, provenance)
+    _ = normalize_journal_record(journal_record(publication_id, :retrying, data))
+    schedule_publication_retry(publication_id, reason, state)
+  end
+
+  defp publication_workspace_publish(data) do
+    Workspace.publish_pull_request_commit(
+      data[:workspace],
+      data[:base_head_oid],
+      data[:branch],
+      data[:worker_head_oid]
+    )
+  end
+
+  defp publication_retry_data(data, reason, provenance) do
+    provenance =
+      if confirmed_published_provenance?(data[:provenance]) do
+        data[:provenance]
+      else
+        provenance
+      end
+
+    Map.merge(data, %{provenance: provenance, reason: inspect(reason)})
+  end
+
+  defp confirmed_published_provenance?(provenance) when is_map(provenance),
+    do: is_binary(provenance[:published_head_oid]) and provenance[:published_head_oid] != ""
+
+  defp confirmed_published_provenance?(_provenance), do: false
+
+  defp advance_publication_phase(transition_id, :projection_applied, :projection_applied, data) do
+    with :ok <- normalize_journal_record(journal_record(transition_id, :retrying, data)) do
+      normalize_journal_record(journal_record(transition_id, :projection_applied, data))
+    end
+  end
+
+  defp advance_publication_phase(transition_id, :received, :projection_applied, data) do
+    with :ok <- normalize_journal_record(journal_record(transition_id, :decided, data)) do
+      advance_publication_phase(transition_id, :decided, :projection_applied, data)
+    end
+  end
+
+  defp advance_publication_phase(transition_id, phase, :projection_applied, data)
+       when phase in [:decided, :retrying],
+       do: normalize_journal_record(journal_record(transition_id, :projection_applied, data))
+
+  defp advance_publication_phase(_transition_id, _phase, _target, _data),
+    do: {:error, :invalid_publication_phase}
+
+  defp schedule_publication_retry(publication_id, reason, state) do
+    Logger.warning("Retrying broker publication publication_id=#{publication_id} reason=#{inspect(reason)}")
+    Process.send_after(self(), {:retry_publication_effect, publication_id}, @transition_effect_retry_ms)
+    state
+  end
+
+  defp apply_recovered_publication_outcome(state, publication_id, data, result, provenance) do
+    intent = recovered_publication_intent(publication_id, data, result, provenance)
+    apply_transition_intent(state, intent) |> resolve_recovered_publication_transition(publication_id, data)
+  end
+
+  defp recovered_publication_intent(publication_id, data, result, provenance) do
+    %{kind: kind, head_oid: head_oid, summary: summary, source: source, actor: actor} =
+      recovered_publication_fields(data, result, provenance)
+
+    %TransitionIntent{
+      id: data[:state_transition_id] || recovered_publication_transition_id(data, head_oid),
+      issue_id: data[:issue_id],
+      source: source,
+      actor: actor,
+      kind: kind,
+      head_oid: head_oid,
+      causation_id: data[:dispatch_transition_id] || data[:session_id],
+      work_item_kind: :pull_request,
+      comment_body: publication_outcome_comment(summary, data, provenance),
+      metadata: recovered_publication_metadata(publication_id, data, result, provenance)
+    }
+  end
+
+  defp recovered_publication_fields(data, :published, provenance) do
+    %{
+      kind: data[:kind],
+      head_oid: provenance.published_head_oid,
+      summary: data[:summary_ko],
+      source: :worker,
+      actor: "codex-worker"
+    }
+  end
+
+  defp recovered_publication_fields(_data, {:handoff, reason}, provenance) do
+    %{
+      kind: :handoff_required,
+      head_oid: provenance[:live_head_oid],
+      summary: "Broker가 재시작 후 PR publish를 안전하게 완료하지 못해 사람 검토로 인계합니다.\n\n- 사유: #{inspect(reason)}",
+      source: :orchestrator,
+      actor: "symphony-broker"
+    }
+  end
+
+  defp recovered_publication_transition_id(data, head_oid) do
+    "worker:#{data[:issue_id]}:#{data[:session_id]}:publication:#{head_oid || "handoff"}"
+  end
+
+  defp recovered_publication_metadata(publication_id, data, result, provenance) do
+    %{
+      evidence: data[:evidence] || [],
+      findings: data[:findings] || [],
+      dispatch_transition_id: data[:dispatch_transition_id],
+      session_id: data[:session_id],
+      publication: public_publication_provenance(provenance),
+      publication_id: publication_id,
+      publication_handoff: result != :published
+    }
+  end
+
+  defp resolve_recovered_publication_transition({{:ok, _applied}, state}, publication_id, data) do
+    verify_and_finalize_publication(state, publication_id, data)
+  end
+
+  defp resolve_recovered_publication_transition({{:noop, :already_applied}, state}, publication_id, data) do
+    verify_and_finalize_publication(state, publication_id, data)
+  end
+
+  defp resolve_recovered_publication_transition({{:noop, :stale_causation}, state}, publication_id, data) do
+    obsolete_and_finalize_publication(state, publication_id, data)
+  end
+
+  defp resolve_recovered_publication_transition({{:noop, :stale_head_oid}, state}, publication_id, data) do
+    retry_recovered_publication_transition(state, publication_id, data, :stale_head_oid)
+  end
+
+  defp resolve_recovered_publication_transition({{:error, reason}, state}, publication_id, data) do
+    retry_recovered_publication_transition(state, publication_id, data, reason)
+  end
+
+  defp resolve_recovered_publication_transition({_result, state}, publication_id, data) do
+    retry_recovered_publication_transition(state, publication_id, data, :transition_pending)
+  end
+
+  defp retry_recovered_publication_transition(state, publication_id, data, reason) do
+    data = Map.put(data, :reason, inspect(reason))
+    _ = normalize_journal_record(journal_record(publication_id, :retrying, data))
+    schedule_publication_retry(publication_id, reason, state)
+  end
+
+  defp publication_outcome_comment(summary, data, provenance) do
+    evidence = (data[:evidence] || []) |> Enum.map_join("\n", &"- #{&1}")
+    findings = (data[:findings] || []) |> Enum.map_join("\n", &"- #{&1}")
+
+    [
+      summary,
+      if(evidence == "", do: nil, else: "검증\n#{evidence}"),
+      if(findings == "", do: nil, else: "발견 사항\n#{findings}"),
+      "broker publication: #{inspect(public_publication_provenance(provenance))}"
+    ]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n\n")
+  end
+
+  defp publication_outcome_already_verified?(data) do
+    with pid when is_pid(pid) <- Process.whereis(TransitionJournal),
+         transition_id when is_binary(transition_id) <- data[:state_transition_id],
+         {:ok, %{phase: :verified, data: state_data}} <- TransitionJournal.snapshot(pid, transition_id) do
+      state_data[:result] not in [:noop, :rejected, :conflict]
+    else
+      _ -> false
+    end
+  end
+
+  defp publication_state_transition_stale_causation?(data) do
+    case Process.whereis(TransitionJournal) do
+      pid when is_pid(pid) ->
+        with transition_id when is_binary(transition_id) <- data[:state_transition_id],
+             {:ok, %{phase: :verified, data: state_data}} <- TransitionJournal.snapshot(pid, transition_id) do
+          state_data[:result] == :noop and state_data[:reason] == ":stale_causation"
+        else
+          _ -> false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp claim_pending_publication_issues(state, snapshots) do
+    issue_ids =
+      snapshots
+      |> Enum.map(& &1.data[:issue_id])
+      |> Enum.filter(&is_binary/1)
+
+    %{
+      state
+      | publication_pending: MapSet.union(state.publication_pending, MapSet.new(issue_ids)),
+        claimed: MapSet.union(state.claimed, MapSet.new(issue_ids))
+    }
+  end
+
+  defp finalize_publication_issue(state, issue_id) when is_binary(issue_id) do
+    send(self(), {:refresh_issue, issue_id})
+
+    %{
+      state
+      | publication_pending: MapSet.delete(state.publication_pending, issue_id),
+        publication_resolved: MapSet.delete(state.publication_resolved, issue_id),
+        claimed: MapSet.delete(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+  end
+
+  defp finalize_publication_issue(state, _issue_id), do: state
+
+  defp publication_handoff_reason(data) do
+    data[:reason] || data[:publication_handoff_reason] || :publication_handoff_required
+  end
+
+  defp publication_handoff_transition_id(data) do
+    "broker-publication-handoff:#{data[:issue_id]}:#{data[:session_id] || "missing-session"}"
+  end
+
+  defp public_publication_provenance(provenance) when is_map(provenance) do
+    Map.take(provenance, [
+      :base_head_oid,
+      :worker_head_oid,
+      :live_head_oid,
+      :published_head_oid,
+      :branch,
+      :integration,
+      :changed_files,
+      :patch_digest
+    ])
+  end
+
+  defp public_publication_provenance(_provenance), do: %{}
+
   defp recover_orphaned_worker_dispatches(journal, state) do
     events = TransitionJournal.replay(journal)
 
@@ -3378,8 +3782,12 @@ defmodule SymphonyElixir.Orchestrator do
     |> Enum.filter(&verified_worker_dispatch_event?/1)
     |> Enum.group_by(& &1.data[:issue_id])
     |> Enum.map(fn {_issue_id, leases} -> Enum.max_by(leases, & &1.recorded_at) end)
-    |> Enum.reject(&worker_outcome_recorded_after?(events, &1))
+    |> Enum.reject(&orphaned_worker_dispatch_excluded?(events, state, &1))
     |> Enum.reduce(state, &recover_orphaned_worker_dispatch/2)
+  end
+
+  defp orphaned_worker_dispatch_excluded?(events, state, lease) do
+    MapSet.member?(state.publication_pending, lease.data[:issue_id]) or worker_outcome_recorded_after?(events, lease)
   end
 
   defp verified_worker_dispatch_event?(event) do

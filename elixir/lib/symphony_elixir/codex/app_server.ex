@@ -234,7 +234,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(codex_command)],
+            args: [~c"-lc", String.to_charlist(local_worker_command(codex_command))],
             cd: String.to_charlist(workspace),
             env: worker_environment(gh_config_dir),
             line: @port_line_bytes
@@ -274,10 +274,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     base =
       [
         {~c"GH_CONFIG_DIR", String.to_charlist(gh_config_dir)},
-        {~c"GIT_TERMINAL_PROMPT", ~c"0"},
-        {~c"GIT_CONFIG_COUNT", ~c"1"},
-        {~c"GIT_CONFIG_KEY_0", ~c"credential.helper"},
-        {~c"GIT_CONFIG_VALUE_0", ~c""}
+        {~c"GIT_TERMINAL_PROMPT", ~c"0"}
       ] ++ scrubbed
 
     case Config.settings!().tracker do
@@ -294,6 +291,13 @@ defmodule SymphonyElixir.Codex.AppServer do
       _ ->
         base
     end
+  end
+
+  # Port environment entries with an empty value unset the variable. Git needs
+  # the empty value to reset credential helpers, so inject it through the shell
+  # that launches the local worker instead.
+  defp local_worker_command(codex_command) do
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0='' #{codex_command}"
   end
 
   defp remote_worker_environment(gh_config_dir) do

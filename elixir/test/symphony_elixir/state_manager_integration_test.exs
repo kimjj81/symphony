@@ -903,6 +903,172 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
     refute_receive {:memory_tracker_state_projection, _, _, _}
   end
 
+  test "a broker publication handoff without a confirmed remote head reaches human review", %{journal: journal} do
+    issue = %{
+      issue("github:pr:publication-handoff", "Rework")
+      | metadata: %{"head_oid" => "head-current"}
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    handoff =
+      intent("broker-publication-handoff", issue,
+        source: :orchestrator,
+        actor: "symphony-broker",
+        kind: :handoff_required,
+        head_oid: nil,
+        causation_id: nil,
+        metadata: %{publication_handoff: true},
+        comment_body: "Broker publish를 사람 검토로 인계합니다."
+      )
+
+    assert {:reply, {:ok, %AppliedTransition{to_state: "Human Review"}}, _state} =
+             Orchestrator.handle_call(
+               {:transition_request, handoff},
+               {self(), make_ref()},
+               empty_state()
+             )
+
+    assert_receive {:memory_tracker_state_projection, "github:pr:publication-handoff", "Rework", "Human Review"}
+    assert {:ok, %{phase: :verified}} = TransitionJournal.snapshot(journal, "broker-publication-handoff")
+  end
+
+  test "startup preserves a pending publication claim instead of handing off an orphan worker lease", %{journal: journal} do
+    issue = issue("github:pr:publication-transport-retry", "Reviewing")
+    issue_id = issue.id
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    record_worker_lease!(journal, "worker-dispatch:publication-transport:attempt-0", issue.id)
+
+    publication_id = "publication:#{issue.id}:session-transport"
+
+    record_publication_receipt!(journal, publication_id, publication_data(issue, %{session_id: "session-transport"}), :retrying)
+
+    assert {:noreply, state} = Orchestrator.handle_continue(:replay_transition_journal, empty_state())
+
+    assert MapSet.member?(state.publication_pending, issue.id)
+    assert MapSet.member?(state.claimed, issue.id)
+    assert is_nil(state.last_transition)
+    assert {:ok, %{phase: :retrying}} = TransitionJournal.snapshot(journal, publication_id)
+    refute_receive {:memory_tracker_state_projection, ^issue_id, _, _}
+  end
+
+  test "startup replays a pending publication handoff before verifying its receipt", %{journal: journal} do
+    issue = issue("github:pr:publication-handoff-replay", "Rework")
+    issue_id = issue.id
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    record_worker_lease!(journal, "worker-dispatch:publication-handoff:attempt-0", issue.id)
+
+    publication_id = "publication:#{issue.id}:session-handoff"
+    transition_id = "broker-publication-handoff:#{issue.id}:session-handoff"
+
+    data =
+      publication_data(issue, %{
+        session_id: "session-handoff",
+        result: :handoff,
+        reason: ":publication_rebase_conflict",
+        state_transition_id: transition_id,
+        provenance: %{live_head_oid: nil, branch: "review-head", integration: :handoff}
+      })
+
+    record_publication_receipt!(journal, publication_id, data, :projection_applied)
+
+    assert {:noreply, state} = Orchestrator.handle_continue(:replay_transition_journal, empty_state())
+    assert %AppliedTransition{to_state: "Human Review"} = state.last_transition
+    assert_receive {:memory_tracker_state_projection, ^issue_id, "Rework", "Human Review"}
+    assert {:ok, %{phase: :verified}} = TransitionJournal.snapshot(journal, publication_id)
+    assert {:ok, %{phase: :verified}} = TransitionJournal.snapshot(journal, transition_id)
+
+    assert {:noreply, _state} = Orchestrator.handle_continue(:replay_transition_journal, state)
+    refute_receive {:memory_tracker_state_projection, ^issue_id, _, _}
+  end
+
+  test "stale publication causation is verified as obsolete and releases the claim", %{journal: journal} do
+    issue = issue("github:pr:publication-stale-causation", "Reworking")
+    issue_id = issue.id
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    record_worker_lease!(journal, "worker-dispatch:publication-stale:attempt-0", issue.id)
+
+    publication_id = "publication:#{issue.id}:session-stale"
+    transition_id = "worker:#{issue.id}:session-stale"
+
+    assert {:ok, _} = TransitionJournal.record(journal, transition_id, :received, %{issue_id: issue.id})
+
+    assert {:ok, _} =
+             TransitionJournal.record(journal, transition_id, :decided, %{
+               issue_id: issue.id,
+               kind: :rework_complete,
+               result: :noop,
+               reason: ":stale_causation"
+             })
+
+    assert {:ok, _} =
+             TransitionJournal.record(journal, transition_id, :verified, %{
+               issue_id: issue.id,
+               kind: :rework_complete,
+               result: :noop,
+               reason: ":stale_causation"
+             })
+
+    record_publication_receipt!(
+      journal,
+      publication_id,
+      publication_data(issue, %{session_id: "session-stale", state_transition_id: transition_id}),
+      :projection_applied
+    )
+
+    assert {:noreply, state} = Orchestrator.handle_continue(:replay_transition_journal, empty_state())
+
+    refute MapSet.member?(state.publication_pending, issue.id)
+    refute MapSet.member?(state.claimed, issue.id)
+    assert is_nil(state.last_transition)
+
+    assert {:ok, %{phase: :verified, data: %{result: :obsolete}}} =
+             TransitionJournal.snapshot(journal, publication_id)
+
+    refute_receive {:memory_tracker_state_projection, ^issue_id, _, _}
+  end
+
+  test "publication recovery trusts only its recorded state transition and retains final provenance", %{journal: journal} do
+    issue = issue("github:pr:publication-final-provenance", "Reviewing")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    publication_id = "publication:#{issue.id}:session-provenance"
+    transition_id = "worker:#{issue.id}:session-provenance:publication:remote-head"
+    final_provenance = %{published_head_oid: "remote-head", live_head_oid: "remote-head", integration: :concurrently_advanced}
+
+    record_publication_receipt!(
+      journal,
+      publication_id,
+      publication_data(issue, %{
+        session_id: "session-provenance",
+        state_transition_id: transition_id,
+        provenance: final_provenance
+      }),
+      :projection_applied
+    )
+
+    wrong_transition_id = "worker:#{issue.id}:session-provenance:publication:wrong-head"
+    assert {:ok, _} = TransitionJournal.record(journal, wrong_transition_id, :received, %{issue_id: issue.id})
+    assert {:ok, _} = TransitionJournal.record(journal, wrong_transition_id, :decided, %{issue_id: issue.id, kind: :rework_complete})
+    assert {:ok, _} = TransitionJournal.record(journal, wrong_transition_id, :verified, %{issue_id: issue.id, kind: :rework_complete})
+
+    assert {:noreply, state} = Orchestrator.handle_continue(:replay_transition_journal, empty_state())
+    assert {:ok, %{phase: :retrying}} = TransitionJournal.snapshot(journal, publication_id)
+    assert MapSet.member?(state.publication_pending, issue.id)
+
+    assert {:ok, _} = TransitionJournal.record(journal, transition_id, :received, %{issue_id: issue.id})
+    assert {:ok, _} = TransitionJournal.record(journal, transition_id, :decided, %{issue_id: issue.id, kind: :rework_complete})
+    assert {:ok, _} = TransitionJournal.record(journal, transition_id, :verified, %{issue_id: issue.id, kind: :rework_complete})
+
+    assert {:noreply, state} = Orchestrator.handle_continue(:replay_transition_journal, state)
+
+    assert {:ok, %{phase: :verified, data: %{state_transition_id: ^transition_id, provenance: ^final_provenance}}} =
+             TransitionJournal.snapshot(journal, publication_id)
+
+    refute MapSet.member?(state.publication_pending, issue.id)
+    refute MapSet.member?(state.claimed, issue.id)
+  end
+
   defp issue(id, state) do
     %Issue{
       id: id,
@@ -933,6 +1099,41 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
       transition_conflicts: 0,
       codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
     }
+  end
+
+  defp publication_data(issue, overrides) do
+    Map.merge(
+      %{
+        issue_id: issue.id,
+        workspace: Path.join(System.tmp_dir!(), "missing-publication-workspace-#{System.unique_integer([:positive])}"),
+        base_head_oid: "base-head",
+        worker_head_oid: "worker-head",
+        branch: "review-head",
+        kind: :rework_complete,
+        evidence: [],
+        findings: [],
+        summary_ko: "broker publication recovery",
+        session_id: "session-default",
+        dispatch_transition_id: "dispatch-publication",
+        state_transition_id: "worker:#{issue.id}:session-default",
+        result: :published,
+        provenance: %{published_head_oid: "worker-head", live_head_oid: "worker-head", integration: :direct}
+      },
+      overrides
+    )
+  end
+
+  defp record_publication_receipt!(journal, publication_id, data, terminal_phase) do
+    assert {:ok, _} = TransitionJournal.record(journal, publication_id, :received, data)
+    assert {:ok, _} = TransitionJournal.record(journal, publication_id, :decided, data)
+
+    case terminal_phase do
+      :projection_applied ->
+        assert {:ok, _} = TransitionJournal.record(journal, publication_id, :projection_applied, data)
+
+      :retrying ->
+        assert {:ok, _} = TransitionJournal.record(journal, publication_id, :retrying, data)
+    end
   end
 
   defp record_dispatch!(journal, id, issue_id, kind) do

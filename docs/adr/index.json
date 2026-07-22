@@ -1,5 +1,19 @@
 [
   {
+    "id": "ADR-20260722-0006-BRP",
+    "title": "Broker publishes verified pull-request commits",
+    "tags": [
+      "orchestration",
+      "git",
+      "pull-request",
+      "reliability"
+    ],
+    "status": "Accepted",
+    "date": "2026-07-22",
+    "tldr": "Detached Codex workers commit locally while Symphony's broker verifies, integrates, and non-force publishes the resulting PR head before any state transition.",
+    "path": "docs/adr/ADR-20260722-0006-BRP-broker-publishes-verified-pr-commits.md"
+  },
+  {
     "id": "ADR-20260721-0005-QXB",
     "title": "Acknowledge state-less webhook drift and untracked review feedback",
     "tags": [

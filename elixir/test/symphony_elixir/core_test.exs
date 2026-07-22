@@ -2049,6 +2049,79 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, retry_window_started_at_ms, 39_500, 40_500)
   end
 
+  test "normal worker completion advances a continuation lease after a prior retry" do
+    issue_id = "issue-normal-retry"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :NormalRetryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-NORMAL-RETRY",
+      retry_attempt: 1,
+      issue: %Issue{id: issue_id, identifier: "MT-NORMAL-RETRY", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+
+    assert %{attempt: 2} = :sys.get_state(pid).retry_attempts[issue_id]
+  end
+
+  test "durable broker publication pending prevents a second worker continuation" do
+    issue_id = "issue-publication-pending"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :PublicationPendingOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-PUBLICATION-PENDING",
+      retry_attempt: 1,
+      issue: %Issue{id: issue_id, identifier: "MT-PUBLICATION-PENDING", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:publication_pending, issue_id, "publication:#{issue_id}:session"})
+    _ = :sys.get_state(pid)
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+
+    state = :sys.get_state(pid)
+    assert MapSet.member?(state.claimed, issue_id)
+    assert MapSet.member?(state.publication_pending, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
   test "first abnormal worker exit waits before retrying" do
     issue_id = "issue-crash-initial"
     ref = make_ref()

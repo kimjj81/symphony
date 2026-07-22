@@ -27,7 +27,6 @@ defmodule SymphonyElixir.AgentRunner do
       "findings" => %{"type" => "array", "items" => %{"type" => "string"}}
     }
   }
-
   @spec run(map(), pid() | nil, keyword()) :: :ok | {:error, term()} | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
@@ -465,17 +464,33 @@ defmodule SymphonyElixir.AgentRunner do
                  effort: task_profile.effort,
                  output_schema: worker_outcome_schema(execution_contract)
                ),
-             {:ok, outcome} <- decode_worker_outcome(turn_session),
-             result <-
-               request_worker_outcome_transition(
+             {:ok, outcome} <- decode_worker_outcome(turn_session) do
+          case broker_publish_pull_request_outcome(
+                 workspace,
                  tracker_issue,
                  outcome,
                  turn_session,
-                 review_attempt,
-                 max_review_verdicts,
-                 opts
+                 worker_host
                ) do
-          normalize_worker_transition_result(result)
+            {:ok, published_outcome} ->
+              request_published_worker_outcome_transition(
+                tracker_issue,
+                published_outcome,
+                turn_session,
+                review_attempt,
+                max_review_verdicts,
+                opts,
+                codex_update_recipient,
+                workspace
+              )
+
+            {:publication_pending, publication_id} ->
+              notify_publication_pending(codex_update_recipient, tracker_issue.id, publication_id)
+              :ok
+
+            {:error, reason} ->
+              {:error, reason}
+          end
         end
       after
         AppServer.stop_session(session)
@@ -571,16 +586,18 @@ defmodule SymphonyElixir.AgentRunner do
          opts
        ) do
     session_id = Map.fetch!(turn_session, :session_id)
+    metadata = outcome.metadata || %{}
+    publication_handoff? = metadata[:publication_handoff] || metadata["publication_handoff"]
 
     dispatch_transition_id =
       tracker_issue.metadata &&
         (tracker_issue.metadata["symphony_transition_id"] || tracker_issue.metadata[:symphony_transition_id])
 
     intent = %TransitionIntent{
-      id: "worker:#{tracker_issue.id}:#{session_id}",
+      id: Keyword.get(opts, :transition_id, "worker:#{tracker_issue.id}:#{session_id}"),
       issue_id: tracker_issue.id,
-      source: :worker,
-      actor: "codex-worker",
+      source: if(publication_handoff?, do: :orchestrator, else: :worker),
+      actor: if(publication_handoff?, do: "symphony-broker", else: "codex-worker"),
       expected_state: tracker_issue.state,
       kind: outcome.kind,
       head_oid: outcome.head_oid,
@@ -589,12 +606,14 @@ defmodule SymphonyElixir.AgentRunner do
       review_attempt: review_attempt,
       review_limit: review_limit,
       comment_body: render_worker_outcome_comment(outcome),
-      metadata: %{
-        evidence: outcome.evidence,
-        findings: outcome.findings,
-        dispatch_transition_id: dispatch_transition_id,
-        session_id: session_id
-      }
+      metadata:
+        %{
+          evidence: outcome.evidence,
+          findings: outcome.findings,
+          dispatch_transition_id: dispatch_transition_id,
+          session_id: session_id
+        }
+        |> Map.merge(metadata)
     }
 
     requester = Keyword.get(opts, :state_manager_requester)
@@ -603,6 +622,562 @@ defmodule SymphonyElixir.AgentRunner do
       requester.(intent)
     else
       StateManager.request(Keyword.get(opts, :state_manager, SymphonyElixir.Orchestrator), intent)
+    end
+  end
+
+  defp request_published_worker_outcome_transition(
+         tracker_issue,
+         outcome,
+         turn_session,
+         review_attempt,
+         review_limit,
+         opts,
+         codex_update_recipient,
+         workspace
+       ) do
+    state_transition_id = publication_state_transition_id(tracker_issue, outcome, turn_session)
+
+    result =
+      request_worker_outcome_transition(
+        tracker_issue,
+        outcome,
+        turn_session,
+        review_attempt,
+        review_limit,
+        Keyword.put(opts, :transition_id, state_transition_id)
+      )
+
+    case result do
+      {:noop, :stale_head_oid} when is_map(outcome.metadata) ->
+        reconcile_published_head_and_retry_transition(
+          tracker_issue,
+          outcome,
+          turn_session,
+          review_attempt,
+          review_limit,
+          opts,
+          codex_update_recipient,
+          workspace
+        )
+
+      {:noop, :stale_causation} ->
+        finalize_obsolete_publication(
+          outcome,
+          state_transition_id,
+          codex_update_recipient,
+          tracker_issue.id
+        )
+
+      _ ->
+        finalize_published_worker_transition(
+          outcome,
+          result,
+          state_transition_id,
+          codex_update_recipient,
+          tracker_issue.id
+        )
+    end
+  end
+
+  defp reconcile_published_head_and_retry_transition(
+         tracker_issue,
+         outcome,
+         turn_session,
+         review_attempt,
+         review_limit,
+         opts,
+         codex_update_recipient,
+         workspace
+       ) do
+    publication = Map.get(outcome.metadata, :publication) || %{}
+
+    context = %{
+      tracker_issue: tracker_issue,
+      outcome: outcome,
+      turn_session: turn_session,
+      review_attempt: review_attempt,
+      review_limit: review_limit,
+      opts: opts,
+      recipient: codex_update_recipient,
+      workspace: workspace,
+      publication_id: Map.get(outcome.metadata, :publication_id)
+    }
+
+    case Workspace.publish_pull_request_commit(
+           context.workspace,
+           publication[:base_head_oid],
+           publication[:branch],
+           publication[:worker_head_oid]
+         ) do
+      {:ok, provenance} ->
+        reconcile_published_publication(context, provenance)
+
+      {:retry, reason, provenance} ->
+        defer_publication(context, reason, provenance)
+
+      {:error, reason, provenance} ->
+        defer_publication(context, reason, provenance)
+
+      {:handoff, reason, provenance} ->
+        reconcile_publication_handoff(context, reason, provenance)
+    end
+  end
+
+  defp reconcile_published_publication(context, provenance) do
+    outcome = reconciled_publication_outcome(context.outcome, provenance)
+    transition_id = published_publication_transition_id(context, provenance)
+    projection = %{provenance: provenance, state_transition_id: transition_id}
+
+    case record_publication_projection(context.publication_id, projection) do
+      :ok -> request_reconciled_publication_transition(context, outcome, transition_id)
+      {:error, reason} -> defer_publication(context, reason, provenance)
+    end
+  end
+
+  defp reconciled_publication_outcome(outcome, provenance) do
+    %{outcome | head_oid: provenance.published_head_oid, metadata: Map.put(outcome.metadata, :publication, provenance)}
+  end
+
+  defp published_publication_transition_id(context, provenance) do
+    session_id = Map.fetch!(context.turn_session, :session_id)
+    "worker:#{context.tracker_issue.id}:#{session_id}:publication:#{provenance.published_head_oid}"
+  end
+
+  defp request_reconciled_publication_transition(context, outcome, transition_id) do
+    result =
+      request_worker_outcome_transition(
+        context.tracker_issue,
+        outcome,
+        context.turn_session,
+        context.review_attempt,
+        context.review_limit,
+        Keyword.put(context.opts, :transition_id, transition_id)
+      )
+
+    finalize_reconciled_publication_transition(context, outcome, transition_id, result)
+  end
+
+  defp finalize_reconciled_publication_transition(context, outcome, transition_id, {:noop, :stale_causation}) do
+    finalize_obsolete_publication(outcome, transition_id, context.recipient, context.tracker_issue.id)
+  end
+
+  defp finalize_reconciled_publication_transition(context, outcome, transition_id, result) do
+    finalize_published_worker_transition(outcome, result, transition_id, context.recipient, context.tracker_issue.id)
+  end
+
+  defp reconcile_publication_handoff(context, reason, provenance) do
+    transition_id = broker_publication_handoff_transition_id(context.tracker_issue, context.turn_session)
+
+    publication_data = %{
+      provenance: provenance,
+      result: :handoff,
+      reason: inspect(reason),
+      state_transition_id: transition_id
+    }
+
+    case record_publication_projection(context.publication_id, publication_data) do
+      :ok ->
+        handoff =
+          publication_handoff_outcome(
+            context.outcome,
+            reason,
+            provenance,
+            context.publication_id,
+            transition_id
+          )
+
+        request_reconciled_publication_transition(context, handoff, transition_id)
+
+      {:error, journal_reason} ->
+        defer_publication(context, journal_reason, provenance)
+    end
+  end
+
+  defp defer_publication(context, reason, provenance) do
+    mark_publication_retrying(context.publication_id, reason, provenance)
+    notify_publication_pending(context.recipient, context.tracker_issue.id, context.publication_id)
+    :ok
+  end
+
+  defp finalize_published_worker_transition(outcome, result, state_transition_id, codex_update_recipient, issue_id) do
+    publication_id = outcome.metadata && Map.get(outcome.metadata, :publication_id)
+
+    cond do
+      not is_binary(publication_id) ->
+        normalize_worker_transition_result(result)
+
+      publication_transition_completed?(result) ->
+        with :ok <- mark_publication_verified(publication_id, result, state_transition_id) do
+          normalize_worker_transition_result(result)
+        end
+
+      true ->
+        mark_publication_retrying(publication_id, {:publication_transition_pending, result}, %{})
+        notify_publication_pending(codex_update_recipient, issue_id, publication_id)
+        :ok
+    end
+  end
+
+  defp finalize_obsolete_publication(outcome, state_transition_id, codex_update_recipient, issue_id) do
+    publication_id = outcome.metadata && Map.get(outcome.metadata, :publication_id)
+
+    if is_binary(publication_id) do
+      with :ok <- mark_publication_obsolete(publication_id, state_transition_id) do
+        notify_publication_obsolete(codex_update_recipient, issue_id, publication_id)
+        :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp publication_transition_completed?({:ok, _applied}), do: true
+  defp publication_transition_completed?({:noop, :already_applied}), do: true
+  defp publication_transition_completed?(_result), do: false
+
+  defp mark_publication_verified(publication_id, result, state_transition_id) do
+    record_publication_phase(
+      publication_id,
+      :verified,
+      publication_phase_data(publication_id, %{
+        state_transition_id: state_transition_id,
+        state_transition_result: inspect(result)
+      })
+    )
+  end
+
+  defp mark_publication_obsolete(publication_id, state_transition_id) do
+    record_publication_phase(
+      publication_id,
+      :verified,
+      publication_phase_data(publication_id, %{
+        result: :obsolete,
+        state_transition_id: state_transition_id,
+        state_transition_result: ":noop, :stale_causation"
+      })
+    )
+  end
+
+  defp mark_publication_retrying(publication_id, reason, provenance) when is_binary(publication_id) do
+    extra = %{result: :retrying, reason: inspect(reason)}
+    extra = if is_map(provenance) and map_size(provenance) > 0, do: Map.put(extra, :provenance, provenance), else: extra
+    data = publication_phase_data(publication_id, extra)
+
+    _ = record_publication_phase(publication_id, :retrying, data)
+    :ok
+  end
+
+  defp mark_publication_retrying(_publication_id, _reason, _provenance), do: :ok
+
+  defp publication_phase_data(publication_id, extra) do
+    case Process.whereis(TransitionJournal) do
+      pid when is_pid(pid) ->
+        case TransitionJournal.snapshot(pid, publication_id) do
+          {:ok, snapshot} -> Map.merge(snapshot.data, extra)
+          :error -> extra
+        end
+
+      _ ->
+        extra
+    end
+  end
+
+  defp notify_publication_pending(recipient, issue_id, publication_id)
+       when is_pid(recipient) and is_binary(publication_id) do
+    send(recipient, {:publication_pending, issue_id, publication_id})
+    :ok
+  end
+
+  defp notify_publication_pending(_recipient, _issue_id, _publication_id), do: :ok
+
+  defp notify_publication_obsolete(recipient, issue_id, publication_id)
+       when is_pid(recipient) and is_binary(publication_id) do
+    send(recipient, {:publication_obsolete, issue_id, publication_id})
+    :ok
+  end
+
+  defp notify_publication_obsolete(_recipient, _issue_id, _publication_id), do: :ok
+
+  defp broker_publish_pull_request_outcome(
+         _workspace,
+         %Issue{kind: kind},
+         %WorkerOutcome{kind: outcome_kind} = outcome,
+         _turn_session,
+         _worker_host
+       )
+       when kind != :pull_request or outcome_kind not in [:implementation_complete, :rework_complete],
+       do: {:ok, outcome}
+
+  defp broker_publish_pull_request_outcome(
+         _workspace,
+         _tracker_issue,
+         %WorkerOutcome{} = outcome,
+         _turn_session,
+         worker_host
+       )
+       when is_binary(worker_host) do
+    {:ok,
+     publication_handoff_outcome(
+       outcome,
+       :remote_worker_publication_unsupported,
+       %{worker_host: worker_host}
+     )}
+  end
+
+  defp broker_publish_pull_request_outcome(workspace, tracker_issue, outcome, turn_session, nil) do
+    case local_publication_inputs(tracker_issue, outcome) do
+      {:ok, base_head_oid, branch} ->
+        publish_local_pull_request_outcome(workspace, tracker_issue, outcome, turn_session, base_head_oid, branch)
+
+      {:error, provenance} ->
+        {:ok, publication_handoff_outcome(outcome, :publication_preconditions_missing, provenance)}
+    end
+  end
+
+  defp local_publication_inputs(tracker_issue, outcome) do
+    metadata = tracker_issue.metadata || %{}
+    base_head_oid = metadata["head_oid"] || metadata[:head_oid]
+    branch = tracker_issue.branch_name
+
+    if valid_local_publication_inputs?(base_head_oid, branch, outcome.head_oid) do
+      {:ok, base_head_oid, branch}
+    else
+      {:error,
+       %{
+         base_head_oid: base_head_oid,
+         branch: branch,
+         worker_head_oid: outcome.head_oid,
+         journal_available?: is_pid(Process.whereis(TransitionJournal))
+       }}
+    end
+  end
+
+  defp valid_local_publication_inputs?(base_head_oid, branch, worker_head_oid) do
+    is_binary(base_head_oid) and base_head_oid != "" and is_binary(branch) and branch != "" and
+      is_binary(worker_head_oid) and worker_head_oid != "" and is_pid(Process.whereis(TransitionJournal))
+  end
+
+  defp publish_local_pull_request_outcome(
+         workspace,
+         tracker_issue,
+         outcome,
+         turn_session,
+         base_head_oid,
+         branch
+       ) do
+    metadata = tracker_issue.metadata || %{}
+    publication_id = publication_transition_id(tracker_issue, turn_session)
+    state_transition_id = worker_outcome_transition_id(tracker_issue, turn_session)
+
+    publication_data = %{
+      issue_id: tracker_issue.id,
+      workspace: workspace,
+      dispatch_transition_id: metadata["symphony_transition_id"] || metadata[:symphony_transition_id],
+      session_id: Map.get(turn_session, :session_id),
+      base_head_oid: base_head_oid,
+      worker_head_oid: outcome.head_oid,
+      branch: branch,
+      kind: outcome.kind,
+      evidence: outcome.evidence,
+      findings: outcome.findings,
+      summary_ko: outcome.summary_ko,
+      state_transition_id: state_transition_id
+    }
+
+    case initialize_publication_receipt(publication_id, publication_data) do
+      :ok ->
+        publication_context = %{
+          workspace: workspace,
+          tracker_issue: tracker_issue,
+          outcome: outcome,
+          turn_session: turn_session,
+          publication_id: publication_id,
+          data: publication_data,
+          base_head_oid: base_head_oid,
+          branch: branch,
+          state_transition_id: state_transition_id
+        }
+
+        publish_recorded_local_pull_request_outcome(publication_context)
+
+      {:error, reason} ->
+        {:ok, publication_handoff_outcome(outcome, reason, %{branch: branch})}
+    end
+  end
+
+  defp initialize_publication_receipt(publication_id, data) do
+    case record_publication_phase(publication_id, :received, data) do
+      :ok -> record_publication_phase(publication_id, :decided, data)
+      error -> error
+    end
+  end
+
+  defp publish_recorded_local_pull_request_outcome(context) do
+    case publish_with_broker_retries(
+           context.workspace,
+           context.base_head_oid,
+           context.branch,
+           context.outcome.head_oid
+         ) do
+      {:ok, provenance} ->
+        record_published_publication_outcome(
+          context.outcome,
+          context.publication_id,
+          context.data,
+          provenance,
+          context.state_transition_id
+        )
+
+      {:handoff, reason, provenance} ->
+        record_publication_handoff_outcome(
+          context.tracker_issue,
+          context.outcome,
+          context.turn_session,
+          context.publication_id,
+          context.data,
+          reason,
+          provenance
+        )
+
+      {result, reason, provenance} when result in [:retry, :error] ->
+        record_pending_publication_outcome(context.publication_id, context.data, reason, provenance)
+    end
+  end
+
+  defp record_published_publication_outcome(outcome, publication_id, data, provenance, state_transition_id) do
+    data = Map.merge(data, %{provenance: provenance, result: :published})
+
+    case record_publication_phase(publication_id, :projection_applied, data) do
+      :ok ->
+        {:ok,
+         %{
+           outcome
+           | head_oid: provenance.published_head_oid,
+             metadata:
+               Map.merge(outcome.metadata || %{}, %{
+                 publication: provenance,
+                 publication_id: publication_id,
+                 publication_state_transition_id: state_transition_id
+               })
+         }}
+
+      error ->
+        error
+    end
+  end
+
+  defp record_publication_handoff_outcome(tracker_issue, outcome, turn_session, publication_id, data, reason, provenance) do
+    transition_id = broker_publication_handoff_transition_id(tracker_issue, turn_session)
+    data = Map.merge(data, %{provenance: provenance, result: :handoff, reason: inspect(reason), state_transition_id: transition_id})
+
+    case record_publication_phase(publication_id, :projection_applied, data) do
+      :ok -> {:ok, publication_handoff_outcome(outcome, reason, provenance, publication_id, transition_id)}
+      error -> error
+    end
+  end
+
+  defp record_pending_publication_outcome(publication_id, data, reason, provenance) do
+    data = Map.merge(data, %{provenance: provenance, result: :retrying, reason: inspect(reason)})
+    :ok = record_publication_phase(publication_id, :retrying, data)
+    {:publication_pending, publication_id}
+  end
+
+  defp publish_with_broker_retries(workspace, base_head_oid, branch, worker_head_oid) do
+    Workspace.publish_pull_request_commit(workspace, base_head_oid, branch, worker_head_oid)
+  end
+
+  defp publication_handoff_outcome(outcome, reason, provenance, publication_id \\ nil, state_transition_id \\ nil) do
+    public_provenance = publication_public_provenance(provenance)
+
+    %{
+      outcome
+      | kind: :handoff_required,
+        head_oid: Map.get(public_provenance, :live_head_oid),
+        summary_ko:
+          "Broker가 PR 브랜치 publish를 안전하게 완료하지 못해 사람 검토로 인계합니다.\n\n" <>
+            "- 사유: #{inspect(reason)}",
+        evidence:
+          outcome.evidence ++
+            [
+              "broker publication: #{render_publication_provenance(public_provenance)}"
+            ],
+        metadata:
+          Map.merge(outcome.metadata || %{}, %{
+            publication: public_provenance,
+            publication_id: publication_id,
+            publication_state_transition_id: state_transition_id,
+            publication_handoff_reason: inspect(reason),
+            publication_handoff: true
+          })
+    }
+  end
+
+  defp publication_public_provenance(provenance) when is_map(provenance) do
+    Map.take(provenance, [
+      :base_head_oid,
+      :worker_head_oid,
+      :live_head_oid,
+      :published_head_oid,
+      :branch,
+      :integration,
+      :changed_files,
+      :patch_digest
+    ])
+  end
+
+  defp publication_public_provenance(_provenance), do: %{}
+
+  defp render_publication_provenance(provenance) do
+    provenance
+    |> Map.take([:branch, :integration, :published_head_oid, :live_head_oid, :patch_digest])
+    |> inspect()
+  end
+
+  defp publication_transition_id(tracker_issue, turn_session) do
+    session_id = Map.get(turn_session, :session_id) || "missing-session"
+    "publication:#{tracker_issue.id}:#{session_id}"
+  end
+
+  defp worker_outcome_transition_id(tracker_issue, turn_session) do
+    session_id = Map.get(turn_session, :session_id) || "missing-session"
+    "worker:#{tracker_issue.id}:#{session_id}"
+  end
+
+  defp broker_publication_handoff_transition_id(tracker_issue, turn_session) do
+    session_id = Map.get(turn_session, :session_id) || "missing-session"
+    "broker-publication-handoff:#{tracker_issue.id}:#{session_id}"
+  end
+
+  defp publication_state_transition_id(tracker_issue, outcome, turn_session) do
+    metadata = outcome.metadata || %{}
+
+    metadata[:publication_state_transition_id] ||
+      metadata["publication_state_transition_id"] ||
+      worker_outcome_transition_id(tracker_issue, turn_session)
+  end
+
+  defp record_publication_projection(publication_id, extra) when is_binary(publication_id) and is_map(extra) do
+    data = publication_phase_data(publication_id, extra)
+
+    case record_publication_phase(publication_id, :retrying, data) do
+      :ok -> record_publication_phase(publication_id, :projection_applied, data)
+      error -> error
+    end
+  end
+
+  defp record_publication_projection(_publication_id, _extra), do: {:error, :publication_receipt_missing}
+
+  defp record_publication_phase(transition_id, phase, data) do
+    case Process.whereis(TransitionJournal) do
+      pid when is_pid(pid) ->
+        case TransitionJournal.record(pid, transition_id, phase, data) do
+          {:ok, _event} -> :ok
+          {:noop, _reason} -> :ok
+          {:error, reason} -> {:error, {:publication_journal_failed, reason}}
+        end
+
+      _ ->
+        {:error, :publication_journal_unavailable}
     end
   end
 

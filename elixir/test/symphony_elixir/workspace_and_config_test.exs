@@ -102,6 +102,179 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "broker publishes a detached pull request worker commit without attaching the branch" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-publication-#{System.unique_integer([:positive])}")
+
+    try do
+      remote = Path.join(test_root, "remote.git")
+      source = Path.join(test_root, "source")
+      workspace = Path.join(test_root, "worker")
+      File.mkdir_p!(test_root)
+      System.cmd("git", ["init", "--bare", remote])
+      System.cmd("git", ["init", "-b", "main", source])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      File.write!(Path.join(source, "README.md"), "base\n")
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "base"])
+      System.cmd("git", ["-C", source, "remote", "add", "origin", remote])
+      System.cmd("git", ["-C", source, "push", "-u", "origin", "main"])
+      System.cmd("git", ["-C", source, "checkout", "-b", "review-head"])
+      System.cmd("git", ["-C", source, "push", "-u", "origin", "review-head"])
+      System.cmd("git", ["-C", source, "checkout", "main"])
+      {base_head, 0} = System.cmd("git", ["-C", source, "rev-parse", "origin/review-head"])
+      base_head = String.trim(base_head)
+      System.cmd("git", ["-C", source, "worktree", "add", "--detach", workspace, base_head])
+      File.write!(Path.join(workspace, "worker.txt"), "worker\n")
+      System.cmd("git", ["-C", workspace, "add", "worker.txt"])
+      System.cmd("git", ["-C", workspace, "commit", "-m", "worker change"])
+      {worker_head, 0} = System.cmd("git", ["-C", workspace, "rev-parse", "HEAD"])
+      worker_head = String.trim(worker_head)
+
+      assert {:ok, %{integration: :direct, published_head_oid: ^worker_head, changed_files: ["worker.txt"]}} =
+               Workspace.publish_pull_request_commit(workspace, base_head, "review-head", worker_head)
+
+      assert {:ok, %{integration: :already_published, published_head_oid: ^worker_head}} =
+               Workspace.publish_pull_request_commit(workspace, base_head, "review-head", worker_head)
+
+      {remote_head, 0} = System.cmd("git", ["-C", source, "ls-remote", "origin", "refs/heads/review-head"])
+      assert remote_head =~ worker_head
+      assert {"HEAD\n", 0} = System.cmd("git", ["-C", workspace, "rev-parse", "--abbrev-ref", "HEAD"])
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "broker deterministically rebases a detached worker commit when the pull request head advances" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-publication-rebase-#{System.unique_integer([:positive])}")
+
+    try do
+      remote = Path.join(test_root, "remote.git")
+      source = Path.join(test_root, "source")
+      workspace = Path.join(test_root, "worker")
+      File.mkdir_p!(test_root)
+      System.cmd("git", ["init", "--bare", remote])
+      System.cmd("git", ["init", "-b", "main", source])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      File.write!(Path.join(source, "README.md"), "base\n")
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "base"])
+      System.cmd("git", ["-C", source, "remote", "add", "origin", remote])
+      System.cmd("git", ["-C", source, "push", "-u", "origin", "main"])
+      System.cmd("git", ["-C", source, "checkout", "-b", "review-head"])
+      System.cmd("git", ["-C", source, "push", "-u", "origin", "review-head"])
+      System.cmd("git", ["-C", source, "checkout", "main"])
+      {base_head, 0} = System.cmd("git", ["-C", source, "rev-parse", "origin/review-head"])
+      base_head = String.trim(base_head)
+      System.cmd("git", ["-C", source, "worktree", "add", "--detach", workspace, base_head])
+      File.write!(Path.join(workspace, "worker.txt"), "worker\n")
+      System.cmd("git", ["-C", workspace, "add", "worker.txt"])
+      System.cmd("git", ["-C", workspace, "commit", "-m", "worker change"])
+      {worker_head, 0} = System.cmd("git", ["-C", workspace, "rev-parse", "HEAD"])
+      worker_head = String.trim(worker_head)
+      System.cmd("git", ["-C", source, "checkout", "review-head"])
+      File.write!(Path.join(source, "remote.txt"), "remote\n")
+      System.cmd("git", ["-C", source, "add", "remote.txt"])
+      System.cmd("git", ["-C", source, "commit", "-m", "remote change"])
+      System.cmd("git", ["-C", source, "push", "origin", "review-head"])
+      System.cmd("git", ["-C", source, "checkout", "main"])
+
+      assert {:ok, %{integration: :rebased, published_head_oid: published_head}} =
+               Workspace.publish_pull_request_commit(workspace, base_head, "review-head", worker_head)
+
+      refute published_head == worker_head
+      {worker_contents, 0} = System.cmd("git", ["-C", source, "show", "#{published_head}:worker.txt"])
+      {remote_contents, 0} = System.cmd("git", ["-C", source, "show", "#{published_head}:remote.txt"])
+      assert worker_contents == "worker\n"
+      assert remote_contents == "remote\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "broker hands off a conflicting detached rebase without moving the remote branch" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-publication-conflict-#{System.unique_integer([:positive])}")
+
+    try do
+      remote = Path.join(test_root, "remote.git")
+      source = Path.join(test_root, "source")
+      workspace = Path.join(test_root, "worker")
+      File.mkdir_p!(test_root)
+      System.cmd("git", ["init", "--bare", remote])
+      System.cmd("git", ["init", "-b", "main", source])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      File.write!(Path.join(source, "README.md"), "base\n")
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "base"])
+      System.cmd("git", ["-C", source, "remote", "add", "origin", remote])
+      System.cmd("git", ["-C", source, "push", "-u", "origin", "main"])
+      System.cmd("git", ["-C", source, "checkout", "-b", "review-head"])
+      System.cmd("git", ["-C", source, "push", "-u", "origin", "review-head"])
+      System.cmd("git", ["-C", source, "checkout", "main"])
+      {base_head, 0} = System.cmd("git", ["-C", source, "rev-parse", "origin/review-head"])
+      base_head = String.trim(base_head)
+      System.cmd("git", ["-C", source, "worktree", "add", "--detach", workspace, base_head])
+      File.write!(Path.join(workspace, "README.md"), "worker\n")
+      System.cmd("git", ["-C", workspace, "commit", "-am", "worker conflict"])
+      {worker_head, 0} = System.cmd("git", ["-C", workspace, "rev-parse", "HEAD"])
+      worker_head = String.trim(worker_head)
+      System.cmd("git", ["-C", source, "checkout", "review-head"])
+      File.write!(Path.join(source, "README.md"), "remote\n")
+      System.cmd("git", ["-C", source, "commit", "-am", "remote conflict"])
+      System.cmd("git", ["-C", source, "push", "origin", "review-head"])
+      {remote_head, 0} = System.cmd("git", ["-C", source, "rev-parse", "HEAD"])
+      remote_head = String.trim(remote_head)
+      System.cmd("git", ["-C", source, "checkout", "main"])
+
+      assert {:handoff, {:publication_rebase_conflict, _}, %{live_head_oid: ^remote_head}} =
+               Workspace.publish_pull_request_commit(workspace, base_head, "review-head", worker_head)
+
+      {unchanged_remote_head, 0} = System.cmd("git", ["-C", source, "ls-remote", "origin", "refs/heads/review-head"])
+      assert unchanged_remote_head =~ remote_head
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "broker rejects a detached worker commit that is not based on the dispatch head" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-publication-invalid-#{System.unique_integer([:positive])}")
+
+    try do
+      remote = Path.join(test_root, "remote.git")
+      source = Path.join(test_root, "source")
+      workspace = Path.join(test_root, "worker")
+      File.mkdir_p!(test_root)
+      System.cmd("git", ["init", "--bare", remote])
+      System.cmd("git", ["init", "-b", "main", source])
+      System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+      File.write!(Path.join(source, "README.md"), "base\n")
+      System.cmd("git", ["-C", source, "add", "README.md"])
+      System.cmd("git", ["-C", source, "commit", "-m", "base"])
+      System.cmd("git", ["-C", source, "remote", "add", "origin", remote])
+      System.cmd("git", ["-C", source, "push", "-u", "origin", "main"])
+      System.cmd("git", ["-C", source, "checkout", "-b", "review-head"])
+      System.cmd("git", ["-C", source, "push", "-u", "origin", "review-head"])
+      System.cmd("git", ["-C", source, "checkout", "main"])
+      {base_head, 0} = System.cmd("git", ["-C", source, "rev-parse", "origin/review-head"])
+      base_head = String.trim(base_head)
+      System.cmd("git", ["-C", source, "worktree", "add", "--detach", workspace, base_head])
+      System.cmd("git", ["-C", workspace, "checkout", "--orphan", "unrelated-worker"])
+      File.write!(Path.join(workspace, "unrelated.txt"), "unrelated\n")
+      System.cmd("git", ["-C", workspace, "add", "unrelated.txt"])
+      System.cmd("git", ["-C", workspace, "commit", "-m", "unrelated worker"])
+      {worker_head, 0} = System.cmd("git", ["-C", workspace, "rev-parse", "HEAD"])
+      worker_head = String.trim(worker_head)
+
+      assert {:handoff, {:publication_worker_not_based_on_dispatch_head, ^base_head, ^worker_head}, _} =
+               Workspace.publish_pull_request_commit(workspace, base_head, "review-head", worker_head)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace reuses existing issue directory without deleting local changes" do
     workspace_root =
       Path.join(

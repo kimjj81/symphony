@@ -2,6 +2,7 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Codex.OrchestrationBrief
+  alias SymphonyElixir.TransitionJournal
 
   test "orchestration brief rejects output larger than 8KB" do
     issue = review_issue("oversize")
@@ -152,7 +153,7 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     refute fallback =~ "lane:"
   end
 
-  test "implementation authority overrides a contradictory preflight snapshot" do
+  test "authoritative pull request code outcome hands off when publication inputs are missing" do
     test_root = test_root("implementation-authority")
     on_exit(fn -> File.rm_rf(test_root) end)
     workspace_root = Path.join(test_root, "workspaces")
@@ -207,9 +208,14 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     assert_receive {:worker_outcome,
                     %SymphonyElixir.TransitionIntent{
                       expected_state: "In Progress",
-                      kind: :implementation_complete,
+                      source: :orchestrator,
+                      kind: :handoff_required,
                       causation_id: "dispatch-550"
-                    }}
+                    } = intent}
+
+    assert intent.head_oid == nil
+    assert intent.comment_body =~ "publication_preconditions_missing"
+    refute intent.comment_body =~ workspace_root
 
     trace = File.read!(trace_file)
     assert trace =~ "Execution mode: implementation"
@@ -217,6 +223,95 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     assert trace =~ "bootstrap commit with no implementation diff is the starting point"
     assert trace =~ "\"implementation_complete\""
     refute trace =~ "\"clean_review\""
+  end
+
+  test "rebase-conflict publication stays pending until the broker handoff transition completes" do
+    test_root = test_root("publication-handoff-receipt")
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    remote = Path.join(test_root, "remote.git")
+    source = Path.join(test_root, "source")
+    publisher = Path.join(test_root, "publisher")
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+    journal_path = Path.join(test_root, "publication-transitions.log")
+
+    System.cmd("git", ["init", "--bare", remote])
+    System.cmd("git", ["init", "-b", "main", source])
+    System.cmd("git", ["-C", source, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", source, "config", "user.email", "test@example.com"])
+    File.write!(Path.join(source, "README.md"), "base\n")
+    System.cmd("git", ["-C", source, "add", "README.md"])
+    System.cmd("git", ["-C", source, "commit", "-m", "base"])
+    System.cmd("git", ["-C", source, "remote", "add", "origin", remote])
+    System.cmd("git", ["-C", source, "push", "-u", "origin", "main"])
+    System.cmd("git", ["-C", source, "checkout", "-b", "review-head"])
+    System.cmd("git", ["-C", source, "push", "-u", "origin", "review-head"])
+    System.cmd("git", ["-C", source, "checkout", "main"])
+    System.cmd("git", ["clone", remote, publisher])
+    System.cmd("git", ["-C", publisher, "config", "user.name", "Test User"])
+    System.cmd("git", ["-C", publisher, "config", "user.email", "test@example.com"])
+    {base_head, 0} = System.cmd("git", ["-C", source, "rev-parse", "origin/review-head"])
+    base_head = String.trim(base_head)
+
+    codex_binary = write_conflicting_worker_codex!(test_root, trace_file, publisher)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      workspace_strategy: "git_worktree",
+      workspace_source: source,
+      workspace_base_ref: "origin/main",
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true,
+      tracker_active_states: ["Review", "Reviewing", "Rework", "Reworking", "Merging"]
+    )
+
+    enable_authoritative_mode!()
+
+    journal =
+      start_supervised!(
+        {TransitionJournal, name: TransitionJournal, path: journal_path},
+        restart: :temporary
+      )
+
+    issue = %{
+      review_issue("publication-handoff-receipt")
+      | state: "In Progress",
+        branch_name: "review-head",
+        labels: ["sym:in-progress"],
+        metadata: %{
+          "head_oid" => base_head,
+          "symphony_dispatch_state" => "Planned",
+          "symphony_transition_id" => "dispatch-publication-handoff"
+        }
+    }
+
+    parent = self()
+    publication_id = "publication:#{issue.id}:thread-worker-turn-worker"
+
+    result =
+      AgentRunner.run(issue, nil,
+        raise_on_error: false,
+        brief_generator: fn _workspace, _brief_issue -> {:ok, "live_head: #{base_head}"} end,
+        state_manager_requester: fn intent ->
+          send(parent, {:publication_handoff_intent, intent, TransitionJournal.snapshot(journal, publication_id)})
+          {:ok, %{}}
+        end
+      )
+
+    if result != :ok do
+      flunk("unexpected AgentRunner result=#{inspect(result)}\n#{File.read!(trace_file)}")
+    end
+
+    assert_receive {:publication_handoff_intent,
+                    %SymphonyElixir.TransitionIntent{
+                      id: "broker-publication-handoff:" <> _,
+                      source: :orchestrator,
+                      kind: :handoff_required
+                    }, {:ok, %{phase: :projection_applied, data: %{result: :handoff}}}}
+
+    assert {:ok, %{phase: :verified, data: %{result: :handoff}}} =
+             TransitionJournal.snapshot(journal, publication_id)
   end
 
   test "a Planned issue projected to In Progress receives the implementation contract" do
@@ -980,6 +1075,68 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
           printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-worker"}}}'
           ;;
         *'"method":"turn/start"'*)
+          printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-worker"}}}'
+          printf '%s\n' '#{notification}'
+          ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+    codex_binary
+  end
+
+  defp write_conflicting_worker_codex!(test_root, trace_file, publisher) do
+    codex_binary = Path.join(test_root, "fake-conflicting-worker-codex")
+
+    notification =
+      [
+        Jason.encode!(%{
+          "method" => "item/completed",
+          "params" => %{
+            "item" => %{
+              "type" => "agentMessage",
+              "text" =>
+                Jason.encode!(%{
+                  "kind" => "implementation_complete",
+                  "summary_ko" => "worker conflict",
+                  "evidence" => [],
+                  "head_oid" => "HEAD",
+                  "findings" => []
+                })
+            }
+          }
+        }),
+        Jason.encode!(%{
+          "method" => "turn/completed",
+          "params" => %{
+            "turn" => %{"id" => "turn-worker", "items" => [], "status" => "completed"}
+          }
+        })
+      ]
+      |> Enum.join("\n")
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    trace_file=#{inspect(trace_file)}
+    publisher=#{inspect(publisher)}
+    while IFS= read -r line; do
+      printf 'JSON:%s\n' "$line" >> "$trace_file"
+      case "$line" in
+        *'"method":"initialize"'*)
+          printf '%s\n' '{"id":1,"result":{}}'
+          ;;
+        *'"method":"thread/start"'*)
+          printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-worker"}}}'
+          ;;
+        *'"method":"turn/start"'*)
+          printf 'worker\n' > README.md
+          git add README.md >/dev/null 2>&1
+          git commit -m 'worker conflict' >/dev/null 2>&1
+          git -C "$publisher" checkout review-head >/dev/null 2>&1
+          printf 'remote\n' > "$publisher/README.md"
+          git -C "$publisher" commit -am 'remote conflict' >/dev/null 2>&1
+          git -C "$publisher" push origin review-head >/dev/null 2>&1
           printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-worker"}}}'
           printf '%s\n' '#{notification}'
           ;;

@@ -9,6 +9,45 @@ defmodule SymphonyElixir.Workspace do
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
   @type worker_host :: String.t() | nil
+  @type publication_result ::
+          {:ok, map()} | {:handoff, term(), map()} | {:retry, term(), map()} | {:error, term(), map()}
+
+  @doc """
+  Publishes a verified pull-request worker commit without attaching the worker
+  worktree to the pull-request branch.
+
+  The caller supplies the head observed when the worker was dispatched.  A
+  branch which moved meanwhile is rebased in a short-lived detached worktree;
+  conflicts are deliberately returned for a human handoff rather than guessed.
+  """
+  @spec publish_pull_request_commit(Path.t(), String.t(), String.t(), String.t()) :: publication_result()
+  def publish_pull_request_commit(workspace, base_head_oid, pull_request_branch, worker_head_oid)
+      when is_binary(workspace) and is_binary(base_head_oid) and is_binary(pull_request_branch) and
+             is_binary(worker_head_oid) do
+    provenance = %{
+      workspace: workspace,
+      base_head_oid: base_head_oid,
+      worker_head_oid: worker_head_oid,
+      branch: pull_request_branch
+    }
+
+    with :ok <- validate_publication_input(workspace, base_head_oid, pull_request_branch, worker_head_oid),
+         {:ok, live_head_oid} <- fetch_pull_request_head(workspace, pull_request_branch),
+         :ok <- verify_commit(workspace, base_head_oid),
+         :ok <- verify_commit(workspace, worker_head_oid),
+         :ok <- verify_ancestor(workspace, base_head_oid, worker_head_oid),
+         {:ok, provenance} <- enrich_publication_provenance(workspace, provenance, live_head_oid) do
+      publish_verified_commit(workspace, provenance)
+    else
+      {:handoff, reason, details} -> {:handoff, reason, Map.merge(provenance, details)}
+      {:retry, reason, details} -> {:retry, reason, Map.merge(provenance, details)}
+      {:error, reason} -> {:error, reason, provenance}
+      {:error, reason, details} -> {:error, reason, Map.merge(provenance, details)}
+    end
+  end
+
+  def publish_pull_request_commit(_workspace, _base_head_oid, _pull_request_branch, _worker_head_oid),
+    do: {:error, :invalid_pull_request_publication, %{}}
 
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
@@ -219,6 +258,213 @@ defmodule SymphonyElixir.Workspace do
       {_output, 0} -> :ok
       {output, status} -> {:error, {:source_checkout_pull_failed, status, output}}
     end
+  end
+
+  defp validate_publication_input(workspace, base_head_oid, pull_request_branch, worker_head_oid) do
+    cond do
+      not File.dir?(workspace) -> {:error, {:publication_workspace_missing, workspace}}
+      String.trim(base_head_oid) == "" -> {:error, :publication_base_head_missing}
+      String.trim(pull_request_branch) == "" -> {:error, :publication_branch_missing}
+      String.trim(worker_head_oid) == "" -> {:error, :publication_worker_head_missing}
+      true -> :ok
+    end
+  end
+
+  defp fetch_pull_request_head(workspace, branch) do
+    case git(workspace, ["fetch", "origin", branch]) do
+      {:ok, _output} ->
+        case git(workspace, ["rev-parse", "FETCH_HEAD"]) do
+          {:ok, head_oid} -> {:ok, String.trim(head_oid)}
+          {:error, reason} -> {:retry, {:publication_head_read_failed, reason}, %{}}
+        end
+
+      {:error, reason} ->
+        {:retry, {:publication_fetch_failed, reason}, %{}}
+    end
+  end
+
+  defp verify_commit(workspace, oid) do
+    case git(workspace, ["cat-file", "-e", "#{oid}^{commit}"]) do
+      {:ok, _output} -> :ok
+      {:error, reason} -> {:handoff, {:publication_commit_unavailable, oid, reason}, %{}}
+    end
+  end
+
+  defp verify_ancestor(workspace, ancestor, descendant) do
+    case git_status(workspace, ["merge-base", "--is-ancestor", ancestor, descendant]) do
+      {:ok, 0, _output} -> :ok
+      {:ok, 1, _output} -> {:handoff, {:publication_worker_not_based_on_dispatch_head, ancestor, descendant}, %{}}
+      {:ok, status, output} -> {:handoff, {:publication_ancestry_check_failed, status, output}, %{}}
+      {:error, reason} -> {:error, {:publication_ancestry_command_failed, reason}}
+    end
+  end
+
+  defp enrich_publication_provenance(workspace, provenance, live_head_oid) do
+    base_head_oid = provenance.base_head_oid
+    worker_head_oid = provenance.worker_head_oid
+
+    with {:ok, changed_files} <- git(workspace, ["diff", "--name-only", "#{base_head_oid}..#{worker_head_oid}"]),
+         {:ok, patch} <- git(workspace, ["diff", "--binary", "#{base_head_oid}..#{worker_head_oid}"]) do
+      {:ok,
+       provenance
+       |> Map.put(:live_head_oid, live_head_oid)
+       |> Map.put(:changed_files, changed_files |> String.split("\n", trim: true) |> Enum.sort())
+       |> Map.put(:patch_digest, patch_digest(patch))}
+    else
+      {:error, reason} -> {:error, {:publication_provenance_failed, reason}}
+    end
+  end
+
+  defp publish_verified_commit(workspace, %{base_head_oid: base, worker_head_oid: worker, live_head_oid: live} = provenance) do
+    with {:ok, worker_in_live?} <- commit_ancestry(workspace, worker, live),
+         {:ok, live_in_worker?} <- commit_ancestry(workspace, live, worker),
+         {:ok, base_in_live?} <- commit_ancestry(workspace, base, live) do
+      cond do
+        worker_in_live? ->
+          {:ok, Map.merge(provenance, %{published_head_oid: live, integration: :already_published})}
+
+        live_in_worker? ->
+          push_and_verify(workspace, worker, provenance, :direct)
+
+        not base_in_live? ->
+          {:handoff, :publication_remote_history_rewritten, provenance}
+
+        true ->
+          rebase_and_publish_worker_commit(workspace, base, worker, live, provenance)
+      end
+    else
+      {:error, reason} -> {:retry, reason, provenance}
+    end
+  end
+
+  defp rebase_and_publish_worker_commit(workspace, base, worker, live, provenance) do
+    case rebase_worker_commit(workspace, base, worker, live) do
+      {:ok, rebased_head_oid} -> push_and_verify(workspace, rebased_head_oid, provenance, :rebased)
+      {:handoff, reason} -> {:handoff, reason, provenance}
+      {:retry, reason} -> {:retry, reason, provenance}
+    end
+  end
+
+  defp commit_ancestry(workspace, ancestor, descendant) do
+    case git_status(workspace, ["merge-base", "--is-ancestor", ancestor, descendant]) do
+      {:ok, 0, _output} -> {:ok, true}
+      {:ok, 1, _output} -> {:ok, false}
+      {:ok, status, output} -> {:error, {:publication_graph_check_failed, status, output}}
+      {:error, reason} -> {:error, {:publication_graph_check_failed, reason}}
+    end
+  end
+
+  defp rebase_worker_commit(workspace, base_head_oid, worker_head_oid, live_head_oid) do
+    temporary_workspace = publication_workspace_path()
+
+    try do
+      case git(workspace, ["worktree", "add", "--detach", temporary_workspace, worker_head_oid]) do
+        {:ok, _output} ->
+          rebase_in_temporary_workspace(temporary_workspace, base_head_oid, live_head_oid)
+
+        {:error, reason} ->
+          {:retry, {:publication_integration_workspace_failed, reason}}
+      end
+    after
+      _ = git(workspace, ["worktree", "remove", "--force", temporary_workspace])
+      _ = File.rm_rf(temporary_workspace)
+    end
+  end
+
+  defp rebase_in_temporary_workspace(workspace, base_head_oid, live_head_oid) do
+    case git_status(workspace, ["rebase", "--onto", live_head_oid, base_head_oid]) do
+      {:ok, 0, _output} -> rebased_workspace_head(workspace)
+      {:ok, 1, output} -> abort_rebase_with_handoff(workspace, output)
+      {:ok, status, output} -> abort_rebase_with_retry(workspace, status, output)
+      {:error, reason} -> {:retry, {:publication_rebase_command_failed, reason}}
+    end
+  end
+
+  defp rebased_workspace_head(workspace) do
+    case git(workspace, ["rev-parse", "HEAD"]) do
+      {:ok, rebased_head_oid} -> {:ok, String.trim(rebased_head_oid)}
+      {:error, reason} -> {:retry, {:publication_rebase_head_read_failed, reason}}
+    end
+  end
+
+  defp abort_rebase_with_handoff(workspace, output) do
+    _ = git(workspace, ["rebase", "--abort"])
+    {:handoff, {:publication_rebase_conflict, output}}
+  end
+
+  defp abort_rebase_with_retry(workspace, status, output) do
+    _ = git(workspace, ["rebase", "--abort"])
+    {:retry, {:publication_rebase_failed, status, output}}
+  end
+
+  defp push_and_verify(workspace, head_oid, provenance, integration) do
+    branch_ref = "#{head_oid}:refs/heads/#{provenance.branch}"
+
+    case git(workspace, ["push", "origin", branch_ref]) do
+      {:ok, _output} ->
+        verify_published_pull_request_head(workspace, head_oid, provenance, integration)
+
+      {:error, {_status, output} = reason} ->
+        {:retry, {:publication_push_failed, reason}, Map.put(provenance, :push_output, output)}
+
+      {:error, reason} ->
+        {:retry, {:publication_push_failed, reason}, provenance}
+    end
+  end
+
+  defp verify_published_pull_request_head(workspace, head_oid, provenance, integration) do
+    case fetch_pull_request_head(workspace, provenance.branch) do
+      {:ok, ^head_oid} ->
+        {:ok, Map.merge(provenance, %{published_head_oid: head_oid, integration: integration})}
+
+      {:ok, actual_head_oid} ->
+        verify_concurrently_published_head(workspace, head_oid, actual_head_oid, provenance)
+
+      {:retry, reason, details} ->
+        {:retry, reason, Map.merge(provenance, details)}
+    end
+  end
+
+  defp verify_concurrently_published_head(workspace, head_oid, actual_head_oid, provenance) do
+    case commit_ancestry(workspace, head_oid, actual_head_oid) do
+      {:ok, true} ->
+        {:ok, Map.merge(provenance, %{published_head_oid: actual_head_oid, integration: :concurrently_advanced})}
+
+      {:ok, false} ->
+        {:handoff, {:publication_remote_head_changed_during_push, actual_head_oid}, provenance}
+
+      {:error, reason} ->
+        {:retry, reason, provenance}
+    end
+  end
+
+  defp publication_workspace_path do
+    Path.join(System.tmp_dir!(), "symphony-publication-#{System.unique_integer([:positive, :monotonic])}")
+  end
+
+  defp patch_digest(patch) do
+    :crypto.hash(:sha256, patch)
+    |> Base.encode16(case: :lower)
+  end
+
+  defp git(workspace, arguments) do
+    case git_status(workspace, arguments) do
+      {:ok, 0, output} -> {:ok, output}
+      {:ok, status, output} -> {:error, {status, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp git_status(workspace, arguments) when is_binary(workspace) and is_list(arguments) do
+    {output, status} =
+      System.cmd("git", ["-C", workspace | arguments],
+        stderr_to_stdout: true,
+        env: [{"GIT_EDITOR", "true"}]
+      )
+
+    {:ok, status, output}
+  rescue
+    error -> {:error, error}
   end
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
