@@ -513,7 +513,10 @@ Fields:
   - Invalid values fail configuration validation.
 - `max_review_verdicts` (positive integer)
   - Default: `3`.
-  - Limits review verdicts, not implementation/rework turns, in a briefed worker run.
+  - Limits automatic `review_findings -> Rework` cycles in a briefed worker run. After the
+    configured number of rework cycles, Symphony runs one confirmation review: a clean result
+    enters `Human Review`, while another finding is handed to `Human Review` without another
+    automatic rework.
 - `orchestration_brief_enabled` (boolean)
   - Default: `false` for backward compatibility.
 - `review_states` (list of strings), `rework_state` (string), `reworking_state` (string),
@@ -815,10 +818,15 @@ Workflows MAY enable orchestration briefs for bounded PR review/rework cycles:
 - Each briefed worker turn starts a fresh coding-agent thread and receives only tracker identity,
   the brief, the current review-verdict counter, and the verification tier.
 - Briefed continuation is transition-aware rather than based on active state alone. Implementation or
-  rework may continue to review; review findings may continue to rework while the verdict budget
-  remains; a clean review stops immediately in Human Review.
-- When the configured review-verdict budget is exhausted with findings remaining, or when a worker
-  reports `handoff_required`, policy moves the item to Human Review with a brokered handoff comment.
+  rework may continue to review; the configured budget permits that many complete automatic
+  review/rework cycles. The next review is a confirmation review: a clean review stops immediately
+  in Human Review, and remaining findings are handed to Human Review without another rework.
+- In legacy briefed runs, `agent.max_turns` MUST allow the configured review/rework cycles plus
+  their confirmation review; with the default budget of three, a run starting in implementation
+  needs eight turns. Authoritative mode dispatches one turn per state transition and uses the
+  transition journal's review counter instead of `agent.max_turns` to preserve the cycle budget.
+- When the confirmation review still has findings, or when a worker reports `handoff_required`,
+  policy moves the item to Human Review with a brokered handoff comment.
 - Full verification and required-CI waiting are reserved for configured full states such as Merging.
   Earlier states run focused checks and inspect CI once without polling.
 
@@ -890,8 +898,8 @@ tracker-visible so operators can inspect progress without opening Symphony:
 | `implementation_complete` | `In Progress -> Review` |
 | review dispatch | `Review -> Reviewing` |
 | `clean_review` | `Reviewing -> Human Review` |
-| `review_findings` within budget | `Reviewing -> Rework` |
-| `review_findings` at final verdict | `Reviewing -> Human Review` |
+| `review_findings` within automatic rework-cycle budget | `Reviewing -> Rework` |
+| `review_findings` in the confirmation review | `Reviewing -> Human Review` |
 | rework dispatch | `Rework -> Reworking` |
 | `rework_complete` | `Reworking -> Review` |
 | `merge_ready` followed by observed successful merge | `Merging -> Done` |

@@ -107,6 +107,7 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_review_verdicts: 3
   dispatch_kinds:
     - issue
     - pull_request
@@ -172,6 +173,9 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.max_review_verdicts` caps automatic `review_findings -> Rework` cycles in briefed runs.
+  Symphony performs one confirmation review after the configured cycles; a further finding enters
+  Human Review instead of starting another automatic rework. Default: `3`.
 - `agent.dispatch_kinds` limits which tracker item kinds can dispatch Codex workspace runs.
   Supported values are `issue` and `pull_request`; the default is both. Keep `issue` enabled
   when Todo GitHub issues should run planning-only Codex turns that leave tracker comments.

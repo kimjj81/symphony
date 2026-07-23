@@ -290,7 +290,7 @@ defmodule SymphonyElixir.CoreTest do
     assert settings.codex.task_profiles["default"]["effort"] == "medium"
     assert settings.codex.task_profiles["orchestration"]["model"] == "gpt-5.6-terra"
     assert settings.codex.task_profiles["orchestration"]["effort"] == "medium"
-    assert settings.agent.max_turns == 7
+    assert settings.agent.max_turns == 8
     assert settings.agent.max_review_verdicts == 3
     assert settings.agent.orchestration_brief_enabled
     assert settings.verification.full_states == ["merging"]

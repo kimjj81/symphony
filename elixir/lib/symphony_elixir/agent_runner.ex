@@ -1285,7 +1285,7 @@ defmodule SymphonyElixir.AgentRunner do
       " model=#{task_profile.model}",
       " effort=#{task_profile.effort}",
       " verification_tier=#{verification_tier}",
-      " review_verdict=#{review_attempt}/#{max_review_verdicts}",
+      " review_verdict=#{review_attempt} rework_cycle_limit=#{max_review_verdicts}",
       " prompt_bytes=#{byte_size(prompt)}"
     ])
 
@@ -1468,11 +1468,11 @@ defmodule SymphonyElixir.AgentRunner do
        ) do
     review_guidance =
       cond do
-        review_state?(issue.state) and review_attempt >= max_review_verdicts ->
-          "This is review verdict #{review_attempt} of #{max_review_verdicts}. If any finding remains, return review_findings with a Korean blocker summary. Return clean_review when there are no findings. Symphony decides and applies the tracker transition."
+        review_state?(issue.state) and review_attempt > max_review_verdicts ->
+          "This is confirmation review after #{max_review_verdicts} automatic rework cycles. If any finding remains, return review_findings with a Korean blocker summary so Symphony can hand the item to Human Review. Return clean_review when there are no findings. Symphony decides and applies the tracker transition."
 
         review_state?(issue.state) ->
-          "This is review verdict #{review_attempt} of #{max_review_verdicts}. Return clean_review when there are no findings, or review_findings only for actionable findings. Symphony decides and applies the tracker transition."
+          "This is review verdict #{review_attempt}; actionable findings can start automatic rework cycle #{review_attempt} of #{max_review_verdicts}. Return clean_review when there are no findings, or review_findings only for actionable findings. Symphony decides and applies the tracker transition."
 
         true ->
           "Complete only the current lane and return the matching semantic outcome. Symphony decides and applies the tracker transition."
@@ -1631,8 +1631,8 @@ defmodule SymphonyElixir.AgentRunner do
       not rework_state?(refreshed_state) ->
         invalid_active_transition(previous_state, refreshed_state)
 
-      review_verdicts >= max_review_verdicts ->
-        {:handoff, "자동 리뷰 판정 한도(#{max_review_verdicts}회)에 도달했지만 해결되지 않은 finding이 남아 Human Review로 전환합니다."}
+      review_verdicts > max_review_verdicts ->
+        {:handoff, "자동 재수정 세트 한도(#{max_review_verdicts}회) 이후 확인 리뷰에서도 해결되지 않은 finding이 남아 Human Review로 전환합니다."}
 
       true ->
         {:continue, :review_findings}

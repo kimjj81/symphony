@@ -569,7 +569,7 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     assert count_lines(trace, "RUN:") == 1
     assert count_lines(trace, "THREAD:") == 1
     assert trace =~ "Verification tier: focused"
-    assert trace =~ "review verdict 1 of 3"
+    assert trace =~ "automatic rework cycle 1 of 3"
     assert trace =~ "returning exactly one structured semantic outcome"
     assert trace =~ "do not query or mutate GitHub"
     refute trace =~ "synchronizing the required Korean tracker comment"
@@ -635,7 +635,77 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     refute File.exists?(trace_file)
   end
 
-  test "three review findings stop in Human Review without a fourth verdict" do
+  test "authoritative review uses the journal counter for the post-rework confirmation review" do
+    test_root = test_root("authoritative-review-cycle")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+    journal_path = Path.join(test_root, "transitions.log")
+
+    outcome = %{
+      "kind" => "review_findings",
+      "summary_ko" => "추가 확인이 필요한 finding이 있습니다.",
+      "evidence" => ["focused review"],
+      "head_oid" => nil,
+      "findings" => ["lib/example.ex"]
+    }
+
+    codex_binary = write_worker_outcome_codex!(test_root, trace_file, Jason.encode!(outcome))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true,
+      max_turns: 8,
+      max_review_verdicts: 3,
+      tracker_active_states: ["Review", "Reviewing", "Rework", "Reworking", "Merging"]
+    )
+
+    enable_authoritative_mode!()
+
+    journal =
+      start_supervised!(
+        {TransitionJournal, name: TransitionJournal, path: journal_path},
+        restart: :temporary
+      )
+
+    issue = review_issue("authoritative-review-cycle")
+
+    for {transition_id, kind} <-
+          [{"dispatch-review-cycle", :dispatch_implementation}] ++
+            Enum.map(1..3, &{"review-cycle-#{&1}", :review_findings}) do
+      transition_data = %{issue_id: issue.id, kind: kind}
+
+      assert {:ok, _} = TransitionJournal.record(journal, transition_id, :received, transition_data)
+      assert {:ok, _} = TransitionJournal.record(journal, transition_id, :decided, transition_data)
+      assert {:ok, _} = TransitionJournal.record(journal, transition_id, :verified, transition_data)
+    end
+
+    parent = self()
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               brief_generator: fn _workspace, _brief_issue ->
+                 {:ok, "live_head: unknown\nunresolved_feedback: none"}
+               end,
+               state_manager_requester: fn intent ->
+                 send(parent, {:worker_outcome, intent})
+                 {:ok, %{}}
+               end
+             )
+
+    assert_receive {:worker_outcome,
+                    %SymphonyElixir.TransitionIntent{
+                      expected_state: "Review",
+                      kind: :review_findings,
+                      review_attempt: 4,
+                      review_limit: 3
+                    }}
+
+    assert File.read!(trace_file) =~ "confirmation review after 3 automatic rework cycles"
+  end
+
+  test "three review findings complete three reworks before a fourth confirmation review reaches Human Review" do
     test_root = test_root("review-limit")
     on_exit(fn -> File.rm_rf(test_root) end)
     workspace_root = Path.join(test_root, "workspaces")
@@ -652,7 +722,7 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     )
 
     issue = review_issue("limit")
-    states = Agent.start_link(fn -> ["Rework", "Review", "Rework", "Review", "Rework"] end) |> elem(1)
+    states = Agent.start_link(fn -> ["Rework", "Review", "Rework", "Review", "Rework", "Review", "Human Review"] end) |> elem(1)
     on_exit(fn -> if Process.alive?(states), do: Agent.stop(states) end)
     parent = self()
 
@@ -678,17 +748,16 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
 
     assert_receive :brief_generated
     refute_receive :brief_generated
-    assert_receive {:handoff_comment, "github:pr:limit", body}
-    assert body =~ "자동 리뷰 판정 한도(3회)"
-    assert_receive {:handoff_state, "github:pr:limit", "Human Review"}
+    refute_receive {:handoff_comment, "github:pr:limit", _body}
+    refute_receive {:handoff_state, "github:pr:limit", "Human Review"}
 
     trace = File.read!(trace_file)
-    assert count_lines(trace, "RUN:") == 5
-    assert count_lines(trace, "THREAD:") == 5
-    assert trace =~ "review verdict 1 of 3"
-    assert trace =~ "review verdict 2 of 3"
-    assert trace =~ "review verdict 3 of 3"
-    refute trace =~ "review verdict 4 of 3"
+    assert count_lines(trace, "RUN:") == 7
+    assert count_lines(trace, "THREAD:") == 7
+    assert trace =~ "automatic rework cycle 1 of 3"
+    assert trace =~ "automatic rework cycle 2 of 3"
+    assert trace =~ "automatic rework cycle 3 of 3"
+    assert trace =~ "confirmation review after 3 automatic rework cycles"
   end
 
   test "unexpected same active review state is handed to Human Review without retry" do

@@ -28,6 +28,7 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_review_verdicts: 3
   dispatch_kinds:
     - issue
     - pull_request

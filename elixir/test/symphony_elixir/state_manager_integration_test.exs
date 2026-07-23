@@ -438,7 +438,7 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
     refute_receive {:memory_tracker_state_projection, "github:pr:invalid-request", _, _}
   end
 
-  test "startup replay preserves final review budget from a received intent", %{journal: journal} do
+  test "startup replay preserves confirmation-review handoff from a received intent", %{journal: journal} do
     issue = issue("github:pr:review-replay", "Reviewing")
     issue_id = issue.id
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
@@ -469,9 +469,9 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
                kind: :review_findings,
                causation_id: "run-review-replay",
                work_item_kind: :pull_request,
-               review_attempt: 3,
+               review_attempt: 4,
                review_limit: 3,
-               comment_body: "최종 검토 결과를 인계합니다.",
+               comment_body: "재수정 세트 후 확인 검토 결과를 인계합니다.",
                metadata: %{dispatch_transition_id: dispatch_id}
              })
 

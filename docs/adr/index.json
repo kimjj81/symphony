@@ -1,5 +1,20 @@
 [
   {
+    "id": "ADR-20260723-0007-RCL",
+    "title": "Review budget counts complete automatic rework cycles",
+    "tags": [
+      "orchestration",
+      "review",
+      "rework",
+      "workflow",
+      "reliability"
+    ],
+    "status": "Accepted",
+    "date": "2026-07-23",
+    "tldr": "A review budget of three permits three review-and-rework cycles followed by one confirmation review, not only three review verdicts.",
+    "path": "docs/adr/ADR-20260723-0007-RCL-review-budget-counts-complete-rework-cycles.md"
+  },
+  {
     "id": "ADR-20260722-0006-BRP",
     "title": "Broker publishes verified pull-request commits",
     "tags": [

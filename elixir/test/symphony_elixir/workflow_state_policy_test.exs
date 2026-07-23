@@ -35,11 +35,16 @@ defmodule SymphonyElixir.WorkflowStatePolicyTest do
       end
     end
 
-    test "routes final review findings to Human Review" do
+    test "permits the configured third rework and routes confirmation-review findings to Human Review" do
       intent = intent(:review_findings, expected_state: "Reviewing", review_attempt: 3, review_limit: 3)
 
-      assert {:ok, %TransitionPlan{to_state: "Human Review"}} =
+      assert {:ok, %TransitionPlan{to_state: "Rework"}} =
                WorkflowStatePolicy.decide("Reviewing", intent)
+
+      confirmation_intent = intent(:review_findings, expected_state: "Reviewing", review_attempt: 4, review_limit: 3)
+
+      assert {:ok, %TransitionPlan{to_state: "Human Review"}} =
+               WorkflowStatePolicy.decide("Reviewing", confirmation_intent)
     end
 
     test "derives parent completion without bypassing terminal-state semantics" do

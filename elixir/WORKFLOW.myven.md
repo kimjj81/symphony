@@ -233,7 +233,7 @@ hooks:
     exit "$cleanup_failed"
 agent:
   max_concurrent_agents: 3
-  max_turns: 7
+  max_turns: 8
   max_review_verdicts: 3
   orchestration_brief_enabled: true
   review_states:

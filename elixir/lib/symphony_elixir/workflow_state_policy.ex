@@ -148,6 +148,6 @@ defmodule SymphonyElixir.WorkflowStatePolicy do
   defp reopen_intent?(%TransitionIntent{kind: {:operator_request, request}}), do: normalize_request(request) == :reopen
   defp reopen_intent?(_intent), do: false
 
-  defp final_review_attempt?(%TransitionIntent{review_attempt: attempt, review_limit: limit}) when is_integer(attempt) and is_integer(limit), do: attempt >= limit
+  defp final_review_attempt?(%TransitionIntent{review_attempt: attempt, review_limit: limit}) when is_integer(attempt) and is_integer(limit), do: attempt > limit
   defp final_review_attempt?(_intent), do: false
 end
