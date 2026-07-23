@@ -375,7 +375,21 @@ Instructions:
 14. Rework pull requests run after Symphony projects `Reworking`. Use the orchestration brief's live head, top-level comments, review summaries, inline review comments, and unresolved threads as the tracker snapshot for the dispatch; do not query or mutate GitHub. Address only actionable feedback, commit the result locally in the detached worktree, and return `rework_complete` with the exact detached HEAD OID. Do not push: Symphony's broker compares the worker commit with the live PR head, performs a verified non-force publish or deterministic integration, and hands off only when that integration needs human judgment.
 15. An inline-comment webhook is a rework signal, not proof that a code change is needed. A justified no-change result still returns `rework_complete` with the evidence Symphony should publish.
 16. If implementation becomes too large, stop before committing and return `handoff_required` with the Korean split proposal: "이 PR은 너무 커졌으므로 여기까지 commit하지 않고 분할 제안".
-17. Merging is an approved verification lane. Use the existing workspace and branch, inspect changed user-facing text for i18n compliance, and run the repository-defined full local verification bundle. Do not query GitHub or merge. Return `merge_ready` with the exact head OID when local merge preconditions pass; Symphony validates required CI, performs the pinned merge, and projects Done after observing success.
+17. Merging is an approved verification lane. Use the existing workspace and branch, fetch `origin/main`, rebase it onto the fetched `origin/main`, and inspect changed user-facing text for i18n compliance. A PR is broad-scope when its diff or rebase-conflict resolution touches two or more stable work units, a shared package or repository-wide configuration, a generated API contract, a schema or migration, CI/local-stack tooling, or runtime/deployment infrastructure. A broad-scope PR MUST pass this full local verification bundle after the rebase and before returning `merge_ready`:
+    ```bash
+    pnpm test
+    pnpm --filter @myven/observability test
+    CI=true pnpm api:test
+    pnpm check
+    pnpm build
+    pnpm codegen:check
+    pnpm local:up
+    pnpm local:seed
+    pnpm local:smoke
+    pnpm e2e:install
+    pnpm e2e
+    ```
+    `pnpm test` omits the observability workspace, so its separate test command is required. `pnpm e2e` is the full Playwright suite and MUST NOT be replaced with targeted smoke coverage for a broad-scope PR. Do not query GitHub or merge. If any required command cannot run or fails, return `blocked` with the command and evidence; do not return `merge_ready` from partial local evidence. Otherwise return `merge_ready` with the exact head OID when local merge preconditions pass; Symphony validates required CI, performs the pinned merge, and projects Done after observing success.
 18. Before Merging, other lanes run only focused verification and use any CI snapshot supplied by the orchestration brief without polling GitHub. Do not expand into full API/Web/OpenAPI/Astro suites, Compose startup, seed, or browser setup unless the exact change cannot be verified more narrowly. Retry a plausible environment failure at most once, then report partial evidence.
 19. Human Review and Waiting are inactive retention/coordination states and must not execute work. Cleanup is allowed only after Done, Canceled, or Duplicate.
 20. Preserve `docs/draft` workpads through Human Review. Before returning `merge_ready`, either move durable content into `docs/architecture`, `docs/design-system`, or `docs/adr`, or remove the draft-only workpad.
