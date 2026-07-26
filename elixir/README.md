@@ -157,6 +157,10 @@ Notes:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
+- Local and SSH Codex workers receive session-isolated `XDG_CACHE_HOME`, `UV_CACHE_DIR`, and
+  `MYVEN_GITLEAKS_CACHE_DIR` paths beneath their temporary runtime directory. Symphony removes the
+  directory when the app-server session stops, so verification tools do not require write access to
+  the worker account's home cache.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - `codex.auto_approve_requests: true` makes Symphony approve app-server approval requests without

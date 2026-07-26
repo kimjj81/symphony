@@ -275,7 +275,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       [
         {~c"GH_CONFIG_DIR", String.to_charlist(gh_config_dir)},
         {~c"GIT_TERMINAL_PROMPT", ~c"0"}
-      ] ++ scrubbed
+      ] ++ worker_cache_environment(gh_config_dir) ++ scrubbed
 
     case Config.settings!().tracker do
       %{kind: "github", read_api_key: token} when is_binary(token) and token != "" ->
@@ -305,6 +305,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     # as shell identifiers without quoting while preserving a readable command.
     unset = "env" <> Enum.map_join(worker_write_token_envs(), "", &" -u #{&1}")
     config_dir = "GH_CONFIG_DIR=#{shell_escape(gh_config_dir)}"
+    cache_environment = remote_worker_cache_environment(gh_config_dir)
 
     git_credentials =
       "GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=''"
@@ -313,7 +314,31 @@ defmodule SymphonyElixir.Codex.AppServer do
     # not need tracker credentials to perform its task, so remote workers never
     # receive even the optional read token. Local workers may still receive it
     # through an inherited environment entry without placing it in argv.
-    Enum.join([unset, config_dir, git_credentials], " ")
+    Enum.join([unset, config_dir, cache_environment, git_credentials], " ")
+  end
+
+  defp worker_cache_environment(gh_config_dir) do
+    gh_config_dir
+    |> worker_cache_paths()
+    |> Enum.map(fn {name, path} ->
+      {String.to_charlist(name), String.to_charlist(path)}
+    end)
+  end
+
+  defp remote_worker_cache_environment(gh_config_dir) do
+    gh_config_dir
+    |> worker_cache_paths()
+    |> Enum.map_join(" ", fn {name, path} -> "#{name}=#{shell_escape(path)}" end)
+  end
+
+  defp worker_cache_paths(gh_config_dir) do
+    cache_root = Path.join(gh_config_dir, "cache")
+
+    [
+      {"XDG_CACHE_HOME", Path.join(cache_root, "xdg")},
+      {"UV_CACHE_DIR", Path.join(cache_root, "uv")},
+      {"MYVEN_GITLEAKS_CACHE_DIR", Path.join(cache_root, "gitleaks")}
+    ]
   end
 
   defp worker_write_token_envs do

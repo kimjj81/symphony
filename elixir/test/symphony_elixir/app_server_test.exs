@@ -1715,6 +1715,12 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "mkdir -p"
       assert argv_line =~ "symphony-worker-gh-config-"
       assert argv_line =~ "trap "
+      assert argv_line =~ "XDG_CACHE_HOME="
+      assert argv_line =~ "/cache/xdg"
+      assert argv_line =~ "UV_CACHE_DIR="
+      assert argv_line =~ "/cache/uv"
+      assert argv_line =~ "MYVEN_GITLEAKS_CACHE_DIR="
+      assert argv_line =~ "/cache/gitleaks"
       assert argv_line =~ "env -u GITHUB_TOKEN -u GH_TOKEN -u FORGEJO_TOKEN -u SYMPHONY_TRACKER_READ_TOKEN"
       assert argv_line =~ "-u SYMPHONY_TRACKER_WRITE_TOKEN"
       assert argv_line =~ "-u LINEAR_API_KEY"
@@ -1823,6 +1829,9 @@ defmodule SymphonyElixir.AppServerTest do
         printf 'SYMPHONY_FORGEJO_WEBHOOK_SECRET=%s\\n' "${SYMPHONY_FORGEJO_WEBHOOK_SECRET-unset}"
         printf 'SYMPHONY_GITHUB_WEBHOOK_SECRET=%s\\n' "${SYMPHONY_GITHUB_WEBHOOK_SECRET-unset}"
         printf 'CUSTOM_FORGEJO_WRITE_TOKEN=%s\\n' "${CUSTOM_FORGEJO_WRITE_TOKEN-unset}"
+        printf 'XDG_CACHE_HOME=%s\\n' "${XDG_CACHE_HOME-unset}"
+        printf 'UV_CACHE_DIR=%s\\n' "${UV_CACHE_DIR-unset}"
+        printf 'MYVEN_GITLEAKS_CACHE_DIR=%s\\n' "${MYVEN_GITLEAKS_CACHE_DIR-unset}"
       } > "$SYMP_TEST_LOCAL_ENV_TRACE"
 
       while IFS= read -r line; do
@@ -1865,16 +1874,37 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert {:ok, _result} = AppServer.run(workspace, "Inspect worker credentials", issue)
 
-      assert File.read!(trace_file) == """
-             GH_TOKEN=unset
-             GITHUB_TOKEN=unset
-             FORGEJO_TOKEN=forgejo-read-only-token
-             SYMPHONY_TRACKER_READ_TOKEN=unset
-             SYMPHONY_TRACKER_WRITE_TOKEN=unset
-             SYMPHONY_FORGEJO_WEBHOOK_SECRET=unset
-             SYMPHONY_GITHUB_WEBHOOK_SECRET=unset
-             CUSTOM_FORGEJO_WRITE_TOKEN=unset
-             """
+      worker_env =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Map.new(fn line ->
+          [name, value] = String.split(line, "=", parts: 2)
+          {name, value}
+        end)
+
+      assert worker_env["GH_TOKEN"] == "unset"
+      assert worker_env["GITHUB_TOKEN"] == "unset"
+      assert worker_env["FORGEJO_TOKEN"] == "forgejo-read-only-token"
+      assert worker_env["SYMPHONY_TRACKER_READ_TOKEN"] == "unset"
+      assert worker_env["SYMPHONY_TRACKER_WRITE_TOKEN"] == "unset"
+      assert worker_env["SYMPHONY_FORGEJO_WEBHOOK_SECRET"] == "unset"
+      assert worker_env["SYMPHONY_GITHUB_WEBHOOK_SECRET"] == "unset"
+      assert worker_env["CUSTOM_FORGEJO_WRITE_TOKEN"] == "unset"
+
+      xdg_cache = worker_env["XDG_CACHE_HOME"]
+      uv_cache = worker_env["UV_CACHE_DIR"]
+      gitleaks_cache = worker_env["MYVEN_GITLEAKS_CACHE_DIR"]
+      cache_root = Path.dirname(xdg_cache)
+      worker_runtime_dir = Path.dirname(cache_root)
+
+      assert Path.basename(xdg_cache) == "xdg"
+      assert Path.dirname(uv_cache) == cache_root
+      assert Path.basename(uv_cache) == "uv"
+      assert Path.dirname(gitleaks_cache) == cache_root
+      assert Path.basename(gitleaks_cache) == "gitleaks"
+      assert Path.basename(worker_runtime_dir) =~ "symphony-worker-gh-config-"
+      refute File.exists?(worker_runtime_dir)
     after
       File.rm_rf(test_root)
     end

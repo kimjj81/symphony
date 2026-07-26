@@ -1,5 +1,21 @@
 [
   {
+    "id": "ADR-20260726-0008-KVC",
+    "title": "Isolate worker tool caches",
+    "tags": [
+      "orchestration",
+      "codex",
+      "sandbox",
+      "cache",
+      "security",
+      "reliability"
+    ],
+    "status": "Accepted",
+    "date": "2026-07-26",
+    "tldr": "Symphony gives every Codex app-server worker a temporary writable cache root and removes it with the session.",
+    "path": "docs/adr/ADR-20260726-0008-KVC-isolate-worker-tool-caches.md"
+  },
+  {
     "id": "ADR-20260723-0007-RCL",
     "title": "Review budget counts complete automatic rework cycles",
     "tags": [
