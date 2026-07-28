@@ -20,19 +20,23 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     brief = %{
       lane: "Review",
       live_head: nil,
-      unresolved_feedback: ["thread-1", "thread-2"],
+      unresolved_feedback: [
+        %{thread_ref: "thread-1", feedback: "첫 번째 검토 의견"},
+        %{thread_ref: "thread-2", feedback: "두 번째 검토 의견"}
+      ],
       allowed_scope: ["agent runner"],
       focused_verification: ["mix test focused"],
       stop_conditions: ["head drift"],
       transitions: ["clean -> Human Review"]
     }
 
-    assert {:ok, rendered, %{source: :agent, lane: "Review", bytes: bytes}} =
+    assert {:ok, rendered, %{source: :broker, lane: "Review", bytes: bytes}} =
              OrchestrationBrief.normalize_for_test({:ok, brief}, issue)
 
     assert byte_size(rendered) == bytes
     assert rendered =~ "live_head: unknown"
-    assert rendered =~ "thread-1 | thread-2"
+    assert rendered =~ "\"thread_ref\":\"thread-1\""
+    assert rendered =~ "\"thread_ref\":\"thread-2\""
     refute rendered =~ "lane:"
     refute rendered =~ "allowed_scope:"
     refute rendered =~ "transitions:"
@@ -62,93 +66,39 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
              OrchestrationBrief.decode_for_test("[]", issue)
   end
 
-  test "orchestration preflight uses a read-only Codex session and decodes its result" do
-    test_root = test_root("preflight-success")
-    on_exit(fn -> File.rm_rf(test_root) end)
-    workspace_root = Path.join(test_root, "workspaces")
-    workspace = Path.join(workspace_root, "preflight")
-    trace_file = Path.join(test_root, "preflight.trace")
-    File.mkdir_p!(workspace)
+  test "orchestration brief renders a broker snapshot without a Codex preflight session" do
+    issue = review_issue("broker-snapshot")
 
-    brief = %{
-      "live_head" => "abc123",
-      "unresolved_feedback" => [],
-      "focused_verification" => ["mix test focused"],
-      "stop_conditions" => ["head drift"]
+    snapshot = %{
+      live_head: "abc123",
+      top_level_comments: [%{body: "top-level", author: "reviewer"}],
+      reviews: [%{body: "summary", state: "CHANGES_REQUESTED", author: "reviewer"}],
+      inline_comments: [%{body: "inline", path: "apps/api/core/models.py", line: 12, author: "reviewer"}],
+      unresolved_feedback: [%{thread_ref: "thread-1", feedback: "수정 필요"}]
     }
 
-    codex_binary = write_preflight_codex!(test_root, trace_file, {:completed, Jason.encode!(brief)})
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      workspace_root: workspace_root,
-      codex_command: "#{codex_binary} app-server"
-    )
-
-    issue = review_issue("preflight-success")
-
-    assert {:ok, rendered, %{source: :agent, lane: "Review"}} =
-             OrchestrationBrief.generate(workspace, issue)
+    assert {:ok, rendered, %{source: :broker, lane: "Review"}} =
+             OrchestrationBrief.generate("/tmp", issue, snapshot_fetcher: fn _issue_id -> {:ok, snapshot} end)
 
     assert rendered =~ "live_head: abc123"
-    refute rendered =~ "lane:"
-    trace = File.read!(trace_file)
-    assert trace =~ "outputSchema"
-    assert trace =~ "thread/start"
+    assert rendered =~ "thread-1"
+    assert rendered =~ "top-level"
+    assert rendered =~ "GitHub를 조회하거나 변경하지 않음"
   end
 
-  test "orchestration preflight still decodes a legacy embedded agent message" do
-    test_root = test_root("preflight-legacy-success")
-    on_exit(fn -> File.rm_rf(test_root) end)
-    workspace_root = Path.join(test_root, "workspaces")
-    workspace = Path.join(workspace_root, "preflight")
-    trace_file = Path.join(test_root, "preflight.trace")
-    File.mkdir_p!(workspace)
+  test "orchestration brief returns a broker snapshot failure" do
+    snapshot_fetcher = fn _issue -> {:error, {:github_api_status, 401, %{}}} end
 
-    brief = %{
-      "live_head" => "legacy123",
-      "unresolved_feedback" => [],
-      "focused_verification" => ["mix test focused"],
-      "stop_conditions" => ["head drift"]
-    }
-
-    codex_binary =
-      write_preflight_codex!(test_root, trace_file, {:completed_legacy, Jason.encode!(brief)})
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      workspace_root: workspace_root,
-      codex_command: "#{codex_binary} app-server"
-    )
-
-    assert {:ok, rendered, %{source: :agent, lane: "Review"}} =
-             OrchestrationBrief.generate(workspace, review_issue("preflight-legacy-success"))
-
-    assert rendered =~ "live_head: legacy123"
-  end
-
-  test "orchestration preflight returns Codex turn failures" do
-    test_root = test_root("preflight-failure")
-    on_exit(fn -> File.rm_rf(test_root) end)
-    workspace_root = Path.join(test_root, "workspaces")
-    workspace = Path.join(workspace_root, "preflight")
-    trace_file = Path.join(test_root, "preflight.trace")
-    File.mkdir_p!(workspace)
-    codex_binary = write_preflight_codex!(test_root, trace_file, {:failed, "preflight failed"})
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      workspace_root: workspace_root,
-      codex_command: "#{codex_binary} app-server"
-    )
-
-    assert {:error, {:turn_failed, %{"error" => "preflight failed"}}} =
-             OrchestrationBrief.generate(workspace, review_issue("preflight-failure"))
+    assert {:error, {:github_api_status, 401, %{}}} =
+             OrchestrationBrief.generate("/tmp", review_issue("broker-failure"), snapshot_fetcher: snapshot_fetcher)
   end
 
   test "fallback handles an unknown lane deterministically" do
     issue = %{review_issue("unknown-lane") | state: nil}
     fallback = OrchestrationBrief.fallback(issue)
 
-    assert fallback =~ "live_head: use the tracker head metadata"
-    assert fallback =~ "tracker feedback already present in the workflow context"
+    assert fallback =~ "live_head: unknown"
+    assert fallback =~ "broker snapshot unavailable"
     assert fallback =~ "do not query GitHub"
     refute fallback =~ "lane:"
   end
@@ -333,7 +283,12 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: workspace_root,
       codex_command: "#{codex_binary} app-server",
-      orchestration_brief_enabled: true
+      orchestration_brief_enabled: true,
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
     )
 
     enable_authoritative_mode!()
@@ -352,17 +307,11 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
 
     assert :ok =
              AgentRunner.run(issue, nil,
-               brief_generator: fn _workspace, brief_issue ->
-                 send(parent, {:brief_lane, brief_issue.state})
-                 {:ok, "live_head: unknown\nunresolved_feedback: none"}
-               end,
                state_manager_requester: fn intent ->
                  send(parent, {:worker_outcome, intent})
                  {:ok, %{}}
                end
              )
-
-    assert_receive {:brief_lane, "Planned"}
 
     assert_receive {:worker_outcome,
                     %SymphonyElixir.TransitionIntent{
@@ -374,6 +323,8 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
 
     trace = File.read!(trace_file)
     assert trace =~ "Execution mode: implementation"
+    assert trace =~ "Implement the approved issue scope"
+    assert trace =~ "work_item:"
     assert trace =~ "\"implementation_complete\""
     refute trace =~ "\"planning_complete\""
   end
@@ -865,7 +816,7 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     refute_receive {:unexpected_state_update, _, _}
   end
 
-  test "dispatch metadata restores Rework for fallback, profile selection, and transition" do
+  test "dispatch snapshot failure hands Rework to Human Review without starting a worker" do
     test_root = test_root("rework-fallback")
     on_exit(fn -> File.rm_rf(test_root) end)
     workspace_root = Path.join(test_root, "workspaces")
@@ -893,8 +844,6 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
         metadata: %{"symphony_dispatch_state" => "Rework"}
     }
 
-    states = Agent.start_link(fn -> ["Review", "Human Review"] end) |> elem(1)
-    on_exit(fn -> if Process.alive?(states), do: Agent.stop(states) end)
     parent = self()
 
     assert :ok =
@@ -903,21 +852,21 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
                  send(parent, {:brief_lane, brief_issue.state})
                  {:error, :preflight_unavailable}
                end,
-               issue_state_fetcher: fn [_issue_id] ->
-                 next_state = Agent.get_and_update(states, fn [next | rest] -> {next, rest} end)
-                 {:ok, [%{issue | state: next_state, metadata: %{}}]}
+               tracker_commenter: fn issue_id, body ->
+                 send(parent, {:snapshot_handoff_comment, issue_id, body})
+                 :ok
+               end,
+               tracker_state_updater: fn issue_id, state ->
+                 send(parent, {:snapshot_handoff_state, issue_id, state})
+                 :ok
                end
              )
 
     assert_receive {:brief_lane, "Rework"}
-    trace = File.read!(trace_file)
-    assert trace =~ "Execution mode: rework"
-    assert trace =~ "State: Rework"
-    assert trace =~ "tracker feedback already present in the workflow context"
-    assert trace =~ "return the matching semantic outcome"
-    assert trace =~ "Symphony decides and applies the tracker transition"
-    assert trace =~ "ARGV:--profile rework app-server"
-    assert count_lines(trace, "RUN:") == 2
+    assert_receive {:snapshot_handoff_comment, "github:pr:rework-fallback", body}
+    assert body =~ "broker_dispatch_snapshot_failed"
+    assert_receive {:snapshot_handoff_state, "github:pr:rework-fallback", "Human Review"}
+    refute File.exists?(trace_file)
   end
 
   test "worker metrics accept current camelCase token usage notifications" do
@@ -949,7 +898,7 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     assert metrics.total_tokens == 16
   end
 
-  test "Merging uses full verification while a failed brief uses the compact fallback" do
+  test "Merging does not start a worker when the broker snapshot is unavailable" do
     test_root = test_root("merging")
     on_exit(fn -> File.rm_rf(test_root) end)
     workspace_root = Path.join(test_root, "workspaces")
@@ -965,19 +914,25 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     )
 
     issue = %{review_issue("merging") | state: "Merging", labels: ["sym:merging"]}
+    parent = self()
 
     assert :ok =
              AgentRunner.run(issue, nil,
                brief_generator: fn _workspace, _issue -> {:error, :preflight_unavailable} end,
-               issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+               tracker_commenter: fn issue_id, body ->
+                 send(parent, {:snapshot_handoff_comment, issue_id, body})
+                 :ok
+               end,
+               tracker_state_updater: fn issue_id, state ->
+                 send(parent, {:snapshot_handoff_state, issue_id, state})
+                 :ok
+               end
              )
 
-    trace = File.read!(trace_file)
-    assert trace =~ "Verification tier: full"
-    assert trace =~ "full local verification bundle"
-    assert trace =~ "Symphony validates required CI"
-    assert trace =~ "Execution mode: merge"
-    assert count_lines(trace, "RUN:") == 1
+    assert_receive {:snapshot_handoff_comment, "github:pr:merging", body}
+    assert body =~ "broker_dispatch_snapshot_failed"
+    assert_receive {:snapshot_handoff_state, "github:pr:merging", "Human Review"}
+    refute File.exists?(trace_file)
   end
 
   defp review_issue(suffix) do
@@ -1036,70 +991,6 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
           printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-'"$$"'"}}}'
           printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"inputTokens":12,"cachedInputTokens":7,"totalTokens":16}}}}'
           printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-'"$$"'","items":[],"status":"completed"}}}'
-          ;;
-      esac
-    done
-    """)
-
-    File.chmod!(codex_binary, 0o755)
-    codex_binary
-  end
-
-  defp write_preflight_codex!(test_root, trace_file, outcome) do
-    codex_binary = Path.join(test_root, "fake-preflight-codex")
-
-    notification =
-      case outcome do
-        {:completed, text} ->
-          [
-            Jason.encode!(%{
-              "method" => "item/completed",
-              "params" => %{"item" => %{"type" => "agentMessage", "text" => text}}
-            }),
-            Jason.encode!(%{
-              "method" => "turn/completed",
-              "params" => %{
-                "turn" => %{
-                  "id" => "turn-preflight",
-                  "items" => [],
-                  "status" => "completed"
-                }
-              }
-            })
-          ]
-          |> Enum.join("\n")
-
-        {:completed_legacy, text} ->
-          Jason.encode!(%{
-            "method" => "turn/completed",
-            "params" => %{
-              "turn" => %{
-                "id" => "turn-preflight",
-                "items" => [%{"type" => "agentMessage", "text" => text}],
-                "status" => "completed"
-              }
-            }
-          })
-
-        {:failed, reason} ->
-          Jason.encode!(%{"method" => "turn/failed", "params" => %{"error" => reason}})
-      end
-
-    File.write!(codex_binary, """
-    #!/bin/sh
-    trace_file=#{inspect(trace_file)}
-    while IFS= read -r line; do
-      printf '%s\n' "$line" >> "$trace_file"
-      case "$line" in
-        *'"method":"initialize"'*)
-          printf '%s\n' '{"id":1,"result":{}}'
-          ;;
-        *'"method":"thread/start"'*)
-          printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-preflight"}}}'
-          ;;
-        *'"method":"turn/start"'*)
-          printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-preflight"}}}'
-          printf '%s\n' '#{notification}'
           ;;
       esac
     done

@@ -1000,6 +1000,11 @@ defmodule SymphonyElixir.Forgejo.Client do
 
   defp expected_matches?(_, _), do: false
 
+  @spec close_review_threads(String.t(), String.t(), [map()], String.t()) :: {:handoff, atom(), map()}
+  def close_review_threads(issue_id, expected_head_oid, updates, _marker) do
+    {:handoff, :review_thread_closeout_unsupported, %{issue_id: issue_id, expected_head_oid: expected_head_oid, updates: Enum.map(updates, &review_thread_ref/1), provider: :forgejo}}
+  end
+
   defp terminal_state?(state), do: normalize(state) in ["done", "canceled", "duplicate"]
   defp pull_merged?(raw), do: raw["merged"] == true
 
@@ -1007,6 +1012,8 @@ defmodule SymphonyElixir.Forgejo.Client do
     do: String.contains?(body, marker)
 
   defp comment_has_marker?(_, _), do: false
+
+  defp review_thread_ref(update), do: Map.get(update, :thread_ref) || Map.get(update, "thread_ref")
 
   defp request(method, scope, path, opts \\ []) do
     with {:ok, tracker} <- tracker_config() do

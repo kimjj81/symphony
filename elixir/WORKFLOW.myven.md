@@ -250,10 +250,6 @@ agent:
 codex:
   command: codex app-server
   task_profiles:
-    orchestration:
-      command: codex --config 'model="gpt-5.6-terra"' --config model_reasoning_effort=medium app-server
-      model: gpt-5.6-terra
-      effort: medium
     planning:
       command: codex --config 'model="gpt-5.6-sol"' --config model_reasoning_effort=high app-server
       model: gpt-5.6-sol
@@ -372,8 +368,8 @@ Instructions:
 11. If an issue already has an open linked implementation PR, do not duplicate repository work in the issue lane. Return `implementation_complete` with the linked PR status and recommended source-issue handoff. A waiting feature-to-main integration PR does not block the next explicitly requested child PR.
 12. Planned pull requests run after Symphony projects `In Progress`. Run focused verification, complete the self-review checklist, commit the approved changes locally, and return `implementation_complete`. Include the exact detached HEAD OID, commands/results, and the Korean transition summary; Symphony's broker verifies and publishes the commit before moving the PR to Review and keeping the source issue in Human Review.
 13. Review pull requests run after Symphony projects `Reviewing`. Review only. Return `clean_review` when no required improvement exists, or `review_findings` with actionable findings. Symphony applies Human Review or Rework according to the review-verdict budget and synchronizes the source issue.
-14. Rework pull requests run after Symphony projects `Reworking`. Use the orchestration brief's live head, top-level comments, review summaries, inline review comments, and unresolved threads as the tracker snapshot for the dispatch; do not query or mutate GitHub. Address only actionable feedback, commit the result locally in the detached worktree, and return `rework_complete` with the exact detached HEAD OID. Do not push: Symphony's broker compares the worker commit with the live PR head, performs a verified non-force publish or deterministic integration, and hands off only when that integration needs human judgment.
-15. An inline-comment webhook is a rework signal, not proof that a code change is needed. A justified no-change result still returns `rework_complete` with the evidence Symphony should publish.
+14. Rework pull requests run after Symphony projects `Reworking`. Use the orchestration brief's live head, top-level comments, review summaries, inline review comments, and unresolved threads as the tracker snapshot for the dispatch; do not query or mutate GitHub. Address only actionable feedback, commit the result locally in the detached worktree, and return `rework_complete` with the exact detached HEAD OID. For every supplied unresolved inline thread, return its opaque `thread_ref`, Korean reply, focused evidence, and `fixed` or `needs_human` disposition in `review_thread_updates`. Do not push: Symphony's broker compares the worker commit with the live PR head, performs a verified non-force publish or deterministic integration, posts the broker-owned replies, and resolves only verified `fixed` threads before it may transition state.
+15. An inline-comment webhook is a rework signal, not proof that a code change is needed. A justified no-change result uses `needs_human`: Symphony posts the explanation but keeps the thread open and hands off. New, unaccounted, stale, or provider-unsupported inline threads block automatic completion.
 16. If implementation becomes too large, stop before committing and return `handoff_required` with the Korean split proposal: "이 PR은 너무 커졌으므로 여기까지 commit하지 않고 분할 제안".
 17. Merging is an approved verification lane. Use the existing workspace and branch, fetch `origin/main`, rebase it onto the fetched `origin/main`, and inspect changed user-facing text for i18n compliance. A PR is broad-scope when its diff or rebase-conflict resolution touches two or more stable work units, a shared package or repository-wide configuration, a generated API contract, a schema or migration, CI/local-stack tooling, or runtime/deployment infrastructure. A broad-scope PR MUST pass this full local verification bundle after the rebase and before returning `merge_ready`:
     ```bash
@@ -393,7 +389,7 @@ Instructions:
 18. Before Merging, other lanes run only focused verification and use any CI snapshot supplied by the orchestration brief without polling GitHub. Do not expand into full API/Web/OpenAPI/Astro suites, Compose startup, seed, or browser setup unless the exact change cannot be verified more narrowly. Retry a plausible environment failure at most once, then report partial evidence.
 19. Human Review and Waiting are inactive retention/coordination states and must not execute work. Cleanup is allowed only after Done, Canceled, or Duplicate.
 20. Preserve `docs/draft` workpads through Human Review. Before returning `merge_ready`, either move durable content into `docs/architecture`, `docs/design-system`, or `docs/adr`, or remove the draft-only workpad.
-21. The orchestration preflight owns the long conductor, review, and GitHub-review reference reading. Its output is an evidence snapshot only: it MUST NOT redefine the worker's execution lane, write authority, allowed scope, tracker transition, or semantic outcome. Symphony derives those fields from the dispatched tracker item. Do not reopen those documents unless the brief names a missing, task-critical reference.
+21. Symphony's broker owns the orchestration snapshot. It reads the live PR head, general comments, review summaries, inline comments, and unresolved provider thread IDs using broker credentials before dispatch. Its output is evidence only: it MUST NOT redefine the worker's execution lane, write authority, allowed scope, tracker transition, or semantic outcome. Workers receive this snapshot and MUST NOT query GitHub.
 22. Return `blocked` for a retryable external/environment blocker and `handoff_required` when human judgment, scope split, stale head, or exhausted safe retry requires intervention. Do not invent a target state.
 
 Final output contract:
@@ -402,5 +398,6 @@ Final output contract:
 - `outcome` MUST be one of `planning_complete`, `implementation_complete`, `rework_complete`, `clean_review`, `review_findings`, `merge_ready`, `blocked`, or `handoff_required`.
 - `head_oid` is the observed Git head for pull-request work and `null` for issue-only planning.
 - `evidence` is a list of concise checks, findings, artifacts, or proposed tracker content.
+- `review_thread_updates` is always an array; outside `rework_complete` it MUST be empty, while Rework accounts for every supplied unresolved inline thread with `thread_ref`, `fixed` or `needs_human`, Korean reply, and focused evidence.
 - `summary_ko` is the Korean comment/body summary Symphony may publish with its idempotency marker.
 - Never include a target state or target label in the output.

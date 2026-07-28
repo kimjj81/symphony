@@ -548,7 +548,7 @@ defmodule SymphonyElixir.GitHubClientTest do
       {:get, "/repos/studiojin-dev/myven/pulls/58", github_response(503, %{"message" => "unavailable"})}
     ])
 
-    assert {:error, {:github_api_status, 503, %{"message" => "unavailable"}}} =
+    assert {:error, {:github_retryable_api_status, 503, %{"message" => "unavailable"}}} =
              Client.fetch_issue_states_by_ids(["github:pr:58"])
 
     assert_github_responses_consumed()
@@ -1676,6 +1676,373 @@ defmodule SymphonyElixir.GitHubClientTest do
              Client.state_from_labels_for_test(["sym:todo", "sym:rework"])
 
     assert Enum.sort(states) == ["Rework", "Todo"]
+  end
+
+  test "builds a broker-owned dispatch snapshot with opaque unresolved thread IDs" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    thread = %{
+      "id" => "thread-596",
+      "isResolved" => false,
+      "comments" => %{"nodes" => [%{"body" => "모델 소유권을 옮겨 주세요."}]}
+    }
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})},
+      {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [%{"body" => "일반 댓글", "user" => %{"login" => "reviewer"}}])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [%{"body" => "요약", "state" => "CHANGES_REQUESTED", "user" => %{"login" => "reviewer"}}])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [%{"body" => "inline", "path" => "apps/api/core/models.py", "line" => 42, "user" => %{"login" => "reviewer"}}])},
+      {:post, "/graphql", github_response(200, review_threads_response("head-596", [thread]))}
+    ])
+
+    assert {:ok, snapshot} = Client.fetch_dispatch_snapshot("github:pr:596")
+    assert snapshot.live_head == "head-596"
+    assert snapshot.top_level_comments == [%{body: "일반 댓글", author: "reviewer"}]
+    assert snapshot.reviews == [%{body: "요약", state: "CHANGES_REQUESTED", author: "reviewer"}]
+    assert snapshot.inline_comments == [%{body: "inline", path: "apps/api/core/models.py", line: 42, author: "reviewer"}]
+    assert snapshot.unresolved_feedback == [%{thread_ref: "thread-596", feedback: "모델 소유권을 옮겨 주세요."}]
+    assert_github_responses_consumed()
+  end
+
+  test "builds a deterministic issue dispatch snapshot without a GitHub request" do
+    issue = %Issue{
+      id: "github:issue:529",
+      identifier: "Issue #529",
+      title: "Broker-owned issue dispatch",
+      description: "Use the dispatch context without calling GitHub.",
+      state: "Planned",
+      kind: :issue,
+      url: "https://github.com/studiojin-dev/myven/issues/529",
+      labels: ["sym:planned"]
+    }
+
+    assert {:ok, snapshot} = Client.fetch_dispatch_snapshot(issue)
+    assert snapshot.work_item.title == "Broker-owned issue dispatch"
+    assert snapshot.work_item.description == "Use the dispatch context without calling GitHub."
+    assert snapshot.live_head == nil
+    assert snapshot.unresolved_feedback == []
+  end
+
+  test "classifies REST rate limiting as retryable and ordinary forbidden responses as non-retryable" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(429, %{"message" => "API rate limit exceeded"})}
+    ])
+
+    assert {:error, {:github_retryable_api_status, 429, %{"message" => "API rate limit exceeded"}}} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(403, %{"message" => "secondary rate limit"})}
+    ])
+
+    assert {:error, {:github_retryable_api_status, 403, %{"message" => "secondary rate limit"}}} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(403, %{"message" => "Resource not accessible by integration"})}
+    ])
+
+    assert {:error, {:github_api_status, 403, %{"message" => "Resource not accessible by integration"}}} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+  end
+
+  test "classifies GraphQL rate limiting as retryable" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})},
+      {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [])},
+      {:post, "/graphql", github_response(403, %{"message" => "API rate limit exceeded"})}
+    ])
+
+    assert {:error, {:github_retryable_api_status, 403, %{"message" => "API rate limit exceeded"}}} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+
+    assert_github_responses_consumed()
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})},
+      {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [])},
+      {:post, "/graphql", github_response(429, %{"message" => "API rate limit exceeded"})}
+    ])
+
+    assert {:error, {:github_retryable_api_status, 429, %{"message" => "API rate limit exceeded"}}} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+
+    assert_github_responses_consumed()
+  end
+
+  test "fails a dispatch snapshot when REST and GraphQL heads differ" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})},
+      {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [])},
+      {:post, "/graphql", github_response(200, review_threads_response("newer-head", []))}
+    ])
+
+    assert {:error, {:dispatch_snapshot_head_drift, %{pull_head: "head-596", review_head: "newer-head"}}} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+  end
+
+  test "replies to and resolves every fixed review thread at the published head" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    thread = %{"id" => "thread-1", "isResolved" => false, "comments" => %{"nodes" => []}}
+
+    stub_github_requests(self(), [
+      {:post, "/graphql", github_response(200, review_threads_response("published-head", [thread]))},
+      {:post, "/graphql", github_response(200, review_thread_reply_response())},
+      {:post, "/graphql", github_response(200, review_thread_resolve_response())},
+      {:post, "/graphql", github_response(200, review_threads_response("published-head", [Map.put(thread, "isResolved", true)]))}
+    ])
+
+    update = %{
+      thread_ref: "thread-1",
+      disposition: "fixed",
+      reply_ko: "수정했고 집중 검증을 통과했습니다.",
+      evidence: ["mix test"]
+    }
+
+    assert {:applied, %{resolved: ["thread-1"]}} =
+             Client.close_review_threads("github:pr:513", "published-head", [update], "publication:513")
+
+    assert_receive {:github_request, :post, "/graphql", nil, reply_request}
+    assert reply_request.query =~ "SymphonyReviewThreads"
+
+    assert_receive {:github_request, :post, "/graphql", nil, reply_mutation}
+    assert reply_mutation.query =~ "SymphonyReplyToReviewThread"
+    assert reply_mutation.variables.input.body =~ "수정했고 집중 검증을 통과했습니다."
+    assert reply_mutation.variables.input.body =~ "sym-review-thread:publication:513:thread-1"
+
+    assert_receive {:github_request, :post, "/graphql", nil, resolve_mutation}
+    assert resolve_mutation.query =~ "SymphonyResolveReviewThread"
+    assert resolve_mutation.variables.input.threadId == "thread-1"
+
+    assert_receive {:github_request, :post, "/graphql", nil, final_snapshot}
+    assert final_snapshot.query =~ "SymphonyReviewThreads"
+    assert_github_responses_consumed()
+  end
+
+  test "posts every closeout reply, resolves fixed threads, and leaves needs_human unresolved" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    human_thread = %{"id" => "thread-2", "isResolved" => false, "comments" => %{"nodes" => []}}
+    fixed_thread = %{"id" => "thread-3", "isResolved" => false, "comments" => %{"nodes" => []}}
+
+    stub_github_requests(self(), [
+      {:post, "/graphql", github_response(200, review_threads_response("published-head", [human_thread, fixed_thread]))},
+      {:post, "/graphql", github_response(200, review_thread_reply_response())},
+      {:post, "/graphql", github_response(200, review_thread_reply_response())},
+      {:post, "/graphql", github_response(200, review_thread_resolve_response())}
+    ])
+
+    updates = [
+      %{
+        thread_ref: "thread-2",
+        disposition: "needs_human",
+        reply_ko: "현재 계약과 충돌하므로 사람 검토가 필요합니다.",
+        evidence: ["contract inspection"]
+      },
+      %{
+        thread_ref: "thread-3",
+        disposition: "fixed",
+        reply_ko: "수정했고 집중 검증을 통과했습니다.",
+        evidence: ["mix test"]
+      }
+    ]
+
+    handoff = %{
+      replied: ["thread-2", "thread-3"],
+      needs_human: [{"thread-2", :review_thread_needs_human}]
+    }
+
+    assert {:handoff, :review_thread_needs_human, ^handoff} =
+             Client.close_review_threads("github:pr:513", "published-head", updates, "publication:513")
+
+    assert_receive {:github_request, :post, "/graphql", nil, _snapshot}
+    assert_receive {:github_request, :post, "/graphql", nil, human_reply_mutation}
+    assert human_reply_mutation.query =~ "SymphonyReplyToReviewThread"
+    assert_receive {:github_request, :post, "/graphql", nil, fixed_reply_mutation}
+    assert fixed_reply_mutation.query =~ "SymphonyReplyToReviewThread"
+    assert_receive {:github_request, :post, "/graphql", nil, resolve_mutation}
+    assert resolve_mutation.query =~ "SymphonyResolveReviewThread"
+    assert resolve_mutation.variables.input.threadId == "thread-3"
+    assert_github_responses_consumed()
+  end
+
+  test "retries a failed resolve without duplicating its already-posted reply" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    thread = %{"id" => "thread-1", "isResolved" => false, "comments" => %{"nodes" => []}}
+    marker = "<!-- sym-review-thread:publication:513:thread-1 -->"
+
+    update = %{
+      thread_ref: "thread-1",
+      disposition: "fixed",
+      reply_ko: "수정했고 집중 검증을 통과했습니다.",
+      evidence: ["mix test"]
+    }
+
+    stub_github_requests(self(), [
+      {:post, "/graphql", github_response(200, review_threads_response("published-head", [thread]))},
+      {:post, "/graphql", github_response(200, review_thread_reply_response())},
+      {:post, "/graphql", github_response(500, %{})}
+    ])
+
+    retry_progress = %{
+      completed: [],
+      needs_human: [],
+      replies: [%{thread_ref: "thread-1", reply: :posted}]
+    }
+
+    assert {:retry, {:github_retryable_api_status, 500, %{}}, ^retry_progress} =
+             Client.close_review_threads("github:pr:513", "published-head", [update], "publication:513")
+
+    assert_receive {:github_request, :post, "/graphql", nil, _initial_snapshot}
+    assert_receive {:github_request, :post, "/graphql", nil, reply_mutation}
+    assert reply_mutation.query =~ "SymphonyReplyToReviewThread"
+    assert_receive {:github_request, :post, "/graphql", nil, resolve_mutation}
+    assert resolve_mutation.query =~ "SymphonyResolveReviewThread"
+    assert_github_responses_consumed()
+
+    thread_with_marker = put_in(thread, ["comments", "nodes"], [%{"body" => marker}])
+
+    stub_github_requests(self(), [
+      {:post, "/graphql", github_response(200, review_threads_response("published-head", [thread_with_marker]))},
+      {:post, "/graphql", github_response(200, review_thread_resolve_response())},
+      {:post, "/graphql", github_response(200, review_threads_response("published-head", [Map.put(thread_with_marker, "isResolved", true)]))}
+    ])
+
+    assert {:applied, %{resolved: ["thread-1"]}} =
+             Client.close_review_threads("github:pr:513", "published-head", [update], "publication:513")
+
+    assert_receive {:github_request, :post, "/graphql", nil, _retry_snapshot}
+    assert_receive {:github_request, :post, "/graphql", nil, retry_resolve_mutation}
+    assert retry_resolve_mutation.query =~ "SymphonyResolveReviewThread"
+    assert_receive {:github_request, :post, "/graphql", nil, _final_snapshot}
+    assert_github_responses_consumed()
+  end
+
+  test "uses the GitHub Enterprise GraphQL endpoint for an api v3 REST endpoint" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://github.example/api/v3",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(self(), [
+      {:post, "/api/graphql", github_response(200, review_threads_response("published-head", []))},
+      {:post, "/api/graphql", github_response(200, review_threads_response("published-head", []))}
+    ])
+
+    assert {:applied, %{resolved: []}} =
+             Client.close_review_threads("github:pr:513", "published-head", [], "publication:513")
+
+    assert_receive {:github_request, :post, "/api/graphql", nil, _initial_snapshot}
+    assert_receive {:github_request, :post, "/api/graphql", nil, _final_snapshot}
+    assert_github_responses_consumed()
+  end
+
+  test "fails closed when the published head drifts before review closeout" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(self(), [
+      {:post, "/graphql", github_response(200, review_threads_response("newer-head", []))}
+    ])
+
+    assert {:conflict, %{reason: %{expected_head_oid: "published-head", actual_head_oid: "newer-head"}}} =
+             Client.close_review_threads("github:pr:513", "published-head", [], "publication:513")
+
+    assert_github_responses_consumed()
+  end
+
+  defp review_threads_response(head_oid, threads) do
+    %{
+      "data" => %{
+        "repository" => %{
+          "pullRequest" => %{
+            "headRefOid" => head_oid,
+            "reviewThreads" => %{"nodes" => threads, "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}}
+          }
+        }
+      }
+    }
+  end
+
+  defp review_thread_reply_response do
+    %{
+      "data" => %{
+        "addPullRequestReviewThreadReply" => %{"comment" => %{"id" => "reply-1", "body" => "reply"}}
+      }
+    }
+  end
+
+  defp review_thread_resolve_response do
+    %{
+      "data" => %{
+        "resolveReviewThread" => %{"thread" => %{"id" => "thread-1", "isResolved" => true}}
+      }
+    }
   end
 
   defp github_response(status, body), do: {:ok, %Req.Response{status: status, body: body}}

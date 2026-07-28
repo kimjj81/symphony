@@ -22,6 +22,9 @@ defmodule SymphonyElixir.Forgejo.Adapter do
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(ids), do: client_module().fetch_issue_states_by_ids(ids)
 
+  @spec fetch_dispatch_snapshot(SymphonyElixir.Tracker.Issue.t()) :: {:ok, map()} | {:error, term()}
+  def fetch_dispatch_snapshot(issue), do: {:error, {:dispatch_snapshot_unsupported, :forgejo, issue.id}}
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body), do: client_module().create_comment(issue_id, body)
 
@@ -45,6 +48,10 @@ defmodule SymphonyElixir.Forgejo.Adapter do
           {:applied, map()} | {:conflict, map()} | {:error, map()}
   def merge_pull_request(issue_id, expected_head_oid),
     do: client_module().merge_pull_request(issue_id, expected_head_oid)
+
+  @spec close_review_threads(String.t(), String.t(), [map()], String.t()) :: {:handoff, atom(), map()}
+  def close_review_threads(issue_id, expected_head_oid, updates, marker),
+    do: client_module().close_review_threads(issue_id, expected_head_oid, updates, marker)
 
   defp client_module do
     Application.get_env(:symphony_elixir, :forgejo_client_module, Client)

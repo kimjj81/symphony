@@ -810,11 +810,12 @@ Important nuance:
 
 Workflows MAY enable orchestration briefs for bounded PR review/rework cycles:
 
-- A read-only orchestration preflight runs once per worker run and condenses the rendered workflow,
-  relevant repository skills/references, live head, and unresolved feedback into an in-memory brief
-  no larger than 8 KiB.
-- If preflight generation fails or exceeds the limit, the worker uses a deterministic compact brief;
-  it MUST NOT make every worker reread the long source documents.
+- The broker reads the live PR head, comments, reviews, inline comments, and unresolved feedback
+  once per worker run, then renders an in-memory brief no larger than 8 KiB. Workers receive that
+  immutable snapshot and never query the tracker directly.
+- If broker snapshot generation fails or exceeds the limit, no worker starts. Retryable failures use
+  the bounded dispatch retry policy; missing authority, unsupported providers, stale heads, or an
+  exhausted retry budget hand off to Human Review.
 - Each briefed worker turn starts a fresh coding-agent thread and receives only tracker identity,
   the brief, the current review-verdict counter, and the verification tier.
 - Briefed continuation is transition-aware rather than based on active state alone. Implementation or

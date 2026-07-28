@@ -65,6 +65,9 @@ defmodule SymphonyElixir.Linear.Adapter do
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids), do: client_module().fetch_issue_states_by_ids(issue_ids)
 
+  @spec fetch_dispatch_snapshot(SymphonyElixir.Tracker.Issue.t()) :: {:ok, map()} | {:error, term()}
+  def fetch_dispatch_snapshot(issue), do: {:error, {:dispatch_snapshot_unsupported, :linear, issue.id}}
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do
     with {:ok, response} <- client_module().graphql(@create_comment_mutation, %{issueId: issue_id, body: body}),
@@ -97,6 +100,16 @@ defmodule SymphonyElixir.Linear.Adapter do
       :ok -> :applied
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  @spec close_review_threads(String.t(), String.t(), [map()], String.t()) :: {:handoff, atom(), map()}
+  def close_review_threads(issue_id, expected_head_oid, _updates, _marker) do
+    unsupported_review_thread_closeout(issue_id, expected_head_oid)
+  end
+
+  defp unsupported_review_thread_closeout(issue_id, expected_head_oid) do
+    details = %{issue_id: issue_id, expected_head_oid: expected_head_oid, provider: :linear}
+    {:handoff, :review_thread_closeout_unsupported, details}
   end
 
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}

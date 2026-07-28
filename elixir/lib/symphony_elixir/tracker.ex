@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
+  @callback fetch_dispatch_snapshot(Issue.t()) :: {:ok, map()} | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback create_comment_once(String.t(), String.t(), String.t()) ::
               :applied | :already_applied | {:error, term()}
@@ -21,6 +22,8 @@ defmodule SymphonyElixir.Tracker do
   @callback create_pull_request_for_issue(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
   @callback merge_pull_request(String.t(), String.t()) ::
               {:applied, map()} | {:conflict, map()} | {:error, map()}
+  @callback close_review_threads(String.t(), String.t(), [map()], String.t()) ::
+              {:applied, map()} | {:handoff, term(), map()} | {:retry, term(), map()} | {:conflict, map()}
 
   @spec preflight() :: :ok | {:error, term()}
   def preflight, do: adapter().preflight()
@@ -50,6 +53,14 @@ defmodule SymphonyElixir.Tracker do
   def fetch_issue_states_by_ids(issue_ids) do
     with :ok <- validate_issue_providers(issue_ids) do
       adapter().fetch_issue_states_by_ids(issue_ids)
+    end
+  end
+
+  @doc "Reads broker-owned live evidence for a worker dispatch."
+  @spec fetch_dispatch_snapshot(Issue.t()) :: {:ok, map()} | {:error, term()}
+  def fetch_dispatch_snapshot(%Issue{id: issue_id} = issue) when is_binary(issue_id) do
+    with :ok <- validate_issue_provider(issue_id) do
+      adapter().fetch_dispatch_snapshot(issue)
     end
   end
 
@@ -107,6 +118,16 @@ defmodule SymphonyElixir.Tracker do
       {:ok, :ok} -> adapter().merge_pull_request(issue_id, expected_head_oid)
       {:ok, {:error, reason}} -> {:error, %{stage: :preflight, reason: reason}}
       {{:error, reason}, _} -> {:error, %{stage: :validate, reason: reason}}
+    end
+  end
+
+  @spec close_review_threads(String.t(), String.t(), [map()], String.t()) ::
+          {:applied, map()} | {:handoff, term(), map()} | {:retry, term(), map()} | {:conflict, map()}
+  def close_review_threads(issue_id, expected_head_oid, updates, marker) do
+    case {validate_issue_provider(issue_id), write_ready?()} do
+      {:ok, :ok} -> adapter().close_review_threads(issue_id, expected_head_oid, updates, marker)
+      {:ok, {:error, reason}} -> {:handoff, :review_thread_closeout_unsupported, %{issue_id: issue_id, reason: reason}}
+      {{:error, reason}, _} -> {:conflict, %{issue_id: issue_id, reason: reason}}
     end
   end
 

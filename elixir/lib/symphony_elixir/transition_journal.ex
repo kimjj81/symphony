@@ -13,6 +13,7 @@ defmodule SymphonyElixir.TransitionJournal do
     :received,
     :decided,
     :required_comment_applied,
+    :review_threads_applied,
     :projection_applied,
     :verified,
     :retrying
@@ -56,6 +57,7 @@ defmodule SymphonyElixir.TransitionJournal do
           :received
           | :decided
           | :required_comment_applied
+          | :review_threads_applied
           | :projection_applied
           | :verified
           | :retrying
@@ -288,12 +290,13 @@ defmodule SymphonyElixir.TransitionJournal do
   defp valid_phase_step?(:received, phase) when phase in [:decided, :retrying], do: true
 
   defp valid_phase_step?(:decided, phase)
-       when phase in [:required_comment_applied, :projection_applied, :verified, :retrying],
+       when phase in [:required_comment_applied, :review_threads_applied, :projection_applied, :verified, :retrying],
        do: true
 
-  defp valid_phase_step?(:required_comment_applied, phase) when phase in [:projection_applied, :retrying], do: true
+  defp valid_phase_step?(:required_comment_applied, phase) when phase in [:review_threads_applied, :projection_applied, :retrying], do: true
+  defp valid_phase_step?(:review_threads_applied, phase) when phase in [:projection_applied, :retrying], do: true
   defp valid_phase_step?(:projection_applied, phase) when phase in [:verified, :retrying], do: true
-  defp valid_phase_step?(:retrying, phase) when phase in [:decided, :required_comment_applied, :projection_applied, :verified], do: true
+  defp valid_phase_step?(:retrying, phase) when phase in [:decided, :required_comment_applied, :review_threads_applied, :projection_applied, :verified], do: true
   defp valid_phase_step?(_current, _next), do: false
 
   defp write_event(%State{} = state, transition_id, phase, data) do

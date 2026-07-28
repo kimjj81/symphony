@@ -19,6 +19,9 @@ defmodule SymphonyElixir.GitHub.Adapter do
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids), do: client_module().fetch_issue_states_by_ids(issue_ids)
 
+  @spec fetch_dispatch_snapshot(SymphonyElixir.Tracker.Issue.t()) :: {:ok, map()} | {:error, term()}
+  def fetch_dispatch_snapshot(issue), do: client_module().fetch_dispatch_snapshot(issue)
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body), do: client_module().create_comment(issue_id, body)
 
@@ -39,6 +42,11 @@ defmodule SymphonyElixir.GitHub.Adapter do
   @spec merge_pull_request(String.t(), String.t()) :: {:applied, map()} | {:conflict, map()} | {:error, map()}
   def merge_pull_request(issue_id, expected_head_oid),
     do: client_module().merge_pull_request(issue_id, expected_head_oid)
+
+  @spec close_review_threads(String.t(), String.t(), [map()], String.t()) ::
+          {:applied, map()} | {:handoff, term(), map()} | {:retry, term(), map()} | {:conflict, map()}
+  def close_review_threads(issue_id, expected_head_oid, updates, marker),
+    do: client_module().close_review_threads(issue_id, expected_head_oid, updates, marker)
 
   @spec sync_webhook_state(String.t(), String.t(), map()) :: :ok | {:error, term()}
   def sync_webhook_state(event, action, payload), do: client_module().sync_webhook_state(event, action, payload)

@@ -967,7 +967,11 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
         result: :handoff,
         reason: ":publication_rebase_conflict",
         state_transition_id: transition_id,
-        provenance: %{live_head_oid: nil, branch: "review-head", integration: :handoff}
+        provenance: %{live_head_oid: nil, branch: "review-head", integration: :handoff},
+        review_thread_closeout: %{
+          replied: ["thread-needs-human"],
+          needs_human: [{"thread-needs-human", :review_thread_needs_human}]
+        }
       })
 
     record_publication_receipt!(journal, publication_id, data, :projection_applied)
@@ -975,7 +979,8 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
     assert {:noreply, state} = Orchestrator.handle_continue(:replay_transition_journal, empty_state())
     assert %AppliedTransition{to_state: "Human Review"} = state.last_transition
     assert_receive {:memory_tracker_state_projection, ^issue_id, "Rework", "Human Review"}
-    assert {:ok, %{phase: :verified}} = TransitionJournal.snapshot(journal, publication_id)
+    assert {:ok, %{phase: :verified, history: history}} = TransitionJournal.snapshot(journal, publication_id)
+    assert Enum.count(history, &(&1.phase == :review_threads_applied)) == 1
     assert {:ok, %{phase: :verified}} = TransitionJournal.snapshot(journal, transition_id)
 
     assert {:noreply, _state} = Orchestrator.handle_continue(:replay_transition_journal, state)
@@ -1129,6 +1134,10 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
 
     case terminal_phase do
       :projection_applied ->
+        if is_map(data[:review_thread_closeout]) do
+          assert {:ok, _} = TransitionJournal.record(journal, publication_id, :review_threads_applied, data)
+        end
+
         assert {:ok, _} = TransitionJournal.record(journal, publication_id, :projection_applied, data)
 
       :retrying ->

@@ -86,6 +86,19 @@ defmodule SymphonyElixir.TransitionJournalTest do
     assert :ok = TransitionJournal.close(journal)
   end
 
+  test "records review-thread closeout before publication projection", %{path: path} do
+    {:ok, journal} = TransitionJournal.start_link(path: path)
+
+    assert {:ok, _} = TransitionJournal.record(journal, "publication-closeout", :received)
+    assert {:ok, _} = TransitionJournal.record(journal, "publication-closeout", :decided)
+
+    assert {:ok, _} =
+             TransitionJournal.record(journal, "publication-closeout", :review_threads_applied, %{resolved: ["thread-1"]})
+
+    assert {:ok, _} = TransitionJournal.record(journal, "publication-closeout", :projection_applied)
+    assert :ok = TransitionJournal.close(journal)
+  end
+
   test "rejects skipped phases and a second writer for the same workflow", %{path: path} do
     {:ok, journal} = TransitionJournal.start_link(path: path)
 

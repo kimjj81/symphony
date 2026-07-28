@@ -41,4 +41,7 @@ Body:
 {{ issue.description }}
 
 Return a structured semantic outcome. Symphony owns tracker labels, automated comments, pull-request
-creation, and merging. Do not use a tracker CLI or expose tracker credentials from the worker.
+creation, merging, and inline-review closeout. For Rework, report every supplied unresolved inline
+thread through `review_thread_updates`; do not use a tracker CLI or expose tracker credentials from
+the worker. If the configured Forgejo instance cannot prove an inline reply-and-resolve API,
+Symphony will hand off instead of silently closing the review loop.

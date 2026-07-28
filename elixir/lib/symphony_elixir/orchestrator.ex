@@ -3518,8 +3518,42 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp resume_published_publication(state, snapshot, data, provenance) do
-    data = Map.merge(data, %{provenance: provenance, result: :published})
-    apply_publication_after_projection(state, snapshot, data, :published, provenance)
+    case close_published_review_threads(data, snapshot.transition_id, provenance) do
+      {:applied, closeout} ->
+        data = Map.merge(data, %{provenance: provenance, result: :published, review_thread_closeout: closeout})
+        apply_publication_after_review_thread_closeout(state, snapshot, data, provenance)
+
+      {:handoff, reason, closeout} ->
+        resume_publication_handoff(state, snapshot, Map.put(data, :review_thread_closeout, closeout), reason, provenance)
+
+      {:retry, reason, closeout} ->
+        retry_publication_effect(state, snapshot.transition_id, Map.put(data, :review_thread_closeout, closeout), reason, provenance)
+
+      {:conflict, closeout} ->
+        resume_publication_handoff(
+          state,
+          snapshot,
+          Map.put(data, :review_thread_closeout, closeout),
+          :review_thread_closeout_conflict,
+          provenance
+        )
+    end
+  end
+
+  defp apply_publication_after_review_thread_closeout(state, snapshot, data, provenance) do
+    case advance_publication_phase(snapshot.transition_id, snapshot.phase, :review_threads_applied, data) do
+      :ok ->
+        apply_publication_after_projection(
+          state,
+          %{snapshot | phase: :review_threads_applied},
+          data,
+          :published,
+          provenance
+        )
+
+      {:error, reason} ->
+        schedule_publication_retry(snapshot.transition_id, reason, state)
+    end
   end
 
   defp resume_publication_handoff(state, snapshot, data, reason, provenance) do
@@ -3531,14 +3565,45 @@ defmodule SymphonyElixir.Orchestrator do
         state_transition_id: data[:state_transition_id] || publication_handoff_transition_id(data)
       })
 
-    apply_publication_after_projection(state, snapshot, data, {:handoff, reason}, provenance)
+    case maybe_apply_review_thread_closeout_phase(snapshot, data) do
+      {:ok, snapshot} -> apply_publication_after_projection(state, snapshot, data, {:handoff, reason}, provenance)
+      {:error, journal_reason} -> schedule_publication_retry(snapshot.transition_id, journal_reason, state)
+    end
   end
+
+  defp maybe_apply_review_thread_closeout_phase(
+         %{phase: phase} = snapshot,
+         %{review_thread_closeout: closeout}
+       )
+       when is_map(closeout) and phase in [:review_threads_applied, :projection_applied],
+       do: {:ok, snapshot}
+
+  defp maybe_apply_review_thread_closeout_phase(snapshot, %{review_thread_closeout: closeout} = data) when is_map(closeout) do
+    case advance_publication_phase(snapshot.transition_id, snapshot.phase, :review_threads_applied, data) do
+      :ok -> {:ok, %{snapshot | phase: :review_threads_applied}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp maybe_apply_review_thread_closeout_phase(snapshot, _data), do: {:ok, snapshot}
 
   defp apply_publication_after_projection(state, snapshot, data, result, provenance) do
     case advance_publication_phase(snapshot.transition_id, snapshot.phase, :projection_applied, data) do
       :ok -> apply_recovered_publication_outcome(state, snapshot.transition_id, data, result, provenance)
       {:error, reason} -> schedule_publication_retry(snapshot.transition_id, reason, state)
     end
+  end
+
+  defp close_published_review_threads(%{kind: kind}, _publication_id, _provenance) when kind != :rework_complete,
+    do: {:applied, %{skipped: true}}
+
+  defp close_published_review_threads(data, publication_id, provenance) do
+    Tracker.close_review_threads(
+      data[:issue_id],
+      provenance.published_head_oid,
+      data[:review_thread_updates] || [],
+      "publication:#{publication_id}"
+    )
   end
 
   defp retry_publication_effect(state, publication_id, data, reason, provenance) do
@@ -3578,6 +3643,20 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp advance_publication_phase(transition_id, :received, :review_threads_applied, data) do
+    with :ok <- normalize_journal_record(journal_record(transition_id, :decided, data)) do
+      advance_publication_phase(transition_id, :decided, :review_threads_applied, data)
+    end
+  end
+
+  defp advance_publication_phase(transition_id, :retrying, :review_threads_applied, data),
+    do: normalize_journal_record(journal_record(transition_id, :review_threads_applied, data))
+
+  defp advance_publication_phase(transition_id, :decided, :review_threads_applied, data),
+    do: normalize_journal_record(journal_record(transition_id, :review_threads_applied, data))
+
+  defp advance_publication_phase(_transition_id, :review_threads_applied, :review_threads_applied, _data), do: :ok
+
   defp advance_publication_phase(transition_id, :received, :projection_applied, data) do
     with :ok <- normalize_journal_record(journal_record(transition_id, :decided, data)) do
       advance_publication_phase(transition_id, :decided, :projection_applied, data)
@@ -3585,7 +3664,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp advance_publication_phase(transition_id, phase, :projection_applied, data)
-       when phase in [:decided, :retrying],
+       when phase in [:decided, :retrying, :review_threads_applied],
        do: normalize_journal_record(journal_record(transition_id, :projection_applied, data))
 
   defp advance_publication_phase(_transition_id, _phase, _target, _data),

@@ -42,6 +42,24 @@ defmodule SymphonyElixir.ForgejoClientTest do
     assert :unmanaged = Client.classify_managed_label("customer-facing")
   end
 
+  test "hands off inline review closeout until the instance exposes a complete thread API" do
+    update = %{
+      thread_ref: "opaque-thread-id",
+      disposition: "fixed",
+      reply_ko: "수정했고 검증을 통과했습니다.",
+      evidence: ["mix test"]
+    }
+
+    assert {:handoff, :review_thread_closeout_unsupported,
+            %{
+              issue_id: "forgejo:pr:19",
+              expected_head_oid: "published-head",
+              updates: ["opaque-thread-id"],
+              provider: :forgejo
+            }} =
+             Client.close_review_threads("forgejo:pr:19", "published-head", [update], "publication:19")
+  end
+
   test "normalizes same-repository pull requests and records parent labels" do
     raw =
       raw_pull(19, "abc123", [

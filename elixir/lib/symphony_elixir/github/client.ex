@@ -32,6 +32,36 @@ defmodule SymphonyElixir.GitHub.Client do
     "sym:request-duplicate" => {"8c959f", "Request that Symphony mark this item duplicate."},
     "sym:request-reopen" => {"bfd4ff", "Request that Symphony reopen this terminal item for human review."}
   }
+
+  @review_threads_query """
+  query SymphonyReviewThreads($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        headRefOid
+        reviewThreads(first: 100, after: $cursor) {
+          nodes {
+            id
+            isResolved
+            comments(last: 100) { nodes { body } }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }
+  }
+  """
+
+  @reply_to_review_thread_mutation """
+  mutation SymphonyReplyToReviewThread($input: AddPullRequestReviewThreadReplyInput!) {
+    addPullRequestReviewThreadReply(input: $input) { comment { id body } }
+  }
+  """
+
+  @resolve_review_thread_mutation """
+  mutation SymphonyResolveReviewThread($input: ResolveReviewThreadInput!) {
+    resolveReviewThread(input: $input) { thread { id isResolved } }
+  }
+  """
   @spec default_state_labels() :: map()
   def default_state_labels, do: HostedGit.default_state_labels()
 
@@ -82,6 +112,77 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  @doc """
+  Returns the broker-owned GitHub evidence snapshot for one pull request.
+
+  Opaque review-thread IDs are retained so the worker can describe a closeout
+  without receiving tracker credentials or querying GitHub itself.
+  """
+  @spec fetch_dispatch_snapshot(Issue.t() | String.t()) :: {:ok, map()} | {:error, term()}
+  def fetch_dispatch_snapshot(%Issue{kind: :issue} = issue), do: {:ok, empty_dispatch_snapshot(issue)}
+
+  def fetch_dispatch_snapshot(%Issue{kind: :pull_request} = issue) do
+    with {:ok, snapshot} <- fetch_dispatch_snapshot(issue.id) do
+      {:ok, Map.put(snapshot, :work_item, work_item_context(issue))}
+    end
+  end
+
+  def fetch_dispatch_snapshot(%Issue{} = issue),
+    do: {:error, {:unsupported_github_issue_kind, issue.kind}}
+
+  def fetch_dispatch_snapshot(issue_id) when is_binary(issue_id) do
+    with {:ok, number, :pull_request} <- parse_issue_id(issue_id),
+         {:ok, pull_request} <- request(:get, "/pulls/#{number}"),
+         {:ok, live_head} <- pull_request_head(pull_request),
+         {:ok, comments} <- fetch_all_comments(number),
+         {:ok, reviews} <- fetch_all_reviews(number),
+         {:ok, inline_comments} <- fetch_all_inline_comments(number),
+         {:ok, tracker} <- github_tracker_config(),
+         {:ok, review_snapshot} <- fetch_review_threads(tracker, number) do
+      if review_snapshot.head_oid == live_head do
+        {:ok,
+         %{
+           live_head: live_head,
+           top_level_comments: Enum.map(comments, &comment_evidence/1),
+           reviews: Enum.map(reviews, &review_evidence/1),
+           inline_comments: Enum.map(inline_comments, &inline_comment_evidence/1),
+           unresolved_feedback:
+             review_snapshot.threads
+             |> Enum.reject(&(&1["isResolved"] == true))
+             |> Enum.map(&review_thread_feedback/1)
+         }}
+      else
+        {:error, {:dispatch_snapshot_head_drift, %{pull_head: live_head, review_head: review_snapshot.head_oid}}}
+      end
+    else
+      {:ok, _number, kind} -> {:error, {:unsupported_github_issue_kind, kind}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def fetch_dispatch_snapshot(_issue_id), do: {:error, :invalid_dispatch_snapshot_issue_id}
+
+  defp empty_dispatch_snapshot(%Issue{} = issue) do
+    %{
+      work_item: work_item_context(issue),
+      live_head: nil,
+      top_level_comments: [],
+      reviews: [],
+      inline_comments: [],
+      unresolved_feedback: []
+    }
+  end
+
+  defp work_item_context(%Issue{} = issue) do
+    %{
+      identifier: issue.identifier,
+      title: issue.title,
+      description: issue.description,
+      url: issue.url,
+      kind: issue.kind
+    }
+  end
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do
     with {:ok, number, _kind} <- parse_issue_id(issue_id),
@@ -123,6 +224,28 @@ defmodule SymphonyElixir.GitHub.Client do
 
       {:ok, _payload} ->
         {:error, :github_unexpected_comments_payload}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp fetch_all_reviews(number), do: fetch_paginated("/pulls/#{number}/reviews")
+
+  defp fetch_all_inline_comments(number), do: fetch_paginated("/pulls/#{number}/comments")
+
+  defp fetch_paginated(path, page \\ 1, acc \\ []) do
+    params = if page == 1, do: %{per_page: @per_page}, else: %{per_page: @per_page, page: page}
+
+    case request(:get, path, params: params) do
+      {:ok, values} when is_list(values) and length(values) == @per_page ->
+        fetch_paginated(path, page + 1, acc ++ values)
+
+      {:ok, values} when is_list(values) ->
+        {:ok, acc ++ values}
+
+      {:ok, _payload} ->
+        {:error, :github_unexpected_paginated_payload}
 
       {:error, reason} ->
         {:error, reason}
@@ -243,6 +366,32 @@ defmodule SymphonyElixir.GitHub.Client do
 
   def merge_pull_request(issue_id, expected_head_oid),
     do: {:error, %{stage: :validate, reason: {:invalid_merge_request, issue_id, expected_head_oid}}}
+
+  @doc """
+  Applies the broker-owned closeout for a published rework head. The worker
+  provides only opaque thread references and Korean reply text; this client
+  re-reads GitHub before writing so stale or newly-added feedback cannot be
+  silently closed.
+  """
+  @spec close_review_threads(String.t(), String.t(), [map()], String.t()) ::
+          {:applied, map()} | {:handoff, term(), map()} | {:retry, term(), map()} | {:conflict, map()}
+  def close_review_threads(issue_id, expected_head_oid, updates, marker)
+      when is_binary(issue_id) and is_binary(expected_head_oid) and expected_head_oid != "" and is_list(updates) and
+             is_binary(marker) and marker != "" do
+    with {:ok, number, :pull_request} <- parse_issue_id(issue_id),
+         {:ok, tracker} <- github_tracker_config(),
+         {:ok, snapshot} <- fetch_review_threads(tracker, number),
+         :ok <- validate_review_thread_snapshot(snapshot, expected_head_oid, updates) do
+      apply_review_thread_updates(snapshot.threads, updates, marker, tracker, number, expected_head_oid)
+    else
+      {:ok, _number, kind} -> {:conflict, %{issue_id: issue_id, reason: {:unsupported_github_issue_kind, kind}}}
+      {:error, reason} -> {:retry, reason, %{issue_id: issue_id, expected_head_oid: expected_head_oid}}
+      {:conflict, reason} -> {:conflict, %{issue_id: issue_id, expected_head_oid: expected_head_oid, reason: reason}}
+    end
+  end
+
+  def close_review_threads(issue_id, expected_head_oid, _updates, _marker),
+    do: invalid_review_thread_closeout(issue_id, expected_head_oid)
 
   @spec create_pull_request_for_issue(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
   def create_pull_request_for_issue(%Issue{kind: :issue} = issue) do
@@ -875,6 +1024,7 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp projection_failure_stage({:github_api_status, _, _}), do: :projection_write_or_verify
+  defp projection_failure_stage({:github_retryable_api_status, _, _}), do: :projection_write_or_verify
   defp projection_failure_stage({:github_api_request, _}), do: :projection_write_or_verify
   defp projection_failure_stage(_reason), do: :prepare
 
@@ -1580,7 +1730,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
         {:ok, %{status: status, body: body}} ->
           Logger.error("GitHub request failed method=#{method} path=#{path} status=#{status} body=#{inspect(body, limit: 20)}")
-          {:error, {:github_api_status, status, body}}
+          {:error, github_api_error(status, body)}
 
         {:error, reason} ->
           Logger.error("GitHub request failed method=#{method} path=#{path}: #{inspect(reason)}")
@@ -1588,6 +1738,34 @@ defmodule SymphonyElixir.GitHub.Client do
       end
     end
   end
+
+  defp github_api_error(status, body) do
+    if github_retryable_api_status?(status, body) do
+      {:github_retryable_api_status, status, body}
+    else
+      {:github_api_status, status, body}
+    end
+  end
+
+  defp github_retryable_api_status?(status, _body) when status in [408, 429] or status >= 500, do: true
+  defp github_retryable_api_status?(403, body), do: github_rate_limit_body?(body)
+  defp github_retryable_api_status?(_status, _body), do: false
+
+  defp github_rate_limited_graphql_errors?(errors) when is_list(errors) do
+    Enum.any?(errors, &github_rate_limit_body?/1)
+  end
+
+  defp github_rate_limited_graphql_errors?(_errors), do: false
+
+  defp github_rate_limit_body?(%{} = body) do
+    [Map.get(body, "message", Map.get(body, :message, "")), Map.get(body, "type", Map.get(body, :type, ""))]
+    |> Enum.any?(fn value ->
+      normalized = value |> to_string() |> String.downcase()
+      String.contains?(normalized, "rate limit") or String.contains?(normalized, "rate_limited")
+    end)
+  end
+
+  defp github_rate_limit_body?(_body), do: false
 
   defp github_tracker_config do
     tracker = Config.settings!().tracker
@@ -1621,6 +1799,284 @@ defmodule SymphonyElixir.GitHub.Client do
     |> String.trim_trailing("/")
     |> Kernel.<>("/repos/#{owner}/#{repo}")
     |> Kernel.<>(path)
+  end
+
+  defp fetch_review_threads(tracker, number), do: fetch_review_threads(tracker, number, nil, [])
+
+  defp fetch_review_threads(tracker, number, cursor, acc) do
+    variables = %{owner: tracker.owner, repo: tracker.repo, number: number, cursor: cursor}
+
+    with {:ok, response} <- graphql_request(tracker, @review_threads_query, variables),
+         {:ok, pull_request} <- graphql_pull_request(response),
+         {:ok, threads, page_info} <- graphql_review_threads(pull_request) do
+      next_acc = acc ++ threads
+
+      case page_info do
+        %{"hasNextPage" => true, "endCursor" => next_cursor} when is_binary(next_cursor) and next_cursor != "" ->
+          fetch_review_threads(tracker, number, next_cursor, next_acc)
+
+        _ ->
+          {:ok, %{head_oid: pull_request["headRefOid"], threads: next_acc}}
+      end
+    end
+  end
+
+  defp graphql_pull_request(%{"data" => %{"repository" => %{"pullRequest" => pull_request}}}) when is_map(pull_request),
+    do: {:ok, pull_request}
+
+  defp graphql_pull_request(_response), do: {:error, :github_review_thread_snapshot_invalid}
+
+  defp graphql_review_threads(%{"reviewThreads" => %{"nodes" => threads, "pageInfo" => page_info}})
+       when is_list(threads) and is_map(page_info),
+       do: {:ok, threads, page_info}
+
+  defp graphql_review_threads(_pull_request), do: {:error, :github_review_thread_snapshot_invalid}
+
+  defp pull_request_head(%{"head" => %{"sha" => head}}) when is_binary(head) and head != "", do: {:ok, head}
+  defp pull_request_head(_pull_request), do: {:error, :github_pull_request_head_missing}
+
+  defp comment_evidence(comment) when is_map(comment) do
+    %{body: Map.get(comment, "body", ""), author: get_in(comment, ["user", "login"])}
+  end
+
+  defp review_evidence(review) when is_map(review) do
+    %{body: Map.get(review, "body", ""), state: Map.get(review, "state"), author: get_in(review, ["user", "login"])}
+  end
+
+  defp inline_comment_evidence(comment) when is_map(comment) do
+    %{
+      body: Map.get(comment, "body", ""),
+      path: Map.get(comment, "path"),
+      line: Map.get(comment, "line") || Map.get(comment, "original_line"),
+      author: get_in(comment, ["user", "login"])
+    }
+  end
+
+  defp review_thread_feedback(%{"id" => thread_ref} = thread) when is_binary(thread_ref) do
+    bodies =
+      thread
+      |> get_in(["comments", "nodes"])
+      |> List.wrap()
+      |> Enum.map(&Map.get(&1, "body", ""))
+      |> Enum.reject(&(&1 == ""))
+
+    %{thread_ref: thread_ref, feedback: Enum.join(bodies, "\n\n")}
+  end
+
+  defp validate_review_thread_snapshot(%{head_oid: expected_head_oid, threads: threads}, expected_head_oid, updates) do
+    update_refs = MapSet.new(Enum.map(updates, &review_thread_ref/1))
+    thread_refs = MapSet.new(Enum.map(threads, &Map.get(&1, "id")))
+
+    unresolved_refs =
+      threads
+      |> Enum.reject(&(&1["isResolved"] == true))
+      |> Enum.map(&Map.get(&1, "id"))
+      |> MapSet.new()
+
+    cond do
+      MapSet.size(update_refs) != length(updates) -> {:conflict, :duplicate_review_thread_update}
+      not MapSet.subset?(update_refs, thread_refs) -> {:conflict, :unknown_review_thread}
+      not MapSet.subset?(unresolved_refs, update_refs) -> {:conflict, %{unaccounted_review_threads: MapSet.to_list(MapSet.difference(unresolved_refs, update_refs))}}
+      true -> :ok
+    end
+  end
+
+  defp validate_review_thread_snapshot(%{head_oid: actual_head_oid}, expected_head_oid, _updates),
+    do: {:conflict, %{expected_head_oid: expected_head_oid, actual_head_oid: actual_head_oid}}
+
+  defp apply_review_thread_updates(threads, updates, marker, tracker, number, expected_head_oid) do
+    thread_by_ref = Map.new(threads, &{&1["id"], &1})
+
+    Enum.reduce_while(updates, {:ok, [], [], []}, fn update, {:ok, completed, handoffs, replies} ->
+      thread_ref = review_thread_ref(update)
+      thread = Map.fetch!(thread_by_ref, thread_ref)
+
+      case apply_review_thread_update(thread, update, marker, tracker, number) do
+        :ok ->
+          {:cont, {:ok, [thread_ref | completed], handoffs, replies}}
+
+        {:handoff, reason} ->
+          {:cont, {:ok, [thread_ref | completed], [{thread_ref, reason} | handoffs], replies}}
+
+        {:retry, reason, reply} ->
+          {:halt, {:retry, reason, Enum.reverse(completed), Enum.reverse(handoffs), [reply | replies]}}
+
+        {:retry, reason} ->
+          {:halt, {:retry, reason, Enum.reverse(completed), Enum.reverse(handoffs), replies}}
+      end
+    end)
+    |> finalize_review_thread_updates(tracker, number, expected_head_oid)
+  end
+
+  defp finalize_review_thread_updates({:ok, completed, [], _replies}, tracker, number, expected_head_oid) do
+    with {:ok, snapshot} <- fetch_review_threads(tracker, number),
+         true <- snapshot.head_oid == expected_head_oid,
+         [] <- Enum.reject(snapshot.threads, &(&1["isResolved"] == true)) do
+      {:applied, %{resolved: completed}}
+    else
+      false ->
+        {:conflict, %{expected_head_oid: expected_head_oid, reason: :review_thread_head_drift}}
+
+      unresolved when is_list(unresolved) ->
+        {:conflict, %{reason: :review_threads_remain_unresolved, thread_refs: Enum.map(unresolved, & &1["id"])}}
+
+      {:error, reason} ->
+        {:retry, reason, %{resolved: completed}}
+    end
+  end
+
+  defp finalize_review_thread_updates(
+         {:ok, completed, handoffs, _replies},
+         _tracker,
+         _number,
+         _expected_head_oid
+       ),
+       do: review_thread_handoff_result(completed, handoffs)
+
+  defp finalize_review_thread_updates(
+         {:retry, reason, completed, handoffs, replies},
+         _tracker,
+         _number,
+         _expected_head_oid
+       ),
+       do: {:retry, reason, %{completed: completed, needs_human: handoffs, replies: replies}}
+
+  defp apply_review_thread_update(%{"isResolved" => true}, _update, _marker, _tracker, _number), do: :ok
+
+  defp apply_review_thread_update(thread, update, marker, tracker, _number) do
+    thread_ref = Map.fetch!(thread, "id")
+    disposition = review_thread_disposition(update)
+    thread_marker = "<!-- sym-review-thread:#{marker}:#{thread_ref} -->"
+
+    case ensure_review_thread_reply(thread, update, thread_marker, tracker) do
+      {:ok, reply_status} ->
+        apply_review_thread_after_reply(
+          disposition,
+          thread_ref,
+          thread_marker,
+          tracker,
+          reply_status
+        )
+
+      {:error, reason} ->
+        {:retry, reason}
+    end
+  end
+
+  defp review_thread_handoff_result(completed, handoffs) do
+    {:handoff, :review_thread_needs_human, %{replied: Enum.reverse(completed), needs_human: Enum.reverse(handoffs)}}
+  end
+
+  defp apply_review_thread_after_reply("fixed", thread_ref, thread_marker, tracker, reply_status) do
+    case resolve_review_thread(thread_ref, thread_marker, tracker) do
+      :ok -> :ok
+      {:retry, reason} -> {:retry, reason, %{thread_ref: thread_ref, reply: reply_status}}
+    end
+  end
+
+  defp apply_review_thread_after_reply("needs_human", _thread_ref, _thread_marker, _tracker, _reply_status),
+    do: {:handoff, :review_thread_needs_human}
+
+  defp ensure_review_thread_reply(thread, update, thread_marker, tracker) do
+    if review_thread_reply_present?(thread, thread_marker) do
+      {:ok, :already_present}
+    else
+      input = %{
+        pullRequestReviewThreadId: Map.fetch!(thread, "id"),
+        body: review_thread_reply(update) <> "\n\n" <> thread_marker,
+        clientMutationId: thread_marker
+      }
+
+      case graphql_request(tracker, @reply_to_review_thread_mutation, %{input: input}) do
+        {:ok,
+         %{
+           "data" => %{
+             "addPullRequestReviewThreadReply" => %{"comment" => %{"id" => _id}}
+           }
+         }} ->
+          {:ok, :posted}
+
+        {:ok, _response} ->
+          {:error, :github_review_thread_reply_invalid}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp resolve_review_thread(thread_ref, thread_marker, tracker) do
+    input = %{threadId: thread_ref, clientMutationId: thread_marker}
+
+    case graphql_request(tracker, @resolve_review_thread_mutation, %{input: input}) do
+      {:ok,
+       %{
+         "data" => %{
+           "resolveReviewThread" => %{"thread" => %{"isResolved" => true}}
+         }
+       }} ->
+        :ok
+
+      {:ok, _response} ->
+        {:retry, :github_review_thread_resolve_invalid}
+
+      {:error, reason} ->
+        {:retry, reason}
+    end
+  end
+
+  defp review_thread_reply_present?(thread, marker) do
+    thread
+    |> get_in(["comments", "nodes"])
+    |> List.wrap()
+    |> Enum.any?(fn comment -> is_binary(comment["body"]) and String.contains?(comment["body"], marker) end)
+  end
+
+  defp review_thread_ref(update), do: Map.get(update, :thread_ref) || Map.get(update, "thread_ref")
+  defp review_thread_disposition(update), do: Map.get(update, :disposition) || Map.get(update, "disposition")
+  defp review_thread_reply(update), do: Map.get(update, :reply_ko) || Map.get(update, "reply_ko")
+
+  defp invalid_review_thread_closeout(issue_id, expected_head_oid) do
+    {:conflict, %{issue_id: issue_id, expected_head_oid: expected_head_oid, reason: :invalid_review_thread_closeout}}
+  end
+
+  defp graphql_request(tracker, query, variables) do
+    request_fun = Application.get_env(:symphony_elixir, :github_request_fun, &Req.request/1)
+
+    request_opts = [
+      method: :post,
+      url: github_graphql_url(tracker.endpoint),
+      headers: github_headers(tracker) |> elem(1),
+      json: %{query: query, variables: variables},
+      connect_options: [timeout: 30_000]
+    ]
+
+    case request_fun.(request_opts) do
+      {:ok, %{status: status, body: %{"errors" => errors} = body}} when status in 200..299 ->
+        if github_rate_limited_graphql_errors?(errors),
+          do: {:error, {:github_retryable_api_status, status, body}},
+          else: {:error, {:github_graphql_errors, errors}}
+
+      {:ok, %{status: status, body: body}} when status in 200..299 ->
+        {:ok, body}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, github_api_error(status, body)}
+
+      {:error, reason} ->
+        {:error, {:github_api_request, reason}}
+    end
+  end
+
+  defp github_graphql_url(endpoint) do
+    endpoint
+    |> String.trim_trailing("/")
+    |> String.replace_suffix("/api/v3", "/api/graphql")
+    |> append_graphql_path()
+  end
+
+  defp append_graphql_path(url) do
+    if String.ends_with?(url, "/graphql"), do: url, else: url <> "/graphql"
   end
 
   defp maybe_put_json(opts, nil), do: opts

@@ -1,5 +1,21 @@
 [
   {
+    "id": "ADR-20260728-0009-RTH",
+    "title": "Broker-owned PR snapshot and inline review closeout",
+    "tags": [
+      "orchestration",
+      "pull-request",
+      "review",
+      "github",
+      "forgejo",
+      "reliability"
+    ],
+    "status": "Accepted",
+    "date": "2026-07-28",
+    "tldr": "Symphony's broker owns both PR evidence reads and inline-thread closeout; workers receive only an immutable snapshot.",
+    "path": "docs/adr/ADR-20260728-0009-RTH-broker-owned-inline-review-closeout.md"
+  },
+  {
     "id": "ADR-20260726-0008-KVC",
     "title": "Isolate worker tool caches",
     "tags": [

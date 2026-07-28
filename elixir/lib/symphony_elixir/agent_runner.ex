@@ -16,7 +16,7 @@ defmodule SymphonyElixir.AgentRunner do
   @worker_outcome_schema %{
     "type" => "object",
     "additionalProperties" => false,
-    "required" => ["kind", "summary_ko", "evidence", "head_oid", "findings"],
+    "required" => ["kind", "summary_ko", "evidence", "head_oid", "findings", "review_thread_updates"],
     "properties" => %{
       "kind" => %{
         "type" => "string"
@@ -24,7 +24,21 @@ defmodule SymphonyElixir.AgentRunner do
       "summary_ko" => %{"type" => "string", "minLength" => 1},
       "evidence" => %{"type" => "array", "items" => %{"type" => "string"}},
       "head_oid" => %{"type" => ["string", "null"]},
-      "findings" => %{"type" => "array", "items" => %{"type" => "string"}}
+      "findings" => %{"type" => "array", "items" => %{"type" => "string"}},
+      "review_thread_updates" => %{
+        "type" => "array",
+        "items" => %{
+          "type" => "object",
+          "additionalProperties" => false,
+          "required" => ["thread_ref", "disposition", "reply_ko", "evidence"],
+          "properties" => %{
+            "thread_ref" => %{"type" => "string", "minLength" => 1},
+            "disposition" => %{"type" => "string", "enum" => ["fixed", "needs_human"]},
+            "reply_ko" => %{"type" => "string", "minLength" => 1},
+            "evidence" => %{"type" => "array", "items" => %{"type" => "string"}}
+          }
+        }
+      }
     }
   }
   @spec run(map()) :: :ok | {:error, term()} | no_return()
@@ -348,39 +362,34 @@ defmodule SymphonyElixir.AgentRunner do
       |> Keyword.put(:worker_host, worker_host)
       |> Keyword.put(:on_message, codex_message_handler(codex_update_recipient, lane_issue))
 
-    {brief, brief_meta} =
-      case OrchestrationBrief.generate(workspace, lane_issue, brief_opts) do
-        {:ok, generated, metadata} ->
-          {generated, metadata}
+    case OrchestrationBrief.generate(workspace, lane_issue, brief_opts) do
+      {:ok, brief, brief_meta} ->
+        Logger.info([
+          "Prepared orchestration brief for #{issue_context(lane_issue)}",
+          " source=#{brief_meta.source}",
+          " bytes=#{brief_meta.bytes}",
+          " lane=#{brief_meta.lane}"
+        ])
 
-        {:error, reason} ->
-          fallback = OrchestrationBrief.fallback(lane_issue)
-          Logger.warning("Orchestration brief generation failed for #{issue_context(lane_issue)}; using deterministic fallback reason=#{inspect(reason)}")
-          {fallback, %{source: :fallback, bytes: byte_size(fallback), lane: lane_issue.state}}
-      end
+        send_runtime_observation(codex_update_recipient, lane_issue, :orchestration_brief, brief_meta)
 
-    Logger.info([
-      "Prepared orchestration brief for #{issue_context(lane_issue)}",
-      " source=#{brief_meta.source}",
-      " bytes=#{brief_meta.bytes}",
-      " lane=#{brief_meta.lane}"
-    ])
+        context = %{
+          workspace: workspace,
+          recipient: codex_update_recipient,
+          opts: opts,
+          issue_state_fetcher: issue_state_fetcher,
+          app_server_opts: app_server_opts,
+          brief: brief,
+          worker_host: worker_host,
+          max_turns: max_turns,
+          max_review_verdicts: max_review_verdicts
+        }
 
-    send_runtime_observation(codex_update_recipient, lane_issue, :orchestration_brief, brief_meta)
+        do_run_briefed_turns(context, lane_issue, 1, 0)
 
-    context = %{
-      workspace: workspace,
-      recipient: codex_update_recipient,
-      opts: opts,
-      issue_state_fetcher: issue_state_fetcher,
-      app_server_opts: app_server_opts,
-      brief: brief,
-      worker_host: worker_host,
-      max_turns: max_turns,
-      max_review_verdicts: max_review_verdicts
-    }
-
-    do_run_briefed_turns(context, lane_issue, 1, 0)
+      {:error, reason} ->
+        handle_dispatch_snapshot_failure(lane_issue, reason, opts)
+    end
   end
 
   defp run_authoritative_briefed_codex_turn(
@@ -420,7 +429,7 @@ defmodule SymphonyElixir.AgentRunner do
             })
 
           {:error, reason} ->
-            request_preflight_handoff_transition(tracker_issue, reason, opts)
+            handle_authoritative_dispatch_snapshot_failure(tracker_issue, reason, opts)
         end
 
       {:error, reason} ->
@@ -536,6 +545,27 @@ defmodule SymphonyElixir.AgentRunner do
 
     normalize_worker_transition_result(result)
   end
+
+  defp handle_dispatch_snapshot_failure(issue, reason, opts) do
+    if retryable_dispatch_snapshot_failure?(reason) do
+      {:error, {:broker_dispatch_snapshot_failed, reason}}
+    else
+      handoff_to_human_review(issue, {:broker_dispatch_snapshot_failed, reason}, opts)
+    end
+  end
+
+  defp handle_authoritative_dispatch_snapshot_failure(issue, reason, opts) do
+    if retryable_dispatch_snapshot_failure?(reason) do
+      {:error, {:broker_dispatch_snapshot_failed, reason}}
+    else
+      request_preflight_handoff_transition(issue, reason, opts)
+    end
+  end
+
+  defp retryable_dispatch_snapshot_failure?({:github_api_request, _reason}), do: true
+  defp retryable_dispatch_snapshot_failure?({:github_retryable_api_status, _status, _body}), do: true
+  defp retryable_dispatch_snapshot_failure?({:github_api_status, status, _body}) when status >= 500, do: true
+  defp retryable_dispatch_snapshot_failure?(_reason), do: false
 
   defp request_execution_contract_handoff_transition(tracker_issue, lane_issue, reason, opts) do
     metadata = tracker_issue.metadata || %{}
@@ -730,13 +760,32 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp reconcile_published_publication(context, provenance) do
-    outcome = reconciled_publication_outcome(context.outcome, provenance)
-    transition_id = published_publication_transition_id(context, provenance)
-    projection = %{provenance: provenance, state_transition_id: transition_id}
+    case close_published_review_threads(context.tracker_issue, context.outcome, context.publication_id, provenance) do
+      {:applied, closeout} ->
+        outcome = reconciled_publication_outcome(context.outcome, provenance)
+        transition_id = published_publication_transition_id(context, provenance)
+        projection = %{provenance: provenance, state_transition_id: transition_id, review_thread_closeout: closeout}
 
-    case record_publication_projection(context.publication_id, projection) do
-      :ok -> request_reconciled_publication_transition(context, outcome, transition_id)
-      {:error, reason} -> defer_publication(context, reason, provenance)
+        with :ok <-
+               record_publication_phase(
+                 context.publication_id,
+                 :review_threads_applied,
+                 publication_phase_data(context.publication_id, projection)
+               ),
+             :ok <- record_publication_projection(context.publication_id, projection) do
+          request_reconciled_publication_transition(context, outcome, transition_id)
+        else
+          {:error, reason} -> defer_publication(context, reason, provenance)
+        end
+
+      {:handoff, reason, closeout} ->
+        reconcile_publication_handoff(context, reason, provenance, closeout)
+
+      {:retry, reason, closeout} ->
+        defer_publication(context, reason, provenance, closeout)
+
+      {:conflict, closeout} ->
+        reconcile_publication_handoff(context, :review_thread_closeout_conflict, provenance, closeout)
     end
   end
 
@@ -771,7 +820,7 @@ defmodule SymphonyElixir.AgentRunner do
     finalize_published_worker_transition(outcome, result, transition_id, context.recipient, context.tracker_issue.id)
   end
 
-  defp reconcile_publication_handoff(context, reason, provenance) do
+  defp reconcile_publication_handoff(context, reason, provenance, closeout \\ nil) do
     transition_id = broker_publication_handoff_transition_id(context.tracker_issue, context.turn_session)
 
     publication_data = %{
@@ -781,26 +830,27 @@ defmodule SymphonyElixir.AgentRunner do
       state_transition_id: transition_id
     }
 
-    case record_publication_projection(context.publication_id, publication_data) do
-      :ok ->
-        handoff =
-          publication_handoff_outcome(
-            context.outcome,
-            reason,
-            provenance,
-            context.publication_id,
-            transition_id
-          )
+    publication_data = if is_map(closeout), do: Map.put(publication_data, :review_thread_closeout, closeout), else: publication_data
 
-        request_reconciled_publication_transition(context, handoff, transition_id)
+    with :ok <- maybe_record_review_thread_closeout(context.publication_id, publication_data),
+         :ok <- record_publication_projection(context.publication_id, publication_data) do
+      handoff =
+        publication_handoff_outcome(
+          context.outcome,
+          reason,
+          provenance,
+          context.publication_id,
+          transition_id
+        )
 
-      {:error, journal_reason} ->
-        defer_publication(context, journal_reason, provenance)
+      request_reconciled_publication_transition(context, handoff, transition_id)
+    else
+      {:error, journal_reason} -> defer_publication(context, journal_reason, provenance, closeout)
     end
   end
 
-  defp defer_publication(context, reason, provenance) do
-    mark_publication_retrying(context.publication_id, reason, provenance)
+  defp defer_publication(context, reason, provenance, closeout \\ nil) do
+    mark_publication_retrying(context.publication_id, reason, provenance, closeout)
     notify_publication_pending(context.recipient, context.tracker_issue.id, context.publication_id)
     :ok
   end
@@ -864,21 +914,24 @@ defmodule SymphonyElixir.AgentRunner do
     )
   end
 
-  defp mark_publication_retrying(publication_id, reason, provenance)
+  defp mark_publication_retrying(publication_id, reason, provenance, closeout \\ nil)
+
+  defp mark_publication_retrying(publication_id, reason, provenance, closeout)
        when is_binary(publication_id) and is_map(provenance) do
     extra = %{result: :retrying, reason: inspect(reason)}
     extra = if map_size(provenance) > 0, do: Map.put(extra, :provenance, provenance), else: extra
+    extra = if is_map(closeout), do: Map.put(extra, :review_thread_closeout, closeout), else: extra
     data = publication_phase_data(publication_id, extra)
 
     _ = record_publication_phase(publication_id, :retrying, data)
     :ok
   end
 
-  defp mark_publication_retrying(publication_id, reason, _provenance) when is_binary(publication_id) do
-    mark_publication_retrying(publication_id, reason, %{})
+  defp mark_publication_retrying(publication_id, reason, _provenance, closeout) when is_binary(publication_id) do
+    mark_publication_retrying(publication_id, reason, %{}, closeout)
   end
 
-  defp mark_publication_retrying(_publication_id, _reason, _provenance), do: :ok
+  defp mark_publication_retrying(_publication_id, _reason, _provenance, _closeout), do: :ok
 
   defp publication_phase_data(publication_id, extra) do
     case Process.whereis(TransitionJournal) do
@@ -991,6 +1044,7 @@ defmodule SymphonyElixir.AgentRunner do
       kind: outcome.kind,
       evidence: outcome.evidence,
       findings: outcome.findings,
+      review_thread_updates: outcome.review_thread_updates,
       summary_ko: outcome.summary_ko,
       state_transition_id: state_transition_id
     }
@@ -1031,13 +1085,52 @@ defmodule SymphonyElixir.AgentRunner do
            context.outcome.head_oid
          ) do
       {:ok, provenance} ->
-        record_published_publication_outcome(
-          context.outcome,
-          context.publication_id,
-          context.data,
-          provenance,
-          context.state_transition_id
-        )
+        case close_published_review_threads(
+               context.tracker_issue,
+               context.outcome,
+               context.publication_id,
+               provenance
+             ) do
+          {:applied, closeout} ->
+            record_published_publication_outcome(
+              context.outcome,
+              context.publication_id,
+              context.data,
+              provenance,
+              context.state_transition_id,
+              closeout
+            )
+
+          {:handoff, reason, closeout} ->
+            record_publication_handoff_outcome(
+              context.tracker_issue,
+              context.outcome,
+              context.turn_session,
+              context.publication_id,
+              Map.put(context.data, :review_thread_closeout, closeout),
+              reason,
+              provenance
+            )
+
+          {:retry, reason, closeout} ->
+            record_pending_publication_outcome(
+              context.publication_id,
+              Map.put(context.data, :review_thread_closeout, closeout),
+              reason,
+              provenance
+            )
+
+          {:conflict, closeout} ->
+            record_publication_handoff_outcome(
+              context.tracker_issue,
+              context.outcome,
+              context.turn_session,
+              context.publication_id,
+              Map.put(context.data, :review_thread_closeout, closeout),
+              :review_thread_closeout_conflict,
+              provenance
+            )
+        end
 
       {:handoff, reason, provenance} ->
         record_publication_handoff_outcome(
@@ -1055,25 +1148,24 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp record_published_publication_outcome(outcome, publication_id, data, provenance, state_transition_id) do
-    data = Map.merge(data, %{provenance: provenance, result: :published})
+  defp record_published_publication_outcome(outcome, publication_id, data, provenance, state_transition_id, closeout) do
+    data = Map.merge(data, %{provenance: provenance, result: :published, review_thread_closeout: closeout})
 
-    case record_publication_phase(publication_id, :projection_applied, data) do
-      :ok ->
-        {:ok,
-         %{
-           outcome
-           | head_oid: provenance.published_head_oid,
-             metadata:
-               Map.merge(outcome.metadata, %{
-                 publication: provenance,
-                 publication_id: publication_id,
-                 publication_state_transition_id: state_transition_id
-               })
-         }}
-
-      error ->
-        error
+    with :ok <- record_publication_phase(publication_id, :review_threads_applied, data),
+         :ok <- record_publication_phase(publication_id, :projection_applied, data) do
+      {:ok,
+       %{
+         outcome
+         | head_oid: provenance.published_head_oid,
+           metadata:
+             Map.merge(outcome.metadata, %{
+               publication: provenance,
+               publication_id: publication_id,
+               publication_state_transition_id: state_transition_id
+             })
+       }}
+    else
+      error -> error
     end
   end
 
@@ -1081,8 +1173,10 @@ defmodule SymphonyElixir.AgentRunner do
     transition_id = broker_publication_handoff_transition_id(tracker_issue, turn_session)
     data = Map.merge(data, %{provenance: provenance, result: :handoff, reason: inspect(reason), state_transition_id: transition_id})
 
-    case record_publication_phase(publication_id, :projection_applied, data) do
-      :ok -> {:ok, publication_handoff_outcome(outcome, reason, provenance, publication_id, transition_id)}
+    with :ok <- maybe_record_review_thread_closeout(publication_id, data),
+         :ok <- record_publication_phase(publication_id, :projection_applied, data) do
+      {:ok, publication_handoff_outcome(outcome, reason, provenance, publication_id, transition_id)}
+    else
       error -> error
     end
   end
@@ -1141,6 +1235,24 @@ defmodule SymphonyElixir.AgentRunner do
     |> Map.take([:branch, :integration, :published_head_oid, :live_head_oid, :patch_digest])
     |> inspect()
   end
+
+  defp close_published_review_threads(_tracker_issue, %WorkerOutcome{kind: kind}, _publication_id, _provenance)
+       when kind != :rework_complete,
+       do: {:applied, %{skipped: true}}
+
+  defp close_published_review_threads(tracker_issue, outcome, publication_id, provenance) do
+    Tracker.close_review_threads(
+      tracker_issue.id,
+      provenance.published_head_oid,
+      outcome.review_thread_updates,
+      "publication:#{publication_id}"
+    )
+  end
+
+  defp maybe_record_review_thread_closeout(publication_id, %{review_thread_closeout: closeout} = data) when is_map(closeout),
+    do: record_publication_phase(publication_id, :review_threads_applied, data)
+
+  defp maybe_record_review_thread_closeout(_publication_id, _data), do: :ok
 
   defp publication_transition_id(tracker_issue, turn_session) do
     session_id = Map.get(turn_session, :session_id) || "missing-session"
@@ -1522,9 +1634,15 @@ defmodule SymphonyElixir.AgentRunner do
     #{review_guidance}
     #{verification_guidance}
 
-    Finish by returning exactly one structured semantic outcome. Do not post tracker comments,
-    add or remove workflow labels, close or reopen items, or merge pull requests. Symphony owns all
-    tracker responses and state transitions.
+    For a rework_complete outcome, include one review_thread_updates entry for every unresolved
+    thread supplied by the preflight snapshot. Use that opaque thread_ref unchanged. Set disposition
+    to fixed only when the commit and focused evidence address it; otherwise set needs_human and
+    give the Korean rationale in reply_ko. The broker, not you, posts replies and resolves threads.
+
+    Finish by returning exactly one structured semantic outcome. Always include review_thread_updates:
+    use [] outside rework_complete. Do not post tracker comments, add or remove workflow labels,
+    close or reopen items, or merge pull requests. Symphony owns all tracker responses and state
+    transitions.
     """
   end
 
@@ -1575,7 +1693,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp execution_guidance(:review), do: "Review the pull request; do not implement unless Symphony dispatches Rework."
-  defp execution_guidance(:rework), do: "Address only actionable review feedback in this writable workspace."
+  defp execution_guidance(:rework), do: "Address only actionable review feedback in this writable workspace and account for every supplied unresolved inline thread in review_thread_updates."
   defp execution_guidance(:merge), do: "Run the approved merge verification lane without merging the pull request."
 
   defp execution_contract_handoff_reason({:unsupported_execution_lane, kind, state}) do
@@ -1676,7 +1794,7 @@ defmodule SymphonyElixir.AgentRunner do
       end)
 
     target_state = Config.settings!().agent.human_review_state
-    body = "Symphony 자동 실행 중단\n\n#{reason}"
+    body = "Symphony 자동 실행 중단\n\n#{inspect(reason)}"
 
     with :ok <- normalize_handoff_comment(commenter.(issue_id, body)),
          :ok <- normalize_handoff_state_update(state_updater.(issue_id, target_state)) do
