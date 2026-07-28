@@ -341,9 +341,6 @@ defmodule SymphonyElixir.GitHub.Client do
         Logger.warning("Skipping GitHub candidate with ambiguous Symphony state labels number=#{inspect(raw_issue["number"])} states=#{inspect(states)}")
 
         {:cont, {:ok, acc}}
-
-      {:error, reason} ->
-        {:halt, {:error, reason}}
     end
   end
 

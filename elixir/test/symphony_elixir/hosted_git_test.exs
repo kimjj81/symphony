@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.HostedGitTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias SymphonyElixir.HostedGit
 
@@ -24,6 +24,19 @@ defmodule SymphonyElixir.HostedGitTest do
 
     refute HostedGit.codex_review_comment?(%{
              "comment" => %{"user" => %{"login" => "maintainer"}}
+           })
+  end
+
+  test "normalizes configured Codex review-bot logins" do
+    previous = System.get_env("SYMPHONY_CODEX_REVIEW_BOT_LOGINS")
+    System.put_env("SYMPHONY_CODEX_REVIEW_BOT_LOGINS", "  CUSTOM-CODEX, secondary-bot  ")
+
+    on_exit(fn ->
+      if previous, do: System.put_env("SYMPHONY_CODEX_REVIEW_BOT_LOGINS", previous), else: System.delete_env("SYMPHONY_CODEX_REVIEW_BOT_LOGINS")
+    end)
+
+    assert HostedGit.codex_review_comment?(%{
+             "comment" => %{"user" => %{"login" => "custom-codex"}}
            })
   end
 

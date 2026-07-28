@@ -3,8 +3,8 @@ defmodule SymphonyElixir.GitHub.NatsWebhookConsumer do
   JetStream consumer that feeds GitHub webhook relay messages into Symphony.
 
   The Oracle relay publishes signed GitHub deliveries as JSON envelopes to the
-  `GITHUB_WEBHOOKS` stream. This consumer uses its own durable consumer so it can
-  process the same event stream independently from Hermes Kanban consumers.
+  `GITHUB_WEBHOOKS` stream. This consumer uses its own durable consumer to
+  process the event stream independently from other consumers.
   """
 
   use Gnat.Jetstream.PullConsumer

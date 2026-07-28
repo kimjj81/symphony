@@ -27,8 +27,14 @@ defmodule SymphonyElixir.AgentRunner do
       "findings" => %{"type" => "array", "items" => %{"type" => "string"}}
     }
   }
+  @spec run(map()) :: :ok | {:error, term()} | no_return()
+  def run(issue), do: run(issue, nil, [])
+
+  @spec run(map(), pid() | nil) :: :ok | {:error, term()} | no_return()
+  def run(issue, codex_update_recipient), do: run(issue, codex_update_recipient, [])
+
   @spec run(map(), pid() | nil, keyword()) :: :ok | {:error, term()} | no_return()
-  def run(issue, codex_update_recipient \\ nil, opts \\ []) do
+  def run(issue, codex_update_recipient, opts) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
 
@@ -586,7 +592,7 @@ defmodule SymphonyElixir.AgentRunner do
          opts
        ) do
     session_id = Map.fetch!(turn_session, :session_id)
-    metadata = outcome.metadata || %{}
+    metadata = outcome.metadata
     publication_handoff? = metadata[:publication_handoff] || metadata["publication_handoff"]
 
     dispatch_transition_id =
@@ -800,7 +806,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp finalize_published_worker_transition(outcome, result, state_transition_id, codex_update_recipient, issue_id) do
-    publication_id = outcome.metadata && Map.get(outcome.metadata, :publication_id)
+    publication_id = Map.get(outcome.metadata, :publication_id)
 
     cond do
       not is_binary(publication_id) ->
@@ -819,7 +825,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp finalize_obsolete_publication(outcome, state_transition_id, codex_update_recipient, issue_id) do
-    publication_id = outcome.metadata && Map.get(outcome.metadata, :publication_id)
+    publication_id = Map.get(outcome.metadata, :publication_id)
 
     if is_binary(publication_id) do
       with :ok <- mark_publication_obsolete(publication_id, state_transition_id) do
@@ -858,13 +864,18 @@ defmodule SymphonyElixir.AgentRunner do
     )
   end
 
-  defp mark_publication_retrying(publication_id, reason, provenance) when is_binary(publication_id) do
+  defp mark_publication_retrying(publication_id, reason, provenance)
+       when is_binary(publication_id) and is_map(provenance) do
     extra = %{result: :retrying, reason: inspect(reason)}
-    extra = if is_map(provenance) and map_size(provenance) > 0, do: Map.put(extra, :provenance, provenance), else: extra
+    extra = if map_size(provenance) > 0, do: Map.put(extra, :provenance, provenance), else: extra
     data = publication_phase_data(publication_id, extra)
 
     _ = record_publication_phase(publication_id, :retrying, data)
     :ok
+  end
+
+  defp mark_publication_retrying(publication_id, reason, _provenance) when is_binary(publication_id) do
+    mark_publication_retrying(publication_id, reason, %{})
   end
 
   defp mark_publication_retrying(_publication_id, _reason, _provenance), do: :ok
@@ -1054,7 +1065,7 @@ defmodule SymphonyElixir.AgentRunner do
            outcome
            | head_oid: provenance.published_head_oid,
              metadata:
-               Map.merge(outcome.metadata || %{}, %{
+               Map.merge(outcome.metadata, %{
                  publication: provenance,
                  publication_id: publication_id,
                  publication_state_transition_id: state_transition_id
@@ -1102,7 +1113,7 @@ defmodule SymphonyElixir.AgentRunner do
               "broker publication: #{render_publication_provenance(public_provenance)}"
             ],
         metadata:
-          Map.merge(outcome.metadata || %{}, %{
+          Map.merge(outcome.metadata, %{
             publication: public_provenance,
             publication_id: publication_id,
             publication_state_transition_id: state_transition_id,
@@ -1124,8 +1135,6 @@ defmodule SymphonyElixir.AgentRunner do
       :patch_digest
     ])
   end
-
-  defp publication_public_provenance(_provenance), do: %{}
 
   defp render_publication_provenance(provenance) do
     provenance
@@ -1149,7 +1158,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp publication_state_transition_id(tracker_issue, outcome, turn_session) do
-    metadata = outcome.metadata || %{}
+    metadata = outcome.metadata
 
     metadata[:publication_state_transition_id] ||
       metadata["publication_state_transition_id"] ||

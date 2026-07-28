@@ -1,8 +1,8 @@
 """GitHub webhook relay entrypoint.
 
 This service is deliberately workflow-agnostic. It verifies GitHub delivery
-signatures, wraps the delivery, and publishes it to NATS JetStream. Consumers
-(Symphony, Hermes Kanban, etc.) decide what labels/events they care about.
+signatures, wraps the delivery, and publishes it to NATS JetStream. Symphony
+decides which labels and events it handles.
 """
 
 from __future__ import annotations

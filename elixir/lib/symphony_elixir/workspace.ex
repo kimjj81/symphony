@@ -42,7 +42,6 @@ defmodule SymphonyElixir.Workspace do
       {:handoff, reason, details} -> {:handoff, reason, Map.merge(provenance, details)}
       {:retry, reason, details} -> {:retry, reason, Map.merge(provenance, details)}
       {:error, reason} -> {:error, reason, provenance}
-      {:error, reason, details} -> {:error, reason, Map.merge(provenance, details)}
     end
   end
 

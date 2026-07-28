@@ -55,6 +55,10 @@ defmodule SymphonyElixir.RunMyvenScriptTest do
         if [ "${1:-}" = "--" ]; then shift; fi
         if [ "${1:-}" = "mix" ]; then exit 0; fi
         printf 'started\n' > "$SYMPHONY_TEST_STARTED_FILE"
+        for _ in $(seq 1 100); do
+          [ -s "$SYMPHONY_TEST_GH_COUNT_FILE" ] && break
+          sleep 0.01
+        done
         sleep "$SYMPHONY_TEST_LIFETIME_SECONDS"
         exit 0
         ;;

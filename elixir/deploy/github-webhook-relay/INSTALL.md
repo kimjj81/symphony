@@ -22,7 +22,7 @@ helm --kube-context oracle-cluster upgrade --install nats nats/nats \
   --values deploy/github-webhook-relay/k8s/nats-values.yaml
 ```
 
-The provided values keep NATS as a ClusterIP service. For the Mac consumer, prefer a private Cloudflare/Tailscale TCP path or `kubectl port-forward` during tests instead of exposing raw NATS publicly.
+The provided values keep NATS as a ClusterIP service. For a local Symphony process, prefer a private Cloudflare/Tailscale TCP path or `kubectl port-forward` during tests instead of exposing raw NATS publicly.
 
 Pilot port-forward test:
 
@@ -124,6 +124,10 @@ Secret: same value as github-webhook-secret
 Events: issues, issue_comment, pull_request, pull_request_review, pull_request_review_comment, workflow_run/check_suite as needed
 ```
 
-## 7. Start Mac consumer in dry-run
+## 7. Connect a local Symphony process
 
-See `consumer/README.md`. Keep `DRY_RUN=true` until webhook delivery -> NATS -> Mac logs are verified.
+When Symphony runs outside the cluster, install the shared tunnel template from
+`local/com.studiojin.myven-nats-tunnel.plist.example` and keep it running. Then enable
+Symphony's NATS consumer with `SYMPHONY_NATS_WEBHOOK_ENABLED=true` and its dedicated
+`SYMPHONY_NATS_DURABLE=symphony-webhook` configuration. Verify webhook delivery through
+the Symphony process logs before relying on the relay operationally.

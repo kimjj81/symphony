@@ -7,19 +7,16 @@ VENV=${WEBHOOK_RELAY_VERIFY_VENV:-/tmp/symphony-webhook-relay-verify-venv}
 python3 -m venv "$VENV"
 # shellcheck disable=SC1091
 . "$VENV/bin/activate"
-python -m pip install -q -r "$ROOT/relay/requirements.txt" -r "$ROOT/consumer/requirements.txt"
+python -m pip install -q -r "$ROOT/relay/requirements.txt"
 
 python -m py_compile \
   "$ROOT/relay/app.py" \
-  "$ROOT/relay/test_app.py" \
-  "$ROOT/consumer/myven_hermes_consumer.py" \
-  "$ROOT/consumer/test_myven_hermes_consumer.py"
+  "$ROOT/relay/test_app.py"
 
 PYTHONPATH="$ROOT/relay" python -m unittest "$ROOT/relay/test_app.py"
-PYTHONPATH="$ROOT/consumer" python -m unittest "$ROOT/consumer/test_myven_hermes_consumer.py"
 
 if command -v plutil >/dev/null 2>&1; then
-  for plist in "$ROOT"/consumer/*.plist.example; do
+  for plist in "$ROOT"/local/*.plist.example; do
     plutil -lint "$plist"
   done
 fi

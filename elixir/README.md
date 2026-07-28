@@ -294,9 +294,8 @@ The script stores the reusable webhook secret under
 normal local polling path. `SYMPHONY_GITHUB_WEBHOOK_MODE=ngrok` remains available for local direct
 Phoenix API experiments, but should not be used for Myven's fixed relay setup.
 
-The fixed relay publishes GitHub deliveries to NATS for local consumers such as Hermes Kanban and
-Symphony itself. Enable Symphony's opt-in NATS consumer with its own durable consumer name so it does
-not compete with Hermes Kanban:
+The fixed relay publishes GitHub deliveries to NATS for Symphony's opt-in NATS consumer. Enable it
+with a dedicated durable consumer name:
 
 ```bash
 SYMPHONY_NATS_WEBHOOK_ENABLED=true
