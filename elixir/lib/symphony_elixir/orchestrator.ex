@@ -1599,7 +1599,8 @@ defmodule SymphonyElixir.Orchestrator do
            :dispatch_planning,
            :dispatch_implementation,
            :dispatch_review,
-           :dispatch_rework
+           :dispatch_rework,
+           :dispatch_merging
          ] do
       event.transition_id
     end
@@ -1649,13 +1650,15 @@ defmodule SymphonyElixir.Orchestrator do
       "planned" -> :dispatch_implementation
       "rework" -> :dispatch_rework
       "review" -> :dispatch_review
+      "merging" -> :dispatch_merging
       _ -> nil
     end
   end
 
-  defp dispatch_marked_issue(%Issue{} = issue, :dispatch_planning) do
+  defp dispatch_marked_issue(%Issue{} = issue, intent_kind)
+       when intent_kind in [:dispatch_planning, :dispatch_merging] do
     if Config.settings!().state_manager.mode in ["shadow", "authoritative"] do
-      record_planning_dispatch_receipt(issue)
+      record_same_state_dispatch_receipt(issue, intent_kind)
     else
       {:ok, issue}
     end
@@ -1697,7 +1700,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp record_planning_dispatch_receipt(%Issue{state: state_name} = issue) do
+  defp record_same_state_dispatch_receipt(%Issue{state: state_name} = issue, intent_kind) do
     transition_id = dispatch_transition_id(issue)
 
     data = %{
@@ -1706,15 +1709,15 @@ defmodule SymphonyElixir.Orchestrator do
       actor: "symphony",
       from_state: state_name,
       to_state: state_name,
-      kind: :dispatch_planning,
+      kind: intent_kind,
       causation_id: issue.id,
       work_item_kind: issue.kind,
       head_oid: issue.metadata && (issue.metadata["head_oid"] || issue.metadata[:head_oid]),
       effect: :dispatch_receipt
     }
 
-    with :ok <- ensure_planning_dispatch_receipt(transition_id, data) do
-      Logger.info("Recorded planning dispatch receipt: #{issue_context(issue)} state=#{state_name}")
+    with :ok <- ensure_same_state_dispatch_receipt(transition_id, data) do
+      Logger.info("Recorded same-state dispatch receipt: #{issue_context(issue)} state=#{state_name} kind=#{intent_kind}")
 
       metadata =
         issue.metadata
@@ -1726,43 +1729,43 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp ensure_planning_dispatch_receipt(transition_id, data) do
+  defp ensure_same_state_dispatch_receipt(transition_id, data) do
     case journal_snapshot(transition_id) do
-      {:ok, %{phase: :verified, data: %{issue_id: issue_id, kind: :dispatch_planning}}}
-      when issue_id == data.issue_id ->
+      {:ok, %{phase: :verified, data: %{issue_id: issue_id, kind: kind}}}
+      when issue_id == data.issue_id and kind == data.kind ->
         :ok
 
       {:ok, %{phase: :verified}} ->
         {:error, {:dispatch_receipt_collision, transition_id}}
 
       {:ok, snapshot} ->
-        complete_planning_dispatch_receipt(transition_id, snapshot.phase, data)
+        complete_same_state_dispatch_receipt(transition_id, snapshot.phase, data)
 
       :error ->
         with :ok <- normalize_journal_record(journal_record(transition_id, :received, data)) do
-          complete_planning_dispatch_receipt(transition_id, :received, data)
+          complete_same_state_dispatch_receipt(transition_id, :received, data)
         end
     end
   end
 
-  defp complete_planning_dispatch_receipt(transition_id, :received, data) do
+  defp complete_same_state_dispatch_receipt(transition_id, :received, data) do
     with :ok <- normalize_journal_record(journal_record(transition_id, :decided, data)) do
-      complete_planning_dispatch_receipt(transition_id, :decided, data)
+      complete_same_state_dispatch_receipt(transition_id, :decided, data)
     end
   end
 
-  defp complete_planning_dispatch_receipt(transition_id, :retrying, data) do
+  defp complete_same_state_dispatch_receipt(transition_id, :retrying, data) do
     with :ok <- normalize_journal_record(journal_record(transition_id, :decided, data)) do
-      complete_planning_dispatch_receipt(transition_id, :decided, data)
+      complete_same_state_dispatch_receipt(transition_id, :decided, data)
     end
   end
 
-  defp complete_planning_dispatch_receipt(transition_id, :decided, data),
+  defp complete_same_state_dispatch_receipt(transition_id, :decided, data),
     do: normalize_journal_record(journal_record(transition_id, :verified, data))
 
-  defp complete_planning_dispatch_receipt(_transition_id, :verified, _data), do: :ok
+  defp complete_same_state_dispatch_receipt(_transition_id, :verified, _data), do: :ok
 
-  defp complete_planning_dispatch_receipt(_transition_id, phase, _data),
+  defp complete_same_state_dispatch_receipt(_transition_id, phase, _data),
     do: {:error, {:invalid_dispatch_receipt_phase, phase}}
 
   defp dispatch_transition_id(%Issue{} = issue) do
@@ -2753,7 +2756,8 @@ defmodule SymphonyElixir.Orchestrator do
         :dispatch_planning,
         :dispatch_implementation,
         :dispatch_review,
-        :dispatch_rework
+        :dispatch_rework,
+        :dispatch_merging
       ]
 
     if event.phase == :verified and event.data[:issue_id] == issue_id and dispatch_kind?,
@@ -4033,7 +4037,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp resume_transition_snapshot(%{data: %{effect: :dispatch_receipt}} = snapshot, state) do
-    case complete_planning_dispatch_receipt(
+    case complete_same_state_dispatch_receipt(
            snapshot.transition_id,
            snapshot.phase,
            snapshot.data

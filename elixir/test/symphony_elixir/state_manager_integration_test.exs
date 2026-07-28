@@ -721,6 +721,57 @@ defmodule SymphonyElixir.StateManagerIntegrationTest do
     refute retry_one == initial
   end
 
+  test "Merging receives its own same-state dispatch causation and retry leases", %{journal: journal} do
+    issue_id = "github:pr:merging-dispatch"
+
+    review_issue = %{issue(issue_id, "Review") | updated_at: "2026-07-28T06:00:00Z"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [review_issue])
+
+    assert {:ok, %Issue{state: "Reviewing", metadata: review_metadata}} =
+             Orchestrator.mark_issue_in_progress_for_dispatch_for_test(review_issue)
+
+    assert_receive {:memory_tracker_state_projection, ^issue_id, "Review", "Reviewing"}
+
+    review_lease =
+      Orchestrator.worker_dispatch_lease_id_for_test(
+        %{review_issue | metadata: review_metadata},
+        0
+      )
+
+    record_worker_lease!(journal, review_lease, issue_id)
+
+    merging_issue = %{issue(issue_id, "Merging") | updated_at: "2026-07-28T06:05:00Z"}
+
+    assert {:ok, %Issue{state: "Merging", metadata: merging_metadata}} =
+             Orchestrator.mark_issue_in_progress_for_dispatch_for_test(merging_issue)
+
+    merging_dispatch_id = merging_metadata["symphony_transition_id"]
+
+    assert merging_metadata["symphony_dispatch_state"] == "Merging"
+    refute merging_dispatch_id == review_metadata["symphony_transition_id"]
+
+    assert {:ok,
+            %{
+              phase: :verified,
+              data: %{
+                issue_id: ^issue_id,
+                kind: :dispatch_merging,
+                from_state: "Merging",
+                to_state: "Merging"
+              }
+            }} = TransitionJournal.snapshot(journal, merging_dispatch_id)
+
+    merging_context = %{merging_issue | metadata: merging_metadata}
+    initial_lease = Orchestrator.worker_dispatch_lease_id_for_test(merging_context, nil)
+    retry_lease = Orchestrator.worker_dispatch_lease_id_for_test(merging_context, 1)
+
+    refute initial_lease == review_lease
+    refute retry_lease == initial_lease
+    assert initial_lease == "worker-dispatch:#{merging_dispatch_id}:attempt-0"
+    assert retry_lease == "worker-dispatch:#{merging_dispatch_id}:attempt-1"
+    refute_receive {:memory_tracker_state_projection, ^issue_id, _, _}
+  end
+
   test "startup recovery hands an ambiguous worker dispatch lease to human review", %{journal: journal} do
     issue = issue("github:pr:ambiguous-worker", "Reviewing")
     issue_id = issue.id

@@ -13,6 +13,7 @@ defmodule SymphonyElixir.TransitionIntent do
           | :dispatch_implementation
           | :dispatch_review
           | :dispatch_rework
+          | :dispatch_merging
           | :planning_complete
           | :implementation_complete
           | :rework_complete
