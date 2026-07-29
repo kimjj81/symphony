@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.BriefedAgentRunnerTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.Codex.OrchestrationBrief
+  alias SymphonyElixir.Codex.{OrchestrationBrief, OrchestrationEvidence}
   alias SymphonyElixir.TransitionJournal
 
   test "orchestration brief rejects output larger than 8KB" do
@@ -56,6 +56,14 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
   test "orchestration brief decoder reports missing, malformed, and non-object output" do
     issue = review_issue("decode-errors")
 
+    assert {:ok, decoded, %{source: :broker}} =
+             OrchestrationBrief.decode_for_test(
+               Jason.encode!(%{live_head: "abc123", unresolved_feedback: []}),
+               issue
+             )
+
+    assert decoded =~ "live_head: abc123"
+
     assert {:error, :missing_orchestration_brief} =
              OrchestrationBrief.decode_for_test(nil, issue)
 
@@ -77,13 +85,362 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
       unresolved_feedback: [%{thread_ref: "thread-1", feedback: "수정 필요"}]
     }
 
-    assert {:ok, rendered, %{source: :broker, lane: "Review"}} =
+    assert {:ok, rendered, %{source: :broker, lane: "Review", evidence: evidence}} =
              OrchestrationBrief.generate("/tmp", issue, snapshot_fetcher: fn _issue_id -> {:ok, snapshot} end)
 
     assert rendered =~ "live_head: abc123"
-    assert rendered =~ "thread-1"
-    assert rendered =~ "top-level"
+    assert rendered =~ "SYMPHONY_ORCHESTRATION_EVIDENCE"
+    assert rendered =~ "\"required_regions\""
+    refute rendered =~ "top-level"
+    assert evidence.content =~ "thread_ref: \"thread-1\""
+    assert evidence.content =~ "top-level"
     assert rendered =~ "GitHub를 조회하거나 변경하지 않음"
+  end
+
+  test "orchestration evidence deduplicates exact comments and indexes stable YAML regions" do
+    issue = review_issue("indexed-sidecar")
+
+    duplicate = %{
+      id: 10,
+      body: "동일한 사용자 의견\n둘째 줄",
+      author: "reviewer",
+      created_at: "2026-07-29T00:00:00Z"
+    }
+
+    snapshot = %{
+      live_head: "abc123",
+      top_level_comments: [
+        duplicate,
+        %{duplicate | id: 11, created_at: "2026-07-29T00:01:00Z"},
+        %{
+          id: 12,
+          body: "검증 완료\n<!-- sym-transition:worker:github:pr:1:session -->",
+          author: "symphony"
+        },
+        %{
+          id: 13,
+          body: "Review로 복구\n<!-- sym-transition:projection-drift:digest -->",
+          author: "symphony"
+        }
+      ],
+      reviews: [],
+      inline_comments: [],
+      unresolved_feedback: [
+        %{
+          thread_ref: "thread-1",
+          path: "lib/example.ex",
+          line: 7,
+          comments: [
+            %{
+              author: "reviewer",
+              created_at: "2026-07-29T00:02:00Z",
+              url: "https://example.test/thread-1",
+              body: "원문을 보존합니다."
+            }
+          ]
+        }
+      ]
+    }
+
+    assert {:ok, rendered, %{evidence: evidence}} =
+             OrchestrationBrief.generate("/tmp", issue, snapshot_fetcher: fn _issue -> {:ok, snapshot} end)
+
+    assert byte_size(rendered) <= 8_192
+    assert evidence.bytes == byte_size(evidence.content)
+    assert evidence.sha256 == sha256(evidence.content)
+    assert {:ok, decoded} = YamlElixir.read_from_string(evidence.content)
+
+    assert [%{"body" => "동일한 사용자 의견\n둘째 줄", "occurrences" => occurrences}] =
+             decoded["human_comments"]
+
+    assert Enum.map(occurrences, & &1["id"]) == [10, 11]
+    assert [%{"body" => "검증 완료\n"}] = decoded["worker_reports"]
+    assert [%{"body" => "Review로 복구\n"}] = decoded["transition_history"]
+
+    assert [%{"thread_ref" => "thread-1", "comments" => [%{"body" => "원문을 보존합니다."}]}] =
+             decoded["unresolved_threads"]
+
+    assert [%{"original_count" => 2, "region" => "human_comments"}] =
+             decoded["deduplication_report"]
+
+    Enum.each(evidence.regions, fn {name, index} ->
+      lines = String.split(evidence.content, "\n", trim: false)
+
+      region =
+        lines
+        |> Enum.slice(index.start_line - 1, index.end_line - index.start_line + 1)
+        |> Enum.join("\n")
+        |> Kernel.<>("\n")
+
+      assert byte_size(region) == index.bytes
+      assert sha256(region) == index.sha256
+      assert String.starts_with?(region, "#{name}:")
+    end)
+  end
+
+  test "orchestration evidence enforces an inclusive 8 MiB byte limit" do
+    max_bytes = OrchestrationEvidence.max_bytes_for_test()
+
+    assert :ok = OrchestrationEvidence.validate_size_for_test(String.duplicate("x", max_bytes))
+
+    assert {:error, {:orchestration_evidence_too_large, size}} =
+             OrchestrationEvidence.validate_size_for_test(String.duplicate("x", max_bytes + 1))
+
+    assert size == max_bytes + 1
+  end
+
+  test "serialized 8 MiB sidecars are accepted and one extra byte hands off before worker startup" do
+    test_root = test_root("serialized-sidecar-limit")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+    codex_binary = write_fake_codex!(test_root, trace_file)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true,
+      tracker_active_states: ["Review", "Human Review"]
+    )
+
+    issue = review_issue("serialized-sidecar-limit")
+    max_bytes = OrchestrationEvidence.max_bytes_for_test()
+    exact_snapshot = evidence_snapshot_with_exact_size(issue, max_bytes)
+
+    assert {:ok, compact, %{evidence: %{bytes: ^max_bytes}}} =
+             OrchestrationBrief.generate("/tmp", issue, snapshot_fetcher: fn _issue -> {:ok, exact_snapshot} end)
+
+    assert byte_size(compact) <= 8_192
+
+    oversized_snapshot =
+      update_in(exact_snapshot, [:work_item, :description], &(&1 <> "x"))
+
+    assert {:error, {:orchestration_evidence_too_large, oversized_bytes}} =
+             OrchestrationBrief.generate("/tmp", issue, snapshot_fetcher: fn _issue -> {:ok, oversized_snapshot} end)
+
+    assert oversized_bytes == max_bytes + 1
+    parent = self()
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               snapshot_fetcher: fn _issue -> {:ok, oversized_snapshot} end,
+               tracker_commenter: fn issue_id, body ->
+                 send(parent, {:oversized_handoff_comment, issue_id, body})
+                 :ok
+               end,
+               tracker_state_updater: fn issue_id, state ->
+                 send(parent, {:oversized_handoff_state, issue_id, state})
+                 :ok
+               end
+             )
+
+    assert_receive {:oversized_handoff_comment, "github:pr:serialized-sidecar-limit", body}
+    assert body =~ "orchestration_evidence_too_large"
+    assert_receive {:oversized_handoff_state, "github:pr:serialized-sidecar-limit", "Human Review"}
+    refute File.exists?(trace_file)
+  end
+
+  test "orchestration evidence fails closed for invalid inputs and index corruption" do
+    issue = review_issue("invalid-evidence")
+
+    assert {:error, :invalid_dispatch_snapshot} = OrchestrationEvidence.build([], issue)
+
+    assert {:error, {:orchestration_evidence_generation_failed, _reason}} =
+             OrchestrationEvidence.build(%{unresolved_feedback: :invalid}, issue)
+
+    assert {:error, {:invalid_orchestration_evidence_yaml, _reason}} =
+             OrchestrationEvidence.validate_rendered_for_test("not: [yaml", %{})
+
+    assert {:error, :invalid_orchestration_evidence_yaml} =
+             OrchestrationEvidence.validate_rendered_for_test("schema_version: 2\nindex: {}\n", %{})
+
+    snapshot = %{
+      work_item: %{
+        identifier: "BOOL-1",
+        title: false,
+        description: "",
+        url: "https://example.test/bool",
+        kind: true
+      },
+      unresolved_feedback: [],
+      top_level_comments: ["unstructured occurrence"],
+      reviews: [],
+      inline_comments: []
+    }
+
+    assert {:ok, content, descriptor} = OrchestrationEvidence.build(snapshot, issue)
+    assert content =~ "title: false"
+    assert content =~ "kind: true"
+    assert content =~ "description: |-2"
+
+    unexpected_index_region =
+      String.replace(content, "index:\n", "index:\n  unexpected:\n    count: 0\n", global: false)
+
+    assert {:error, {:orchestration_evidence_index_mismatch, "index"}} =
+             OrchestrationEvidence.validate_rendered_for_test(
+               unexpected_index_region,
+               descriptor.regions
+             )
+
+    corrupted_section = String.replace(content, "title: false", "title: true ", global: false)
+
+    assert {:error, {:orchestration_evidence_index_mismatch, "work_item"}} =
+             OrchestrationEvidence.validate_rendered_for_test(
+               corrupted_section,
+               descriptor.regions
+             )
+
+    work_item_index = descriptor.regions["work_item"]
+
+    corruptions = [
+      {"start_line: \"#{padded_line(work_item_index.start_line)}\"", "start_line: \"99999999\""},
+      {"end_line: \"#{padded_line(work_item_index.end_line)}\"", "end_line: \"99999999\""},
+      {"count: #{work_item_index.count}", "count: #{work_item_index.count + 1}"},
+      {"bytes: #{work_item_index.bytes}", "bytes: #{work_item_index.bytes + 1}"},
+      {"sha256: \"#{work_item_index.sha256}\"", "sha256: \"#{String.duplicate("0", 64)}\""}
+    ]
+
+    Enum.each(corruptions, fn {current, replacement} ->
+      corrupted = String.replace(content, current, replacement, global: false)
+      refute corrupted == content
+
+      assert {:error, {:orchestration_evidence_index_mismatch, "work_item"}} =
+               OrchestrationEvidence.validate_rendered_for_test(corrupted, descriptor.regions)
+    end)
+  end
+
+  test "marker removal preserves whitespace distinctions while exact reports share occurrences" do
+    issue = review_issue("marker-whitespace")
+    marker = "\n<!-- sym-transition:worker:test -->"
+
+    snapshot = %{
+      top_level_comments: [
+        %{id: 1, author: "bot", body: " report" <> marker},
+        %{id: 2, author: "bot", body: "report" <> marker},
+        %{id: 3, author: "bot", body: "report" <> marker}
+      ],
+      reviews: [],
+      inline_comments: [],
+      unresolved_feedback: []
+    }
+
+    assert {:ok, content, _descriptor} = OrchestrationEvidence.build(snapshot, issue)
+    assert {:ok, decoded} = YamlElixir.read_from_string(content)
+
+    assert [
+             %{"body" => " report\n", "occurrences" => [%{"id" => 1}]},
+             %{"body" => "report\n", "occurrences" => [%{"id" => 2}, %{"id" => 3}]}
+           ] = decoded["worker_reports"]
+  end
+
+  test "literal bodies preserve normalized multiline and trailing newline content" do
+    issue = review_issue("literal-newlines")
+
+    bodies = [
+      "",
+      "multiple\nlines",
+      "same",
+      "same\n",
+      "same\n\n",
+      "\n",
+      "\n\n",
+      "windows\r\nlines\r\n"
+    ]
+
+    snapshot = %{
+      top_level_comments:
+        bodies
+        |> Enum.with_index(1)
+        |> Enum.map(fn {body, id} -> %{id: id, author: "reviewer", body: body} end),
+      reviews: [],
+      inline_comments: [],
+      unresolved_feedback: []
+    }
+
+    assert {:ok, content, _descriptor} = OrchestrationEvidence.build(snapshot, issue)
+    assert content =~ "body: |-2"
+    assert content =~ "body: |+2"
+    assert {:ok, decoded} = YamlElixir.read_from_string(content)
+
+    assert Enum.map(decoded["human_comments"], & &1["body"]) == [
+             "",
+             "multiple\nlines",
+             "same",
+             "same\n",
+             "same\n\n",
+             "\n",
+             "\n\n",
+             "windows\nlines\n"
+           ]
+  end
+
+  test "large evidence preserves canonical and occurrence order with linear accumulators" do
+    issue = review_issue("large-linear-evidence")
+
+    unique =
+      Enum.map(1..2_000, fn id ->
+        %{id: id, author: "reviewer", body: "comment-#{id}"}
+      end)
+
+    snapshot = %{
+      top_level_comments: unique ++ [%{id: 2_001, author: "reviewer", body: "comment-1"}],
+      reviews: [],
+      inline_comments: [],
+      unresolved_feedback: []
+    }
+
+    assert {:ok, content, _descriptor} = OrchestrationEvidence.build(snapshot, issue)
+    assert {:ok, decoded} = YamlElixir.read_from_string(content)
+    assert length(decoded["human_comments"]) == 2_000
+
+    assert %{"body" => "comment-1", "occurrences" => [%{"id" => 1}, %{"id" => 2_001}]} =
+             List.first(decoded["human_comments"])
+
+    assert %{"body" => "comment-2000", "occurrences" => [%{"id" => 2_000}]} =
+             List.last(decoded["human_comments"])
+  end
+
+  test "merging evidence requires worker reports" do
+    issue = %{review_issue("merging-evidence") | state: "Merging"}
+
+    assert {:ok, _content, descriptor} =
+             OrchestrationEvidence.build(
+               %{top_level_comments: [], reviews: [], inline_comments: [], unresolved_feedback: []},
+               issue
+             )
+
+    assert descriptor.required_regions == [
+             "work_item",
+             "unresolved_threads",
+             "human_comments",
+             "review_summaries",
+             "inline_comments",
+             "worker_reports"
+           ]
+  end
+
+  test "large PR history uses an indexed sidecar instead of overflowing the compact brief" do
+    issue = %{review_issue("large-history") | description: String.duplicate("본문 문맥\n", 520)}
+
+    snapshot = %{
+      live_head: String.duplicate("a", 40),
+      top_level_comments: [
+        %{body: String.duplicate("이전 worker 검증 결과 ", 70) <> "\n<!-- sym-transition:worker:one -->"},
+        %{body: String.duplicate("확인 검토 결과 ", 70) <> "\n<!-- sym-transition:worker:two -->"}
+      ],
+      reviews: [],
+      inline_comments: [],
+      unresolved_feedback: []
+    }
+
+    assert {:ok, compact, %{evidence: evidence}} =
+             OrchestrationBrief.generate("/tmp", issue, snapshot_fetcher: fn _issue -> {:ok, snapshot} end)
+
+    assert byte_size(compact) <= 8_192
+    assert byte_size(evidence.content) > byte_size(compact)
+    assert {:ok, decoded} = YamlElixir.read_from_string(evidence.content)
+    assert decoded["work_item"]["description"] == issue.description
+    assert compact =~ "worker_reports"
   end
 
   test "orchestration brief returns a broker snapshot failure" do
@@ -91,6 +448,11 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
 
     assert {:error, {:github_api_status, 401, %{}}} =
              OrchestrationBrief.generate("/tmp", review_issue("broker-failure"), snapshot_fetcher: snapshot_fetcher)
+  end
+
+  test "orchestration brief rejects a non-map broker snapshot" do
+    assert {:error, :invalid_dispatch_snapshot} =
+             OrchestrationBrief.generate("/tmp", review_issue("invalid-snapshot"), snapshot_fetcher: fn _issue -> {:ok, []} end)
   end
 
   test "fallback handles an unknown lane deterministically" do
@@ -307,6 +669,16 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
 
     assert :ok =
              AgentRunner.run(issue, nil,
+               snapshot_fetcher: fn _issue ->
+                 {:ok,
+                  %{
+                    live_head: nil,
+                    top_level_comments: [],
+                    reviews: [],
+                    inline_comments: [],
+                    unresolved_feedback: []
+                  }}
+               end,
                state_manager_requester: fn intent ->
                  send(parent, {:worker_outcome, intent})
                  {:ok, %{}}
@@ -323,7 +695,7 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
 
     trace = File.read!(trace_file)
     assert trace =~ "Execution mode: implementation"
-    assert trace =~ "Implement the approved issue scope"
+    assert trace =~ "Implement the approved scope"
     assert trace =~ "work_item:"
     assert trace =~ "\"implementation_complete\""
     refute trace =~ "\"planning_complete\""
@@ -528,6 +900,70 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     refute trace =~ "You are an agent for this repository."
   end
 
+  test "each fresh legacy worker receives a newly generated sidecar for the current lane" do
+    test_root = test_root("fresh-sidecars")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+    codex_binary = write_fake_codex!(test_root, trace_file)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true,
+      max_turns: 2,
+      tracker_active_states: ["Review", "Rework", "Human Review"]
+    )
+
+    issue = review_issue("fresh-sidecars")
+    states = start_supervised!({Agent, fn -> ["Rework", "Human Review"] end})
+    parent = self()
+
+    snapshot_fetcher = fn brief_issue ->
+      send(parent, {:snapshot_lane, brief_issue.state})
+
+      {:ok,
+       %{
+         live_head: "head-#{String.downcase(brief_issue.state)}",
+         top_level_comments: [
+           %{id: brief_issue.state, author: "reviewer", body: "feedback for #{brief_issue.state}"}
+         ],
+         reviews: [],
+         inline_comments: [],
+         unresolved_feedback: []
+       }}
+    end
+
+    assert :ok =
+             AgentRunner.run(issue, self(),
+               snapshot_fetcher: snapshot_fetcher,
+               issue_state_fetcher: fn [_issue_id] ->
+                 next_state = Agent.get_and_update(states, fn [next | rest] -> {next, rest} end)
+                 {:ok, [%{issue | state: next_state}]}
+               end
+             )
+
+    assert_receive {:snapshot_lane, "Review"}
+    assert_receive {:snapshot_lane, "Rework"}
+
+    assert_receive {
+      :codex_worker_update,
+      "github:pr:fresh-sidecars",
+      %{event: :orchestration_brief, payload: %{lane: "Review", evidence: review_evidence}}
+    }
+
+    assert_receive {
+      :codex_worker_update,
+      "github:pr:fresh-sidecars",
+      %{event: :orchestration_brief, payload: %{lane: "Rework", evidence: rework_evidence}}
+    }
+
+    refute Map.has_key?(review_evidence, :content)
+    refute Map.has_key?(rework_evidence, :content)
+    refute review_evidence.sha256 == rework_evidence.sha256
+    assert count_lines(File.read!(trace_file), "THREAD:") == 2
+  end
+
   test "authoritative preflight failure hands off without starting a worker" do
     test_root = test_root("authoritative-preflight-handoff")
     on_exit(fn -> File.rm_rf(test_root) end)
@@ -679,9 +1115,9 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
 
     assert :ok =
              AgentRunner.run(issue, nil,
-               brief_generator: fn _workspace, _issue ->
-                 send(parent, :brief_generated)
-                 {:ok, "lane: Review\nfocused_verification: direct test only"}
+               brief_generator: fn _workspace, brief_issue ->
+                 send(parent, {:brief_generated, brief_issue.state})
+                 {:ok, "lane: #{brief_issue.state}\nfocused_verification: direct test only"}
                end,
                issue_state_fetcher: fn [_issue_id] ->
                  next_state = Agent.get_and_update(states, fn [next | rest] -> {next, rest} end)
@@ -697,8 +1133,11 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
                end
              )
 
-    assert_receive :brief_generated
-    refute_receive :brief_generated
+    for expected_state <- ["Review", "Rework", "Review", "Rework", "Review", "Rework", "Review"] do
+      assert_receive {:brief_generated, ^expected_state}
+    end
+
+    refute_receive {:brief_generated, _state}
     refute_receive {:handoff_comment, "github:pr:limit", _body}
     refute_receive {:handoff_state, "github:pr:limit", "Human Review"}
 
@@ -1387,6 +1826,64 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     text
     |> String.split("\n", trim: true)
     |> Enum.count(&String.starts_with?(&1, prefix))
+  end
+
+  defp sha256(value) do
+    :crypto.hash(:sha256, value)
+    |> Base.encode16(case: :lower)
+  end
+
+  defp padded_line(value) do
+    value
+    |> Integer.to_string()
+    |> String.pad_leading(8, "0")
+  end
+
+  defp evidence_snapshot_with_exact_size(issue, target_bytes) do
+    initial_description_bytes = target_bytes - 4_096
+    fit_evidence_snapshot(issue, target_bytes, initial_description_bytes, 12)
+  end
+
+  defp fit_evidence_snapshot(_issue, target_bytes, _description_bytes, 0) do
+    flunk("could not fit serialized evidence to exactly #{target_bytes} bytes")
+  end
+
+  defp fit_evidence_snapshot(issue, target_bytes, description_bytes, attempts_left) do
+    snapshot = %{
+      work_item: %{
+        identifier: issue.identifier,
+        title: issue.title,
+        description: String.duplicate("x", description_bytes),
+        url: issue.url,
+        kind: issue.kind
+      },
+      live_head: String.duplicate("a", 40),
+      top_level_comments: [],
+      reviews: [],
+      inline_comments: [],
+      unresolved_feedback: []
+    }
+
+    case OrchestrationEvidence.build(snapshot, issue) do
+      {:ok, content, _descriptor} when byte_size(content) == target_bytes ->
+        snapshot
+
+      {:ok, content, _descriptor} ->
+        fit_evidence_snapshot(
+          issue,
+          target_bytes,
+          description_bytes + target_bytes - byte_size(content),
+          attempts_left - 1
+        )
+
+      {:error, {:orchestration_evidence_too_large, actual_bytes}} ->
+        fit_evidence_snapshot(
+          issue,
+          target_bytes,
+          description_bytes - (actual_bytes - target_bytes),
+          attempts_left - 1
+        )
+    end
   end
 
   defp enable_authoritative_mode! do

@@ -35,6 +35,7 @@ defmodule SymphonyElixir.WorkerOutcomeTest do
 
     invalid = %{thread_ref: "thread-1", disposition: "fixed", reply_ko: "", evidence: []}
     assert {:error, :invalid_review_thread_updates} = WorkerOutcome.new(Map.put(base, :review_thread_updates, [invalid]))
+    assert {:error, :invalid_review_thread_updates} = WorkerOutcome.new(Map.put(base, :review_thread_updates, ["invalid"]))
 
     duplicate = %{thread_ref: "thread-1", disposition: "fixed", reply_ko: "수정했습니다.", evidence: []}
     assert {:error, :invalid_review_thread_updates} = WorkerOutcome.new(Map.put(base, :review_thread_updates, [duplicate, duplicate]))

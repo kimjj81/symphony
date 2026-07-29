@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_interrupt_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @max_orchestration_evidence_bytes 8 * 1024 * 1024
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
 
   @type session :: %{
@@ -25,7 +26,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
-          gh_config_dir: Path.t() | nil
+          gh_config_dir: Path.t() | nil,
+          orchestration_evidence_path: Path.t() | nil
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -44,10 +46,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
     codex_command = Keyword.get(opts, :codex_command) || Config.settings!().codex.command
     worker_tool_policy = Keyword.get(opts, :worker_tool_policy, :broker_only)
+    orchestration_evidence = Keyword.get(opts, :orchestration_evidence)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          :ok <- validate_worker_tool_policy(worker_tool_policy),
-         {:ok, port, gh_config_dir} <- start_port(expanded_workspace, worker_host, codex_command) do
+         {:ok, port, gh_config_dir, evidence_path} <-
+           start_port(expanded_workspace, worker_host, codex_command, orchestration_evidence) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
@@ -65,7 +69,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host,
-           gh_config_dir: gh_config_dir
+           gh_config_dir: gh_config_dir,
+           orchestration_evidence_path: evidence_path
          }}
       else
         {:error, reason} ->
@@ -256,7 +261,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil, codex_command) do
+  defp start_port(workspace, nil, codex_command, orchestration_evidence) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -266,46 +271,63 @@ defmodule SymphonyElixir.Codex.AppServer do
       :ok = File.mkdir_p(gh_config_dir)
       :ok = File.chmod(gh_config_dir, 0o700)
 
-      port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(executable)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(local_worker_command(codex_command))],
-            cd: String.to_charlist(workspace),
-            env: worker_environment(gh_config_dir),
-            line: @port_line_bytes
-          ]
-        )
+      case prepare_local_orchestration_evidence(gh_config_dir, orchestration_evidence) do
+        {:ok, evidence_path} ->
+          port =
+            Port.open(
+              {:spawn_executable, String.to_charlist(executable)},
+              [
+                :binary,
+                :exit_status,
+                :stderr_to_stdout,
+                args: [~c"-lc", String.to_charlist(local_worker_command(codex_command))],
+                cd: String.to_charlist(workspace),
+                env: worker_environment(gh_config_dir, evidence_path),
+                line: @port_line_bytes
+              ]
+            )
 
-      {:ok, port, gh_config_dir}
+          {:ok, port, gh_config_dir, evidence_path}
+
+        {:error, reason} ->
+          remove_worker_gh_config_dir(gh_config_dir)
+          {:error, reason}
+      end
     end
   end
 
-  defp start_port(workspace, worker_host, codex_command) when is_binary(worker_host) do
+  defp start_port(workspace, worker_host, codex_command, orchestration_evidence)
+       when is_binary(worker_host) do
     gh_config_dir = worker_gh_config_dir("/tmp")
-    remote_command = remote_launch_command(workspace, codex_command, gh_config_dir)
 
-    case SSH.start_port(worker_host, remote_command, line: @port_line_bytes) do
-      {:ok, port} -> {:ok, port, nil}
-      error -> error
+    with {:ok, evidence_path} <-
+           prepare_remote_orchestration_evidence(worker_host, gh_config_dir, orchestration_evidence) do
+      remote_command = remote_launch_command(workspace, codex_command, gh_config_dir, evidence_path)
+
+      case SSH.start_port(worker_host, remote_command, line: @port_line_bytes) do
+        {:ok, port} ->
+          {:ok, port, nil, evidence_path}
+
+        {:error, reason} ->
+          cleanup_remote_worker_runtime(worker_host, gh_config_dir)
+          {:error, reason}
+      end
     end
   end
 
-  defp remote_launch_command(workspace, codex_command, gh_config_dir) when is_binary(workspace) do
+  defp remote_launch_command(workspace, codex_command, gh_config_dir, evidence_path)
+       when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
       "umask 077",
       "mkdir -p #{shell_escape(gh_config_dir)}",
       "trap 'rm -rf -- #{gh_config_dir}' EXIT",
-      "#{remote_worker_environment(gh_config_dir)} #{codex_command}"
+      "#{remote_worker_environment(gh_config_dir, evidence_path)} #{codex_command}"
     ]
     |> Enum.join(" && ")
   end
 
-  defp worker_environment(gh_config_dir) do
+  defp worker_environment(gh_config_dir, evidence_path) do
     scrubbed =
       worker_write_token_envs()
       |> Enum.map(&{String.to_charlist(&1), false})
@@ -314,7 +336,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       [
         {~c"GH_CONFIG_DIR", String.to_charlist(gh_config_dir)},
         {~c"GIT_TERMINAL_PROMPT", ~c"0"}
-      ] ++ worker_cache_environment(gh_config_dir) ++ scrubbed
+      ] ++ evidence_environment(evidence_path) ++ worker_cache_environment(gh_config_dir) ++ scrubbed
 
     base
   end
@@ -326,12 +348,13 @@ defmodule SymphonyElixir.Codex.AppServer do
     "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0='' #{codex_command}"
   end
 
-  defp remote_worker_environment(gh_config_dir) do
+  defp remote_worker_environment(gh_config_dir, evidence_path) do
     # Names were validated by worker_write_token_envs/0, so they can be emitted
     # as shell identifiers without quoting while preserving a readable command.
     unset = "env" <> Enum.map_join(worker_write_token_envs(), "", &" -u #{&1}")
     config_dir = "GH_CONFIG_DIR=#{shell_escape(gh_config_dir)}"
     cache_environment = remote_worker_cache_environment(gh_config_dir)
+    evidence_environment = remote_evidence_environment(evidence_path)
 
     git_credentials =
       "GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=''"
@@ -339,7 +362,175 @@ defmodule SymphonyElixir.Codex.AppServer do
     # SSH exposes the remote command to local process inspection. Workers use
     # the broker-owned immutable tracker snapshot, so neither local nor remote
     # workers receive tracker credentials.
-    Enum.join([unset, config_dir, cache_environment, git_credentials], " ")
+    Enum.join([unset, config_dir, cache_environment, evidence_environment, git_credentials], " ")
+  end
+
+  defp evidence_environment(path) when is_binary(path),
+    do: [{~c"SYMPHONY_ORCHESTRATION_EVIDENCE", String.to_charlist(path)}]
+
+  defp evidence_environment(_path), do: []
+
+  defp remote_evidence_environment(path) when is_binary(path),
+    do: "SYMPHONY_ORCHESTRATION_EVIDENCE=#{shell_escape(path)}"
+
+  defp remote_evidence_environment(_path), do: ""
+
+  defp prepare_local_orchestration_evidence(_runtime_dir, nil), do: {:ok, nil}
+
+  defp prepare_local_orchestration_evidence(runtime_dir, evidence) when is_map(evidence) do
+    with {:ok, payload} <- validate_orchestration_evidence(evidence),
+         path = Path.join(runtime_dir, payload.filename),
+         :ok <- File.write(path, payload.content, [:binary, :exclusive]),
+         :ok <- File.chmod(path, 0o400),
+         {:ok, written} <- File.read(path),
+         :ok <- verify_orchestration_evidence(written, payload) do
+      {:ok, path}
+    else
+      {:error, reason} -> {:error, {:orchestration_evidence_write_failed, reason}}
+    end
+  end
+
+  defp prepare_local_orchestration_evidence(_runtime_dir, _evidence),
+    do: {:error, {:orchestration_evidence_write_failed, :invalid_orchestration_evidence}}
+
+  defp prepare_remote_orchestration_evidence(_worker_host, _runtime_dir, nil), do: {:ok, nil}
+
+  defp prepare_remote_orchestration_evidence(worker_host, runtime_dir, evidence)
+       when is_map(evidence) do
+    with {:ok, payload} <- validate_orchestration_evidence(evidence),
+         :ok <- create_remote_worker_runtime(worker_host, runtime_dir),
+         remote_path = Path.join(runtime_dir, payload.filename),
+         :ok <- copy_remote_orchestration_evidence(worker_host, remote_path, payload),
+         :ok <- verify_remote_orchestration_evidence(worker_host, remote_path, payload) do
+      {:ok, remote_path}
+    else
+      {:error, reason} ->
+        cleanup_remote_worker_runtime(worker_host, runtime_dir)
+        {:error, {:orchestration_evidence_upload_failed, reason}}
+    end
+  end
+
+  defp prepare_remote_orchestration_evidence(_worker_host, _runtime_dir, _evidence),
+    do: {:error, {:orchestration_evidence_upload_failed, :invalid_orchestration_evidence}}
+
+  defp validate_orchestration_evidence(evidence) do
+    filename = Map.get(evidence, :filename) || Map.get(evidence, "filename")
+    content = Map.get(evidence, :content) || Map.get(evidence, "content")
+    bytes = Map.get(evidence, :bytes) || Map.get(evidence, "bytes")
+    digest = Map.get(evidence, :sha256) || Map.get(evidence, "sha256")
+
+    with :ok <- validate_evidence_filename(filename),
+         :ok <- validate_evidence_content(content),
+         :ok <- validate_evidence_size(content, bytes),
+         :ok <- validate_evidence_digest(content, digest) do
+      {:ok, %{filename: filename, content: content, bytes: bytes, sha256: digest}}
+    end
+  end
+
+  defp validate_evidence_filename(filename)
+       when is_binary(filename) and filename != "" do
+    if Path.basename(filename) == filename,
+      do: :ok,
+      else: {:error, :invalid_orchestration_evidence_filename}
+  end
+
+  defp validate_evidence_filename(_filename),
+    do: {:error, :invalid_orchestration_evidence_filename}
+
+  defp validate_evidence_content(content) when is_binary(content), do: :ok
+  defp validate_evidence_content(_content), do: {:error, :invalid_orchestration_evidence_content}
+
+  defp validate_evidence_size(content, bytes) when is_binary(content) and is_integer(bytes) do
+    cond do
+      bytes != byte_size(content) ->
+        {:error, :orchestration_evidence_size_mismatch}
+
+      bytes > @max_orchestration_evidence_bytes ->
+        {:error, {:orchestration_evidence_too_large, bytes}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_evidence_size(_content, _bytes), do: {:error, :orchestration_evidence_size_mismatch}
+
+  defp validate_evidence_digest(content, digest)
+       when is_binary(content) and is_binary(digest) do
+    if digest == sha256(content),
+      do: :ok,
+      else: {:error, :orchestration_evidence_digest_mismatch}
+  end
+
+  defp validate_evidence_digest(_content, _digest),
+    do: {:error, :orchestration_evidence_digest_mismatch}
+
+  defp verify_orchestration_evidence(content, payload) do
+    if byte_size(content) == payload.bytes and sha256(content) == payload.sha256 do
+      :ok
+    else
+      {:error, :orchestration_evidence_verification_failed}
+    end
+  end
+
+  defp create_remote_worker_runtime(worker_host, runtime_dir) do
+    command = "umask 077 && mkdir -p #{shell_escape(runtime_dir)} && chmod 700 #{shell_escape(runtime_dir)}"
+
+    case SSH.run(worker_host, command, stderr_to_stdout: true) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, status}} -> {:error, {:remote_runtime_create_failed, status, output}}
+      {:error, reason} -> {:error, {:remote_runtime_create_failed, reason}}
+    end
+  end
+
+  defp copy_remote_orchestration_evidence(worker_host, remote_path, payload) do
+    staging_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-orchestration-evidence-#{System.unique_integer([:positive, :monotonic])}.yaml"
+      )
+
+    try do
+      with :ok <- File.write(staging_path, payload.content, [:binary, :exclusive]),
+           :ok <- File.chmod(staging_path, 0o600),
+           {:ok, {_output, 0}} <-
+             SSH.copy_to(worker_host, staging_path, remote_path, stderr_to_stdout: true) do
+        :ok
+      else
+        {:ok, {output, status}} -> {:error, {:remote_evidence_copy_failed, status, output}}
+        {:error, reason} -> {:error, {:remote_evidence_copy_failed, reason}}
+      end
+    after
+      File.rm(staging_path)
+    end
+  end
+
+  defp verify_remote_orchestration_evidence(worker_host, remote_path, payload) do
+    escaped_path = shell_escape(remote_path)
+
+    command =
+      [
+        """
+        test "$(wc -c < #{escaped_path} | tr -d ' ')" = "#{payload.bytes}"
+        """,
+        """
+        test "$(sha256sum #{escaped_path} | cut -d' ' -f1)" = "#{payload.sha256}"
+        """,
+        "chmod 400 #{escaped_path}"
+      ]
+      |> Enum.map_join(" && ", &String.trim/1)
+
+    case SSH.run(worker_host, command, stderr_to_stdout: true) do
+      {:ok, {_output, 0}} -> :ok
+      {:ok, {output, status}} -> {:error, {:remote_evidence_verification_failed, status, output}}
+      {:error, reason} -> {:error, {:remote_evidence_verification_failed, reason}}
+    end
+  end
+
+  defp cleanup_remote_worker_runtime(worker_host, runtime_dir) do
+    command = "rm -rf -- #{shell_escape(runtime_dir)}"
+    _ = SSH.run(worker_host, command, stderr_to_stdout: true)
+    :ok
   end
 
   defp worker_cache_environment(gh_config_dir) do
@@ -389,6 +580,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     do: File.rm_rf(path) |> then(fn _ -> :ok end)
 
   defp remove_worker_gh_config_dir(_path), do: :ok
+
+  defp sha256(value) do
+    :crypto.hash(:sha256, value)
+    |> Base.encode16(case: :lower)
+  end
 
   defp port_metadata(port, worker_host) when is_port(port) do
     base_metadata =

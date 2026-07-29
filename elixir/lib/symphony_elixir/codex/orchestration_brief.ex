@@ -1,13 +1,14 @@
 defmodule SymphonyElixir.Codex.OrchestrationBrief do
   @moduledoc false
 
+  alias SymphonyElixir.Codex.OrchestrationEvidence
   alias SymphonyElixir.Tracker
   alias SymphonyElixir.Tracker.Issue
 
   @max_bytes 8_192
 
   @spec generate(Path.t(), Issue.t(), keyword()) :: {:ok, String.t(), map()} | {:error, term()}
-  def generate(workspace, %Issue{} = issue, opts \\ []) do
+  def generate(workspace, %Issue{} = issue, opts) do
     case Keyword.get(opts, :brief_generator) do
       generator when is_function(generator, 2) ->
         normalize_generated(generator.(workspace, issue), issue)
@@ -50,19 +51,43 @@ defmodule SymphonyElixir.Codex.OrchestrationBrief do
   def normalize_for_test(result, issue), do: normalize_generated(result, issue)
 
   defp render_snapshot(snapshot, issue) when is_map(snapshot) do
-    rendered = snapshot |> snapshot_brief(issue) |> render()
+    with {:ok, evidence, descriptor} <- OrchestrationEvidence.build(snapshot, issue) do
+      rendered = snapshot |> snapshot_brief(issue, descriptor) |> render()
 
-    normalize_snapshot_rendered(rendered, issue)
+      normalize_snapshot_rendered(rendered, issue, evidence, descriptor)
+    end
   end
 
   defp render_snapshot(_snapshot, _issue), do: {:error, :invalid_dispatch_snapshot}
 
-  defp snapshot_brief(snapshot, issue) do
+  defp snapshot_brief(snapshot, issue, descriptor) do
+    work_item = snapshot_value(snapshot, :work_item, work_item_context(issue))
+
     %{
-      work_item: snapshot_value(snapshot, :work_item, work_item_context(issue)),
+      work_item: %{
+        identifier: snapshot_value(work_item, :identifier, issue.identifier),
+        title: snapshot_value(work_item, :title, issue.title),
+        url: snapshot_value(work_item, :url, issue.url),
+        kind: snapshot_value(work_item, :kind, issue.kind)
+      },
       live_head: snapshot_value(snapshot, :live_head, nil),
-      unresolved_feedback: snapshot_value(snapshot, :unresolved_feedback, []),
-      feedback: snapshot_feedback(snapshot),
+      unresolved_feedback: %{
+        source: "sidecar",
+        count: get_in(descriptor, [:regions, "unresolved_threads", :count])
+      },
+      feedback: %{
+        source: "sidecar",
+        counts: Map.new(descriptor.regions, fn {name, entry} -> {name, entry.count} end)
+      },
+      evidence_sidecar: %{
+        path_env: "SYMPHONY_ORCHESTRATION_EVIDENCE",
+        format: descriptor.format,
+        schema_version: descriptor.schema_version,
+        bytes: descriptor.bytes,
+        sha256: descriptor.sha256,
+        required_regions: descriptor.required_regions,
+        regions: descriptor.regions
+      },
       focused_verification: ["git diff --check 및 변경 파일을 직접 다루는 focused verification만 실행"],
       stop_conditions: [
         "remote head drift, broker snapshot API failure, credible focused verification 부재 시 중단하고 보고",
@@ -71,21 +96,19 @@ defmodule SymphonyElixir.Codex.OrchestrationBrief do
     }
   end
 
-  defp snapshot_feedback(snapshot) do
-    %{
-      top_level_comments: snapshot_value(snapshot, :top_level_comments, []),
-      reviews: snapshot_value(snapshot, :reviews, []),
-      inline_comments: snapshot_value(snapshot, :inline_comments, [])
-    }
-  end
-
   defp snapshot_value(snapshot, key, default) do
     Map.get(snapshot, key) || Map.get(snapshot, Atom.to_string(key)) || default
   end
 
-  defp normalize_snapshot_rendered(rendered, issue) do
+  defp normalize_snapshot_rendered(rendered, issue, evidence, descriptor) do
     if byte_size(rendered) <= @max_bytes do
-      {:ok, rendered, %{source: :broker, bytes: byte_size(rendered), lane: issue.state}}
+      {:ok, rendered,
+       %{
+         source: :broker,
+         bytes: byte_size(rendered),
+         lane: issue.state,
+         evidence: Map.put(descriptor, :content, evidence)
+       }}
     else
       {:error, {:orchestration_brief_too_large, byte_size(rendered)}}
     end
@@ -118,6 +141,7 @@ defmodule SymphonyElixir.Codex.OrchestrationBrief do
       {"live_head", Map.get(brief, "live_head") || Map.get(brief, :live_head)},
       {"unresolved_feedback", Map.get(brief, "unresolved_feedback") || Map.get(brief, :unresolved_feedback)},
       {"feedback", Map.get(brief, "feedback") || Map.get(brief, :feedback)},
+      {"evidence_sidecar", Map.get(brief, "evidence_sidecar") || Map.get(brief, :evidence_sidecar)},
       {"focused_verification", Map.get(brief, "focused_verification") || Map.get(brief, :focused_verification)},
       {"stop_conditions", Map.get(brief, "stop_conditions") || Map.get(brief, :stop_conditions)}
     ]

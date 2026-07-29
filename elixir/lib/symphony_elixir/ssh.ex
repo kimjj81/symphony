@@ -26,6 +26,23 @@ defmodule SymphonyElixir.SSH do
     end
   end
 
+  @spec copy_to(String.t(), Path.t(), Path.t(), keyword()) ::
+          {:ok, {String.t(), non_neg_integer()}} | {:error, term()}
+  def copy_to(host, local_path, remote_path, opts \\ [])
+      when is_binary(host) and is_binary(local_path) and is_binary(remote_path) do
+    with {:ok, executable} <- scp_executable() do
+      %{destination: destination, port: port} = parse_target(host)
+
+      args =
+        []
+        |> maybe_put_config()
+        |> maybe_put_scp_port(port)
+        |> Kernel.++(["--", local_path, "#{destination}:#{remote_path}"])
+
+      {:ok, System.cmd(executable, args, opts)}
+    end
+  end
+
   @spec remote_shell_command(String.t()) :: String.t()
   def remote_shell_command(command) when is_binary(command) do
     "bash -lc " <> shell_escape(command)
@@ -34,6 +51,13 @@ defmodule SymphonyElixir.SSH do
   defp ssh_executable do
     case System.find_executable("ssh") do
       nil -> {:error, :ssh_not_found}
+      executable -> {:ok, executable}
+    end
+  end
+
+  defp scp_executable do
+    case System.find_executable("scp") do
+      nil -> {:error, :scp_not_found}
       executable -> {:ok, executable}
     end
   end
@@ -63,6 +87,9 @@ defmodule SymphonyElixir.SSH do
 
   defp maybe_put_port(args, nil), do: args
   defp maybe_put_port(args, port), do: args ++ ["-p", port]
+
+  defp maybe_put_scp_port(args, nil), do: args
+  defp maybe_put_scp_port(args, port), do: args ++ ["-P", port]
 
   defp parse_target(target) when is_binary(target) do
     trimmed_target = String.trim(target)

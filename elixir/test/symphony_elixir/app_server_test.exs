@@ -24,6 +24,159 @@ defmodule SymphonyElixir.AppServerTest do
     assert AppServer.final_agent_message(%{}) == nil
   end
 
+  test "local worker receives verified orchestration evidence and cleanup removes it" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-evidence-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-EVIDENCE")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "evidence.trace")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      evidence_path="${SYMPHONY_ORCHESTRATION_EVIDENCE-}"
+      printf 'PATH=%s\n' "$evidence_path" > #{inspect(trace_file)}
+      printf 'MODE=%s\n' "$(stat -f '%Lp' "$evidence_path" 2>/dev/null || stat -c '%a' "$evidence_path")" >> #{inspect(trace_file)}
+      printf 'CONTENT=' >> #{inspect(trace_file)}
+      tr '\n' '|' < "$evidence_path" >> #{inspect(trace_file)}
+      printf '\n' >> #{inspect(trace_file)}
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-evidence"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-evidence"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-evidence","items":[],"status":"completed"}}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-evidence",
+        identifier: "MT-EVIDENCE",
+        title: "Read orchestration evidence",
+        state: "In Progress",
+        labels: []
+      }
+
+      content = "schema_version: 1\nwork_item:\n  title: \"Evidence\"\n"
+
+      evidence = %{
+        filename: "orchestration-evidence.yaml",
+        content: content,
+        bytes: byte_size(content),
+        sha256: sha256(content)
+      }
+
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Inspect evidence", issue, orchestration_evidence: evidence)
+
+      trace = File.read!(trace_file)
+      [path_line | _rest] = String.split(trace, "\n", trim: true)
+      evidence_path = String.replace_prefix(path_line, "PATH=", "")
+
+      assert trace =~ "MODE=400"
+      assert trace =~ "CONTENT=schema_version: 1|work_item:|  title: \"Evidence\"|"
+      refute File.exists?(evidence_path)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "local evidence validation and startup failures clean the worker runtime" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-evidence-failure-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-EVIDENCE-FAILURE")
+      codex_binary = Path.join(test_root, "failing-codex")
+      File.mkdir_p!(workspace)
+      File.write!(codex_binary, "#!/bin/sh\nexit 1\n")
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      before_runtime_dirs = worker_runtime_dirs()
+      content = "schema_version: 1\n"
+
+      invalid_cases = [
+        {:invalid_shape, {:orchestration_evidence_write_failed, :invalid_orchestration_evidence}},
+        {%{
+           filename: "orchestration-evidence.yaml",
+           content: content,
+           bytes: byte_size(content) + 1,
+           sha256: sha256(content)
+         }, {:orchestration_evidence_write_failed, :orchestration_evidence_size_mismatch}},
+        {%{
+           filename: "orchestration-evidence.yaml",
+           content: content,
+           bytes: byte_size(content),
+           sha256: String.duplicate("0", 64)
+         }, {:orchestration_evidence_write_failed, :orchestration_evidence_digest_mismatch}}
+      ]
+
+      Enum.each(invalid_cases, fn {evidence, expected_error} ->
+        assert {:error, ^expected_error} =
+                 AppServer.start_session(workspace, orchestration_evidence: evidence)
+
+        assert worker_runtime_dirs() == before_runtime_dirs
+      end)
+
+      oversized = String.duplicate("x", 8 * 1024 * 1024 + 1)
+
+      assert {:error, {:orchestration_evidence_write_failed, {:orchestration_evidence_too_large, 8_388_609}}} =
+               AppServer.start_session(workspace,
+                 orchestration_evidence: %{
+                   filename: "orchestration-evidence.yaml",
+                   content: oversized,
+                   bytes: byte_size(oversized),
+                   sha256: sha256(oversized)
+                 }
+               )
+
+      assert worker_runtime_dirs() == before_runtime_dirs
+
+      assert {:error, _reason} =
+               AppServer.start_session(workspace,
+                 orchestration_evidence: %{
+                   filename: "orchestration-evidence.yaml",
+                   content: content,
+                   bytes: byte_size(content),
+                   sha256: sha256(content)
+                 }
+               )
+
+      assert worker_runtime_dirs() == before_runtime_dirs
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "run_turn returns the last streamed agent message when completed turn items are empty" do
     test_root =
       Path.join(
@@ -1702,6 +1855,7 @@ defmodule SymphonyElixir.AppServerTest do
     try do
       trace_file = Path.join(test_root, "ssh.trace")
       fake_ssh = Path.join(test_root, "ssh")
+      fake_scp = Path.join(test_root, "scp")
       remote_workspace = "/remote/workspaces/MT-REMOTE"
 
       File.mkdir_p!(test_root)
@@ -1714,6 +1868,14 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
       count=0
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+
+      case "$*" in
+        *fake-remote-codex*)
+          ;;
+        *)
+          exit 0
+          ;;
+      esac
 
       while IFS= read -r line; do
         count=$((count + 1))
@@ -1742,6 +1904,15 @@ defmodule SymphonyElixir.AppServerTest do
 
       File.chmod!(fake_ssh, 0o755)
 
+      File.write!(fake_scp, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
+      printf 'SCP_ARGV:%s\\n' "$*" >> "$trace_file"
+      exit 0
+      """)
+
+      File.chmod!(fake_scp, 0o755)
+
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: "/remote/workspaces",
         codex_command: "fake-remote-codex app-server",
@@ -1763,18 +1934,26 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
+      evidence_content = "schema_version: 1\nwork_item:\n  title: \"Remote evidence\"\n"
+
       assert {:ok, _result} =
                AppServer.run(
                  remote_workspace,
                  "Run remote worker",
                  issue,
-                 worker_host: "worker-01:2200"
+                 worker_host: "worker-01:2200",
+                 orchestration_evidence: %{
+                   filename: "orchestration-evidence.yaml",
+                   content: evidence_content,
+                   bytes: byte_size(evidence_content),
+                   sha256: sha256(evidence_content)
+                 }
                )
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
 
-      assert argv_line = Enum.find(lines, &String.starts_with?(&1, "ARGV:"))
+      assert argv_line = Enum.find(lines, &(String.starts_with?(&1, "ARGV:") and &1 =~ "fake-remote-codex"))
       assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
@@ -1787,6 +1966,8 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "/cache/uv"
       assert argv_line =~ "MYVEN_GITLEAKS_CACHE_DIR="
       assert argv_line =~ "/cache/gitleaks"
+      assert argv_line =~ "SYMPHONY_ORCHESTRATION_EVIDENCE="
+      assert argv_line =~ "/orchestration-evidence.yaml"
       assert argv_line =~ "env -u GITHUB_TOKEN -u GH_TOKEN -u FORGEJO_TOKEN -u SYMPHONY_TRACKER_READ_TOKEN"
       assert argv_line =~ "-u SYMPHONY_TRACKER_WRITE_TOKEN"
       assert argv_line =~ "-u LINEAR_API_KEY"
@@ -1798,6 +1979,11 @@ defmodule SymphonyElixir.AppServerTest do
       refute argv_line =~ "forgejo-read-only"
       refute argv_line =~ "forgejo-custom-broker-write"
       assert argv_line =~ "fake-remote-codex app-server"
+
+      assert scp_line = Enum.find(lines, &String.starts_with?(&1, "SCP_ARGV:"))
+      assert scp_line =~ "-P 2200"
+      assert scp_line =~ "worker-01:/tmp/symphony-worker-gh-config-"
+      assert scp_line =~ "/orchestration-evidence.yaml"
 
       expected_turn_policy = %{
         "type" => "workspaceWrite",
@@ -1839,6 +2025,89 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "remote evidence copy and verification failures clean staging and remote runtime paths" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-remote-evidence-failure-#{System.unique_integer([:positive])}"
+      )
+
+    trace_file = Path.join(test_root, "remote.trace")
+    fake_ssh = Path.join(test_root, "ssh")
+    fake_scp = Path.join(test_root, "scp")
+    previous_path = System.get_env("PATH")
+    previous_scp_status = System.get_env("SYMP_TEST_SCP_STATUS")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SCP_STATUS", previous_scp_status)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    printf 'SSH:%s\n' "$*" >> #{inspect(trace_file)}
+    case "$*" in
+      *"rm -rf --"*) exit 0 ;;
+      *"wc -c <"*) exit 1 ;;
+      *) exit 0 ;;
+    esac
+    """)
+
+    File.write!(fake_scp, """
+    #!/bin/sh
+    printf 'SCP:%s\n' "$*" >> #{inspect(trace_file)}
+    exit "${SYMP_TEST_SCP_STATUS:-0}"
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    File.chmod!(fake_scp, 0o755)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+    content = "schema_version: 1\n"
+
+    evidence = %{
+      filename: "orchestration-evidence.yaml",
+      content: content,
+      bytes: byte_size(content),
+      sha256: sha256(content)
+    }
+
+    assert {:error, {:orchestration_evidence_upload_failed, {:remote_evidence_verification_failed, 1, _output}}} =
+             AppServer.start_session("/remote/workspaces/MT-REMOTE-FAILURE",
+               worker_host: "worker-01",
+               codex_command: "fake-codex app-server",
+               orchestration_evidence: evidence
+             )
+
+    verification_trace = File.read!(trace_file)
+    assert verification_trace =~ "wc -c <"
+    assert verification_trace =~ "rm -rf --"
+    assert staging_path = scp_staging_path(verification_trace)
+    refute File.exists?(staging_path)
+    refute verification_trace =~ "fake-codex app-server"
+
+    File.write!(trace_file, "")
+    System.put_env("SYMP_TEST_SCP_STATUS", "9")
+
+    assert {:error, {:orchestration_evidence_upload_failed, {:remote_evidence_copy_failed, 9, _output}}} =
+             AppServer.start_session("/remote/workspaces/MT-REMOTE-COPY-FAILURE",
+               worker_host: "worker-01",
+               codex_command: "fake-codex app-server",
+               orchestration_evidence: evidence
+             )
+
+    copy_trace = File.read!(trace_file)
+    assert copy_trace =~ "SCP:"
+    assert copy_trace =~ "rm -rf --"
+    assert staging_path = scp_staging_path(copy_trace)
+    refute File.exists?(staging_path)
+    refute copy_trace =~ "wc -c <"
+    refute copy_trace =~ "fake-codex app-server"
   end
 
   test "local workers receive no tracker credentials" do
@@ -2056,5 +2325,24 @@ defmodule SymphonyElixir.AppServerTest do
           {:cont, nil}
       end
     end)
+  end
+
+  defp sha256(value) do
+    :crypto.hash(:sha256, value)
+    |> Base.encode16(case: :lower)
+  end
+
+  defp worker_runtime_dirs do
+    System.tmp_dir!()
+    |> Path.join("symphony-worker-gh-config-*")
+    |> Path.wildcard()
+    |> MapSet.new()
+  end
+
+  defp scp_staging_path(trace) do
+    case Regex.run(~r/SCP:.*-- (\S+) \S+/, trace, capture: :all_but_first) do
+      [path] -> path
+      _ -> flunk("missing scp staging path in trace: #{trace}")
+    end
   end
 end
