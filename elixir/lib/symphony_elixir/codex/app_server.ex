@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @turn_interrupt_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
@@ -20,6 +21,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_policy: map(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
+          worker_tool_policy: :broker_only | :legacy_read_only,
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
@@ -41,12 +43,15 @@ defmodule SymphonyElixir.Codex.AppServer do
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
     codex_command = Keyword.get(opts, :codex_command) || Config.settings!().codex.command
+    worker_tool_policy = Keyword.get(opts, :worker_tool_policy, :broker_only)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+         :ok <- validate_worker_tool_policy(worker_tool_policy),
          {:ok, port, gh_config_dir} <- start_port(expanded_workspace, worker_host, codex_command) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
+           session_policies <- Map.put(session_policies, :worker_tool_policy, worker_tool_policy),
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
         {:ok,
          %{
@@ -56,6 +61,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            auto_approve_policy: auto_approve_policy(session_policies),
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
+           worker_tool_policy: worker_tool_policy,
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host,
@@ -76,79 +82,112 @@ defmodule SymphonyElixir.Codex.AppServer do
           port: port,
           metadata: metadata,
           approval_policy: approval_policy,
-          auto_approve_policy: auto_approve_policy,
           turn_sandbox_policy: turn_sandbox_policy,
+          worker_tool_policy: worker_tool_policy,
           thread_id: thread_id,
           workspace: workspace
-        },
+        } = session,
         prompt,
         issue,
         opts \\ []
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
 
-    tool_executor =
-      Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments)
-      end)
+    tool_executor = Keyword.get(opts, :tool_executor, default_tool_executor(worker_tool_policy))
+    tool_policy = Keyword.get(opts, :tool_policy, :allow)
 
-    case start_turn(
+    with :ok <- validate_turn_tool_policy(tool_policy) do
+      case start_turn(
+             port,
+             thread_id,
+             prompt,
+             issue,
+             workspace,
+             approval_policy,
+             turn_sandbox_policy,
+             opts
+           ) do
+        {:ok, turn_id} ->
+          session_id = "#{thread_id}-#{turn_id}"
+          Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
+
+          emit_message(
+            on_message,
+            :session_started,
+            %{
+              session_id: session_id,
+              thread_id: thread_id,
+              turn_id: turn_id
+            },
+            metadata
+          )
+
+          finish_turn(
+            session,
+            issue,
+            turn_id,
+            tool_executor,
+            tool_policy,
+            on_message
+          )
+
+        {:error, reason} ->
+          Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
+          emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
+          {:error, reason}
+      end
+    end
+  end
+
+  defp finish_turn(
+         %{
+           port: port,
+           thread_id: thread_id,
+           auto_approve_policy: auto_approve_policy,
+           metadata: metadata
+         },
+         issue,
+         turn_id,
+         tool_executor,
+         tool_policy,
+         on_message
+       ) do
+    session_id = "#{thread_id}-#{turn_id}"
+
+    case await_turn_completion(
            port,
+           on_message,
+           tool_executor,
+           auto_approve_policy,
            thread_id,
-           prompt,
-           issue,
-           workspace,
-           approval_policy,
-           turn_sandbox_policy,
-           opts
+           turn_id,
+           tool_policy
          ) do
-      {:ok, turn_id} ->
-        session_id = "#{thread_id}-#{turn_id}"
-        Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
+      {:ok, result, final_agent_message} ->
+        Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
+
+        {:ok,
+         %{
+           result: result,
+           final_agent_message: final_agent_message,
+           session_id: session_id,
+           thread_id: thread_id,
+           turn_id: turn_id
+         }}
+
+      {:error, reason} ->
+        Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
 
         emit_message(
           on_message,
-          :session_started,
+          :turn_ended_with_error,
           %{
             session_id: session_id,
-            thread_id: thread_id,
-            turn_id: turn_id
+            reason: reason
           },
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_policy) do
-          {:ok, result, final_agent_message} ->
-            Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
-
-            {:ok,
-             %{
-               result: result,
-               final_agent_message: final_agent_message,
-               session_id: session_id,
-               thread_id: thread_id,
-               turn_id: turn_id
-             }}
-
-          {:error, reason} ->
-            Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
-
-            emit_message(
-              on_message,
-              :turn_ended_with_error,
-              %{
-                session_id: session_id,
-                reason: reason
-              },
-              metadata
-            )
-
-            {:error, reason}
-        end
-
-      {:error, reason} ->
-        Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
-        emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
         {:error, reason}
     end
   end
@@ -277,20 +316,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {~c"GIT_TERMINAL_PROMPT", ~c"0"}
       ] ++ worker_cache_environment(gh_config_dir) ++ scrubbed
 
-    case Config.settings!().tracker do
-      %{kind: "github", read_api_key: token} when is_binary(token) and token != "" ->
-        base
-        |> Enum.reject(fn {name, _value} -> name == ~c"GH_TOKEN" end)
-        |> then(&[{~c"GH_TOKEN", String.to_charlist(token)} | &1])
-
-      %{kind: "forgejo", read_api_key: token} when is_binary(token) and token != "" ->
-        base
-        |> Enum.reject(fn {name, _value} -> name == ~c"FORGEJO_TOKEN" end)
-        |> then(&[{~c"FORGEJO_TOKEN", String.to_charlist(token)} | &1])
-
-      _ ->
-        base
-    end
+    base
   end
 
   # Port environment entries with an empty value unset the variable. Git needs
@@ -310,10 +336,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     git_credentials =
       "GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=''"
 
-    # SSH exposes the remote command to local process inspection. A worker does
-    # not need tracker credentials to perform its task, so remote workers never
-    # receive even the optional read token. Local workers may still receive it
-    # through an inherited environment entry without placing it in argv.
+    # SSH exposes the remote command to local process inspection. Workers use
+    # the broker-owned immutable tracker snapshot, so neither local nor remote
+    # workers receive tracker credentials.
     Enum.join([unset, config_dir, cache_environment, git_credentials], " ")
   end
 
@@ -342,7 +367,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp worker_write_token_envs do
-    configured = Config.settings!().tracker.write_api_key_envs
+    tracker = Config.settings!().tracker
+    configured = tracker.read_api_key_envs ++ tracker.write_api_key_envs
 
     (~w(GITHUB_TOKEN GH_TOKEN FORGEJO_TOKEN SYMPHONY_TRACKER_READ_TOKEN SYMPHONY_TRACKER_WRITE_TOKEN LINEAR_API_KEY SYMPHONY_FORGEJO_WEBHOOK_SECRET SYMPHONY_GITHUB_WEBHOOK_SECRET) ++
        configured)
@@ -422,6 +448,17 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp merge_runtime_overrides(settings, _overrides), do: settings
 
+  defp validate_worker_tool_policy(policy) when policy in [:broker_only, :legacy_read_only],
+    do: :ok
+
+  defp validate_worker_tool_policy(policy), do: {:error, {:invalid_worker_tool_policy, policy}}
+
+  defp validate_turn_tool_policy(policy) when policy in [:allow, :deny_and_interrupt], do: :ok
+  defp validate_turn_tool_policy(policy), do: {:error, {:invalid_turn_tool_policy, policy}}
+
+  defp default_tool_executor(:legacy_read_only), do: &DynamicTool.execute/2
+  defp default_tool_executor(:broker_only), do: &reject_worker_dynamic_tool/2
+
   defp auto_approve_policy(%{approval_policy: approval_policy} = session_policies) do
     auto_approve_all =
       case Map.get(session_policies, :auto_approve_requests) do
@@ -446,7 +483,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp start_thread(port, workspace, %{
          approval_policy: approval_policy,
-         thread_sandbox: thread_sandbox
+         thread_sandbox: thread_sandbox,
+         worker_tool_policy: worker_tool_policy
        }) do
     send_message(port, %{
       "method" => "thread/start",
@@ -455,7 +493,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
-        "dynamicTools" => DynamicTool.tool_specs()
+        "dynamicTools" => worker_dynamic_tools(worker_tool_policy)
       }
     })
 
@@ -471,6 +509,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp worker_dynamic_tools(:legacy_read_only), do: DynamicTool.tool_specs()
+  defp worker_dynamic_tools(:broker_only), do: []
+
   defp start_turn(
          port,
          thread_id,
@@ -481,6 +522,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          turn_sandbox_policy,
          opts
        ) do
+    sandbox_policy = Keyword.get(opts, :sandbox_policy, turn_sandbox_policy)
+
     params =
       %{
         "threadId" => thread_id,
@@ -493,7 +536,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "cwd" => workspace,
         "title" => "#{issue.identifier}: #{issue.title}",
         "approvalPolicy" => approval_policy,
-        "sandboxPolicy" => turn_sandbox_policy
+        "sandboxPolicy" => sandbox_policy
       }
       |> put_optional_param("model", Keyword.get(opts, :model))
       |> put_optional_param("effort", Keyword.get(opts, :effort))
@@ -513,6 +556,22 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp put_optional_param(params, _key, nil), do: params
   defp put_optional_param(params, key, value), do: Map.put(params, key, value)
+
+  defp reject_worker_dynamic_tool(tool, _arguments) do
+    output =
+      Jason.encode!(%{
+        "error" => %{
+          "message" => "Unsupported dynamic tool: #{inspect(tool)}.",
+          "supportedTools" => []
+        }
+      })
+
+    %{
+      "success" => false,
+      "output" => output,
+      "contentItems" => [%{"type" => "inputText", "text" => output}]
+    }
+  end
 
   @doc false
   @spec final_agent_message(map()) :: String.t() | nil
@@ -534,14 +593,29 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   def final_agent_message(_payload), do: nil
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(
+         port,
+         on_message,
+         tool_executor,
+         auto_approve_requests,
+         thread_id,
+         turn_id,
+         tool_policy
+       ) do
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      %{auto_approve_requests: auto_approve_requests, last_agent_message: nil}
+      %{
+        auto_approve_requests: auto_approve_requests,
+        last_agent_message: nil,
+        last_agent_message_scoped: false,
+        thread_id: thread_id,
+        turn_id: turn_id,
+        tool_policy: tool_policy
+      }
     )
   end
 
@@ -596,31 +670,40 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        handle_completed_turn(port, on_message, payload, payload_string, stream_state)
+        handle_terminal_turn_message(
+          :completed,
+          port,
+          on_message,
+          payload,
+          payload_string,
+          timeout_ms,
+          tool_executor,
+          stream_state
+        )
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
-        emit_turn_event(
+        handle_terminal_turn_message(
+          :failed,
+          port,
           on_message,
-          :turn_failed,
           payload,
           payload_string,
-          port,
-          Map.get(payload, "params")
+          timeout_ms,
+          tool_executor,
+          stream_state
         )
-
-        {:error, {:turn_failed, Map.get(payload, "params")}}
 
       {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
-        emit_turn_event(
+        handle_terminal_turn_message(
+          :cancelled,
+          port,
           on_message,
-          :turn_cancelled,
           payload,
           payload_string,
-          port,
-          Map.get(payload, "params")
+          timeout_ms,
+          tool_executor,
+          stream_state
         )
-
-        {:error, {:turn_cancelled, Map.get(payload, "params")}}
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
@@ -683,6 +766,69 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp handle_terminal_turn_message(
+         terminal_kind,
+         port,
+         on_message,
+         payload,
+         payload_string,
+         timeout_ms,
+         tool_executor,
+         stream_state
+       ) do
+    if current_turn_message?(payload, stream_state) do
+      complete_terminal_turn_message(
+        terminal_kind,
+        port,
+        on_message,
+        payload,
+        payload_string,
+        stream_state
+      )
+    else
+      continue_after_foreign_turn_message(
+        port,
+        on_message,
+        payload,
+        payload_string,
+        timeout_ms,
+        tool_executor,
+        stream_state
+      )
+    end
+  end
+
+  defp complete_terminal_turn_message(
+         :completed,
+         port,
+         on_message,
+         payload,
+         payload_string,
+         stream_state
+       ) do
+    handle_completed_turn(port, on_message, payload, payload_string, stream_state)
+  end
+
+  defp complete_terminal_turn_message(
+         terminal_kind,
+         port,
+         on_message,
+         payload,
+         payload_string,
+         _stream_state
+       )
+       when terminal_kind in [:failed, :cancelled] do
+    {event, reason} =
+      case terminal_kind do
+        :failed -> {:turn_failed, :turn_failed}
+        :cancelled -> {:turn_cancelled, :turn_cancelled}
+      end
+
+    params = Map.get(payload, "params")
+    emit_turn_event(on_message, event, payload, payload_string, port, params)
+    {:error, {reason, params}}
+  end
+
   defp emit_turn_event(on_message, event, payload, payload_string, port, payload_details) do
     emit_message(
       on_message,
@@ -697,6 +843,41 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp handle_turn_method(
+         port,
+         on_message,
+         payload,
+         payload_string,
+         method,
+         timeout_ms,
+         tool_executor,
+         stream_state
+       ) do
+    if forbidden_tool_activity?(method, payload, stream_state) do
+      interrupt_forbidden_tool_activity(
+        port,
+        on_message,
+        payload,
+        payload_string,
+        method,
+        timeout_ms,
+        tool_executor,
+        stream_state
+      )
+    else
+      handle_allowed_turn_method(
+        port,
+        on_message,
+        payload,
+        payload_string,
+        method,
+        timeout_ms,
+        tool_executor,
+        stream_state
+      )
+    end
+  end
+
+  defp handle_allowed_turn_method(
          port,
          on_message,
          payload,
@@ -783,15 +964,152 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp update_stream_state(stream_state, payload) do
-    case final_agent_message(payload) do
-      message when is_binary(message) -> %{stream_state | last_agent_message: message}
-      nil -> stream_state
+  defp forbidden_tool_activity?(_method, _payload, %{tool_policy: :allow}), do: false
+
+  defp forbidden_tool_activity?(method, payload, %{
+         tool_policy: :deny_and_interrupt
+       }) do
+    forbidden_tool_method?(method, payload)
+  end
+
+  defp forbidden_tool_method?(method, _payload)
+       when method in [
+              "item/commandExecution/requestApproval",
+              "item/fileChange/requestApproval",
+              "item/tool/call",
+              "item/tool/requestUserInput",
+              "item/permissions/requestApproval",
+              "execCommandApproval",
+              "applyPatchApproval",
+              "mcpServer/elicitation/request",
+              "tool/requestUserInput",
+              "codex/event/exec_command_begin",
+              "item/commandExecution/started",
+              "item/fileChange/started",
+              "item/mcpToolCall/started",
+              "item/dynamicToolCall/started",
+              "item/webSearch/started"
+            ],
+       do: true
+
+  defp forbidden_tool_method?("item/started", payload) do
+    get_in(payload, ["params", "item", "type"]) in [
+      "commandExecution",
+      "fileChange",
+      "mcpToolCall",
+      "dynamicToolCall",
+      "webSearch",
+      "imageGeneration"
+    ]
+  end
+
+  defp forbidden_tool_method?(_method, _payload), do: false
+
+  defp interrupt_forbidden_tool_activity(
+         port,
+         on_message,
+         payload,
+         payload_string,
+         method,
+         timeout_ms,
+         tool_executor,
+         stream_state
+       ) do
+    if current_turn_message?(payload, stream_state) do
+      send_message(port, %{
+        "method" => "turn/interrupt",
+        "id" => @turn_interrupt_id,
+        "params" => %{
+          "threadId" => stream_state.thread_id,
+          "turnId" => stream_state.turn_id
+        }
+      })
+
+      emit_message(
+        on_message,
+        :forbidden_tool_call,
+        %{payload: payload, raw: payload_string, method: method},
+        metadata_from_message(port, payload)
+      )
+
+      {:error, {:forbidden_tool_call, method}}
+    else
+      continue_after_foreign_turn_message(
+        port,
+        on_message,
+        payload,
+        payload_string,
+        timeout_ms,
+        tool_executor,
+        stream_state
+      )
     end
   end
 
+  defp update_stream_state(stream_state, payload) do
+    if current_turn_message?(payload, stream_state) do
+      case final_agent_message(payload) do
+        message when is_binary(message) ->
+          %{
+            stream_state
+            | last_agent_message: message,
+              last_agent_message_scoped: scoped_turn_message?(payload)
+          }
+
+        nil ->
+          stream_state
+      end
+    else
+      stream_state
+    end
+  end
+
+  defp current_turn_message?(payload, stream_state) do
+    params = Map.get(payload, "params", %{})
+    message_thread_id = Map.get(params, "threadId")
+    message_turn_id = Map.get(params, "turnId") || get_in(params, ["turn", "id"])
+
+    matches_identifier?(message_thread_id, stream_state.thread_id) and
+      matches_identifier?(message_turn_id, stream_state.turn_id)
+  end
+
+  # Older app-server versions and test doubles omitted notification identifiers.
+  # Treat an absent identifier as compatible, but reject every explicit mismatch.
+  defp matches_identifier?(nil, _expected), do: true
+  defp matches_identifier?(actual, expected), do: actual == expected
+
+  defp scoped_turn_message?(payload) do
+    params = Map.get(payload, "params", %{})
+
+    is_binary(Map.get(params, "threadId")) and
+      is_binary(Map.get(params, "turnId") || get_in(params, ["turn", "id"]))
+  end
+
+  defp continue_after_foreign_turn_message(
+         port,
+         on_message,
+         payload,
+         payload_string,
+         timeout_ms,
+         tool_executor,
+         stream_state
+       ) do
+    emit_message(
+      on_message,
+      :notification,
+      %{payload: payload, raw: payload_string},
+      metadata_from_message(port, payload)
+    )
+
+    receive_loop(port, on_message, timeout_ms, "", tool_executor, stream_state)
+  end
+
   defp completed_final_agent_message(payload, stream_state) do
-    final_agent_message(payload) || stream_state.last_agent_message
+    final_agent_message(payload) ||
+      if(scoped_turn_message?(payload) and not stream_state.last_agent_message_scoped,
+        do: nil,
+        else: stream_state.last_agent_message
+      )
   end
 
   defp handle_completed_turn(port, on_message, payload, payload_string, stream_state) do

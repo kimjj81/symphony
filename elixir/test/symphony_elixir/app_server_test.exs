@@ -84,6 +84,64 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "run_turn ignores foreign child-turn messages and completion" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-root-turn-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-ROOT-TURN")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-root"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-root"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-child","turnId":"turn-child","item":{"type":"agentMessage","text":"markdown child review"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-child","turn":{"id":"turn-child","items":[{"type":"agentMessage","text":"child final"}],"status":"completed"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-root","turnId":"turn-root","item":{"type":"agentMessage","text":"root structured outcome"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-root","turn":{"id":"turn-root","items":[],"status":"completed"}}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-root-turn",
+        identifier: "MT-ROOT-TURN",
+        title: "Keep the root outcome",
+        state: "In Progress"
+      }
+
+      assert {:ok,
+              %{
+                final_agent_message: "root structured outcome",
+                result: %{"params" => %{"turn" => %{"id" => "turn-root"}}}
+              }} = AppServer.run(workspace, "Return the root outcome", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "run_turn rejects failed interrupted and unknown completed-turn statuses" do
     Enum.each(
       [
@@ -755,19 +813,7 @@ defmodule SymphonyElixir.AppServerTest do
                    |> Jason.decode!()
 
                  payload["id"] == 2 and
-                   case get_in(payload, ["params", "dynamicTools"]) do
-                     [
-                       %{
-                         "description" => description,
-                         "inputSchema" => %{"required" => ["query"]},
-                         "name" => "linear_graphql"
-                       }
-                     ] ->
-                       description =~ "Linear"
-
-                     _ ->
-                       false
-                   end
+                   get_in(payload, ["params", "dynamicTools"]) == []
                else
                  false
                end
@@ -1263,7 +1309,10 @@ defmodule SymphonyElixir.AppServerTest do
       end
 
       assert {:ok, _result} =
-               AppServer.run(workspace, "Handle supported tool calls", issue, tool_executor: tool_executor)
+               AppServer.run(workspace, "Handle supported tool calls", issue,
+                 worker_tool_policy: :legacy_read_only,
+                 tool_executor: tool_executor
+               )
 
       assert_received {:tool_called, "linear_graphql",
                        %{
@@ -1273,6 +1322,23 @@ defmodule SymphonyElixir.AppServerTest do
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["id"] == 2 and
+                   Enum.any?(
+                     get_in(payload, ["params", "dynamicTools"]) || [],
+                     &(&1["name"] == "linear_graphql")
+                   )
+               else
+                 false
+               end
+             end)
 
       assert Enum.any?(lines, fn line ->
                if String.starts_with?(line, "JSON:") do
@@ -1775,7 +1841,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "local workers receive only the provider read-token alias" do
+  test "local workers receive no tracker credentials" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1790,6 +1856,7 @@ defmodule SymphonyElixir.AppServerTest do
       "SYMPHONY_TRACKER_WRITE_TOKEN",
       "SYMPHONY_FORGEJO_WEBHOOK_SECRET",
       "SYMPHONY_GITHUB_WEBHOOK_SECRET",
+      "CUSTOM_FORGEJO_READ_TOKEN",
       "CUSTOM_FORGEJO_WRITE_TOKEN",
       "SYMP_TEST_LOCAL_ENV_TRACE"
     ]
@@ -1815,6 +1882,7 @@ defmodule SymphonyElixir.AppServerTest do
       System.put_env("SYMPHONY_TRACKER_WRITE_TOKEN", "tracker-write-token")
       System.put_env("SYMPHONY_FORGEJO_WEBHOOK_SECRET", "forgejo-webhook-secret")
       System.put_env("SYMPHONY_GITHUB_WEBHOOK_SECRET", "github-webhook-secret")
+      System.put_env("CUSTOM_FORGEJO_READ_TOKEN", "custom-read-token")
       System.put_env("CUSTOM_FORGEJO_WRITE_TOKEN", "custom-write-token")
       System.put_env("SYMP_TEST_LOCAL_ENV_TRACE", trace_file)
 
@@ -1828,6 +1896,7 @@ defmodule SymphonyElixir.AppServerTest do
         printf 'SYMPHONY_TRACKER_WRITE_TOKEN=%s\\n' "${SYMPHONY_TRACKER_WRITE_TOKEN-unset}"
         printf 'SYMPHONY_FORGEJO_WEBHOOK_SECRET=%s\\n' "${SYMPHONY_FORGEJO_WEBHOOK_SECRET-unset}"
         printf 'SYMPHONY_GITHUB_WEBHOOK_SECRET=%s\\n' "${SYMPHONY_GITHUB_WEBHOOK_SECRET-unset}"
+        printf 'CUSTOM_FORGEJO_READ_TOKEN=%s\\n' "${CUSTOM_FORGEJO_READ_TOKEN-unset}"
         printf 'CUSTOM_FORGEJO_WRITE_TOKEN=%s\\n' "${CUSTOM_FORGEJO_WRITE_TOKEN-unset}"
         printf 'XDG_CACHE_HOME=%s\\n' "${XDG_CACHE_HOME-unset}"
         printf 'UV_CACHE_DIR=%s\\n' "${UV_CACHE_DIR-unset}"
@@ -1860,7 +1929,7 @@ defmodule SymphonyElixir.AppServerTest do
         tracker_endpoint: "https://forgejo.example/api/v1",
         tracker_owner: "acme",
         tracker_repo: "widgets",
-        tracker_read_api_token: "$SYMPHONY_TRACKER_READ_TOKEN",
+        tracker_read_api_token: "$CUSTOM_FORGEJO_READ_TOKEN",
         tracker_write_api_token: "$CUSTOM_FORGEJO_WRITE_TOKEN"
       )
 
@@ -1885,11 +1954,12 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert worker_env["GH_TOKEN"] == "unset"
       assert worker_env["GITHUB_TOKEN"] == "unset"
-      assert worker_env["FORGEJO_TOKEN"] == "forgejo-read-only-token"
+      assert worker_env["FORGEJO_TOKEN"] == "unset"
       assert worker_env["SYMPHONY_TRACKER_READ_TOKEN"] == "unset"
       assert worker_env["SYMPHONY_TRACKER_WRITE_TOKEN"] == "unset"
       assert worker_env["SYMPHONY_FORGEJO_WEBHOOK_SECRET"] == "unset"
       assert worker_env["SYMPHONY_GITHUB_WEBHOOK_SECRET"] == "unset"
+      assert worker_env["CUSTOM_FORGEJO_READ_TOKEN"] == "unset"
       assert worker_env["CUSTOM_FORGEJO_WRITE_TOKEN"] == "unset"
 
       xdg_cache = worker_env["XDG_CACHE_HOME"]
@@ -1910,7 +1980,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "standalone daemon clears custom tracker write tokens before launching Codex" do
+  test "standalone daemon clears all tracker credentials before launching Codex" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1963,7 +2033,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert output =~ "INFO: booting codex app-server"
 
       assert await_file!(trace_file) == """
-             FORGEJO_TOKEN=forgejo-read-only-token
+             FORGEJO_TOKEN=unset
              SYMPHONY_TRACKER_READ_TOKEN=unset
              SYMPHONY_TRACKER_WRITE_TOKEN=unset
              CUSTOM_DAEMON_WRITE_TOKEN=unset

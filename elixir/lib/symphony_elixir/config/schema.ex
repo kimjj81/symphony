@@ -50,7 +50,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:read_api_key, :string)
       field(:write_api_key, :string)
-      # Internal provenance used only to strip configured write credentials from workers.
+      # Internal provenance used only to strip configured tracker credentials from workers.
+      field(:read_api_key_envs, {:array, :string}, default: [])
       field(:write_api_key_envs, {:array, :string}, default: [])
       field(:project_slug, :string)
       field(:owner, :string)
@@ -786,6 +787,7 @@ defmodule SymphonyElixir.Config.Schema do
             System.get_env("SYMPHONY_TRACKER_WRITE_TOKEN") || legacy_tracker_api_key
           ),
         write_api_key_envs: secret_setting_env_names(settings.tracker.write_api_key, settings.tracker.api_key),
+        read_api_key_envs: secret_setting_env_names([settings.tracker.read_api_key]),
         read_api_key:
           resolve_secret_setting(
             settings.tracker.read_api_key,

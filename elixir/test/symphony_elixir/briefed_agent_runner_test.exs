@@ -898,6 +898,281 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     assert metrics.total_tokens == 16
   end
 
+  test "authoritative worker repairs one malformed outcome in the same app-server session" do
+    test_root = test_root("outcome-repair")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+    codex_binary = Path.join(test_root, "fake-outcome-repair-codex")
+
+    outcome =
+      Jason.encode!(%{
+        "kind" => "clean_review",
+        "summary_ko" => "검토를 완료했습니다.",
+        "evidence" => ["focused review passed"],
+        "head_oid" => nil,
+        "findings" => [],
+        "review_thread_updates" => []
+      })
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    trace_file=#{trace_file}
+    turn=0
+    while IFS= read -r line; do
+      printf 'JSON:%s\\n' "$line" >> "$trace_file"
+      case "$line" in
+        *'"method":"initialize"'*)
+          printf '%s\\n' '{"id":1,"result":{}}'
+          ;;
+        *'"method":"thread/start"'*)
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-repair"}}}'
+          ;;
+        *'"method":"turn/start"'*)
+          turn=$((turn + 1))
+          printf '{"id":3,"result":{"turn":{"id":"turn-repair-%s"}}}\\n' "$turn"
+          if [ "$turn" -eq 1 ]; then
+            printf '%s\\n' '{"method":"item/completed","params":{"threadId":"thread-repair","turnId":"turn-repair-1","item":{"type":"agentMessage","text":"not-json"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-repair","turn":{"id":"turn-repair-1","items":[],"status":"completed"}}}'
+          else
+            printf '%s\\n' '#{Jason.encode!(%{"method" => "item/completed", "params" => %{"threadId" => "thread-repair", "turnId" => "turn-repair-2", "item" => %{"type" => "agentMessage", "text" => outcome}}})}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-repair","turn":{"id":"turn-repair-2","items":[],"status":"completed"}}}'
+          fi
+          ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true,
+      tracker_active_states: ["Review", "Reviewing", "Rework", "Merging"]
+    )
+
+    enable_authoritative_mode!()
+    issue = review_issue("outcome-repair")
+    parent = self()
+
+    assert :ok =
+             AgentRunner.run(issue, self(),
+               brief_generator: fn _workspace, _issue -> {:ok, "focused review"} end,
+               state_manager_requester: fn intent ->
+                 send(parent, {:repaired_outcome, intent})
+                 {:ok, %{}}
+               end
+             )
+
+    assert_receive {:repaired_outcome, %SymphonyElixir.TransitionIntent{kind: :clean_review}}
+
+    assert_receive {:codex_worker_update, "github:pr:outcome-repair",
+                    %{
+                      event: :authoritative_worker_metrics,
+                      payload: %{repair_attempted: true, outcome: :clean_review}
+                    }}
+
+    trace = File.read!(trace_file)
+    assert length(Regex.scan(~r/"method":"thread\/start"/, trace)) == 1
+    assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+    assert trace =~ "Do not call tools"
+  end
+
+  test "authoritative broker rejection completes the worker without another model attempt" do
+    test_root = test_root("outcome-rejected")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+
+    outcome =
+      Jason.encode!(%{
+        "kind" => "clean_review",
+        "summary_ko" => "검토를 완료했습니다.",
+        "evidence" => ["focused review passed"],
+        "head_oid" => nil,
+        "findings" => [],
+        "review_thread_updates" => []
+      })
+
+    codex_binary = write_worker_outcome_codex!(test_root, trace_file, outcome)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true,
+      tracker_active_states: ["Review", "Reviewing", "Rework", "Merging"]
+    )
+
+    enable_authoritative_mode!()
+    issue = review_issue("outcome-rejected")
+
+    assert :ok =
+             AgentRunner.run(issue, self(),
+               brief_generator: fn _workspace, _issue -> {:ok, "focused review"} end,
+               state_manager_requester: fn _intent -> {:rejected, :stale_head} end
+             )
+
+    assert_receive {:worker_transition_result, "github:pr:outcome-rejected", {:rejected, :stale_head}}
+
+    assert_receive {:codex_worker_update, "github:pr:outcome-rejected",
+                    %{
+                      event: :authoritative_worker_metrics,
+                      payload: %{
+                        completion_class: :broker_handoff,
+                        transition_result: "{:error, {:worker_outcome_rejected, :stale_head}}"
+                      }
+                    }}
+
+    trace = File.read!(trace_file)
+    assert length(Regex.scan(~r/"method":"thread\/start"/, trace)) == 1
+    assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
+  end
+
+  test "a second malformed authoritative outcome hands off without a fresh worker session" do
+    test_root = test_root("outcome-repair-handoff")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+    codex_binary = Path.join(test_root, "fake-outcome-repair-handoff-codex")
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    trace_file=#{trace_file}
+    turn=0
+    while IFS= read -r line; do
+      printf 'JSON:%s\\n' "$line" >> "$trace_file"
+      case "$line" in
+        *'"method":"initialize"'*)
+          printf '%s\\n' '{"id":1,"result":{}}'
+          ;;
+        *'"method":"thread/start"'*)
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-repair-handoff"}}}'
+          ;;
+        *'"method":"turn/start"'*)
+          turn=$((turn + 1))
+          printf '{"id":3,"result":{"turn":{"id":"turn-repair-handoff-%s"}}}\\n' "$turn"
+          printf '{"method":"item/completed","params":{"threadId":"thread-repair-handoff","turnId":"turn-repair-handoff-%s","item":{"type":"agentMessage","text":"still-not-json"}}}\\n' "$turn"
+          printf '{"method":"turn/completed","params":{"threadId":"thread-repair-handoff","turn":{"id":"turn-repair-handoff-%s","items":[],"status":"completed"}}}\\n' "$turn"
+          ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true,
+      tracker_active_states: ["Review", "Reviewing", "Rework", "Merging"]
+    )
+
+    enable_authoritative_mode!()
+    issue = review_issue("outcome-repair-handoff")
+    parent = self()
+
+    assert :ok =
+             AgentRunner.run(issue, self(),
+               brief_generator: fn _workspace, _issue -> {:ok, "focused review"} end,
+               state_manager_requester: fn intent ->
+                 send(parent, {:repair_handoff, intent})
+                 {:ok, %{}}
+               end
+             )
+
+    assert_receive {:repair_handoff,
+                    %SymphonyElixir.TransitionIntent{
+                      kind: :handoff_required,
+                      source: :orchestrator
+                    } = intent}
+
+    assert intent.comment_body =~ "같은 세션에서 한 번 교정"
+
+    assert_receive {:worker_transition_result, "github:pr:outcome-repair-handoff", {:ok, %{}}}
+
+    trace = File.read!(trace_file)
+    assert length(Regex.scan(~r/"method":"thread\/start"/, trace)) == 1
+    assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+  end
+
+  test "authoritative repair interrupts tool activity and hands off without a fresh model turn" do
+    test_root = test_root("outcome-repair-tool-interrupt")
+    on_exit(fn -> File.rm_rf(test_root) end)
+    workspace_root = Path.join(test_root, "workspaces")
+    trace_file = Path.join(test_root, "codex.trace")
+    codex_binary = Path.join(test_root, "fake-outcome-repair-tool-interrupt-codex")
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    trace_file=#{trace_file}
+    turn=0
+    while IFS= read -r line; do
+      printf 'JSON:%s\\n' "$line" >> "$trace_file"
+      case "$line" in
+        *'"method":"initialize"'*)
+          printf '%s\\n' '{"id":1,"result":{}}'
+          ;;
+        *'"method":"thread/start"'*)
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-repair-tool"}}}'
+          ;;
+        *'"method":"turn/start"'*)
+          turn=$((turn + 1))
+          printf '{"id":3,"result":{"turn":{"id":"turn-repair-tool-%s"}}}\\n' "$turn"
+          if [ "$turn" -eq 1 ]; then
+            printf '%s\\n' '{"method":"item/completed","params":{"threadId":"thread-repair-tool","turnId":"turn-repair-tool-1","item":{"type":"agentMessage","text":"not-json"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"thread-repair-tool","turn":{"id":"turn-repair-tool-1","items":[],"status":"completed"}}}'
+          else
+            printf '%s\\n' '{"method":"item/started","params":{"threadId":"thread-repair-tool","turnId":"turn-repair-tool-2","item":{"type":"commandExecution","command":"git status"}}}'
+          fi
+          ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      orchestration_brief_enabled: true,
+      tracker_active_states: ["Review", "Reviewing", "Rework", "Merging"]
+    )
+
+    enable_authoritative_mode!()
+    issue = review_issue("outcome-repair-tool-interrupt")
+    parent = self()
+
+    assert :ok =
+             AgentRunner.run(issue, self(),
+               brief_generator: fn _workspace, _issue -> {:ok, "focused review"} end,
+               state_manager_requester: fn intent ->
+                 send(parent, {:repair_tool_handoff, intent})
+                 {:ok, %{}}
+               end
+             )
+
+    assert_receive {:repair_tool_handoff, %SymphonyElixir.TransitionIntent{kind: :handoff_required}}
+
+    trace = File.read!(trace_file)
+    assert length(Regex.scan(~r/"method":"thread\/start"/, trace)) == 1
+    assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+    assert trace =~ ~s("method":"turn/interrupt")
+
+    repair_turn =
+      trace
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+      |> Enum.map(&(&1 |> String.trim_leading("JSON:") |> Jason.decode!()))
+      |> Enum.filter(&(&1["method"] == "turn/start"))
+      |> Enum.at(1)
+
+    assert get_in(repair_turn, ["params", "sandboxPolicy"]) == %{
+             "networkAccess" => false,
+             "type" => "readOnly"
+           }
+  end
+
   test "Merging does not start a worker when the broker snapshot is unavailable" do
     test_root = test_root("merging")
     on_exit(fn -> File.rm_rf(test_root) end)

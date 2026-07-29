@@ -70,9 +70,8 @@ command -v "$CODEX_BIN" >/dev/null 2>&1 || {
   exit 1
 }
 
-# Tracker writes are broker-owned. Each daemon lifetime receives a new empty
-# gh configuration directory so cached credentials cannot cross runs.
-tracker_read_token=${SYMPHONY_TRACKER_READ_TOKEN:-}
+# Tracker reads and writes are broker-owned. Each daemon lifetime receives a new
+# empty gh configuration directory so cached credentials cannot cross runs.
 unset GITHUB_TOKEN GH_TOKEN FORGEJO_TOKEN SYMPHONY_TRACKER_WRITE_TOKEN LINEAR_API_KEY \
   SYMPHONY_TRACKER_READ_TOKEN SYMPHONY_FORGEJO_WEBHOOK_SECRET SYMPHONY_GITHUB_WEBHOOK_SECRET
 
@@ -95,15 +94,6 @@ export GIT_TERMINAL_PROMPT=0
 export GIT_CONFIG_COUNT=1
 export GIT_CONFIG_KEY_0=credential.helper
 export GIT_CONFIG_VALUE_0=
-if [ -n "$tracker_read_token" ]; then
-  if [ "${SYMPHONY_TRACKER_KIND:-github}" = "forgejo" ]; then
-    export FORGEJO_TOKEN=$tracker_read_token
-  else
-    export GH_TOKEN=$tracker_read_token
-  fi
-fi
-unset tracker_read_token
-
 # The app-server passes its environment to local Codex workers. Start it with
 # only the values a worker needs so an unrecognised custom tracker write-token
 # variable cannot be inherited. Proxy endpoints remain explicitly available.
@@ -122,14 +112,6 @@ for allowed_http_env in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy n
     appserver_env+=("$allowed_http_env=${!allowed_http_env}")
   fi
 done
-
-if [ -n "${GH_TOKEN:-}" ]; then
-  appserver_env+=("GH_TOKEN=$GH_TOKEN")
-fi
-
-if [ -n "${FORGEJO_TOKEN:-}" ]; then
-  appserver_env+=("FORGEJO_TOKEN=$FORGEJO_TOKEN")
-fi
 
 if [ -n "${SSH_AUTH_SOCK:-}" ]; then
   appserver_env+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")

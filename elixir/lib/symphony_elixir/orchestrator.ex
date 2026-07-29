@@ -168,6 +168,30 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  def handle_info({:refresh_completed_worker, issue_id, previous_state}, state)
+      when is_binary(issue_id) and is_binary(previous_state) do
+    state =
+      case Tracker.fetch_issue_states_by_ids([issue_id]) do
+        {:ok, [%Issue{} = issue | _]} ->
+          if normalize_issue_state(issue.state) != normalize_issue_state(previous_state) do
+            state
+            |> release_issue_claim(issue_id)
+            |> handle_targeted_issue_refresh(issue)
+          else
+            handoff_completed_worker_without_receipt(state, issue)
+          end
+
+        {:ok, []} ->
+          release_issue_claim(state, issue_id)
+
+        {:error, reason} ->
+          Logger.warning("Completed-worker broker refresh failed issue_id=#{issue_id} reason=#{inspect(reason)}; claim retained")
+          state
+      end
+
+    {:noreply, state}
+  end
+
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
         %{running: running} = state
@@ -205,17 +229,29 @@ defmodule SymphonyElixir.Orchestrator do
           Process.demonitor(ref, [:flush])
         end
 
-        Logger.warning("Agent run failed for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
-
-        next_attempt = next_retry_attempt_from_running(running_entry)
-
         state =
-          schedule_issue_retry(state, issue_id, next_attempt, %{
-            identifier: running_entry.identifier,
-            error: "agent run failed: #{inspect(reason)}",
-            worker_host: Map.get(running_entry, :worker_host),
-            workspace_path: Map.get(running_entry, :workspace_path)
-          })
+          if authoritative_worker_receipt?(running_entry) do
+            Logger.warning(
+              "Agent reported a post-outcome failure for issue_id=#{issue_id} session_id=#{session_id} " <>
+                "reason=#{inspect(reason)}; using the authoritative broker receipt instead of retrying the model"
+            )
+
+            finalize_authoritative_agent_down(state, issue_id, running_entry, session_id)
+          else
+            Logger.warning(
+              "Agent run failed for issue_id=#{issue_id} session_id=#{session_id} " <>
+                "reason=#{inspect(reason)}; scheduling retry"
+            )
+
+            next_attempt = next_retry_attempt_from_running(running_entry)
+
+            schedule_issue_retry(state, issue_id, next_attempt, %{
+              identifier: running_entry.identifier,
+              error: "agent run failed: #{inspect(reason)}",
+              worker_host: Map.get(running_entry, :worker_host),
+              workspace_path: Map.get(running_entry, :workspace_path)
+            })
+          end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -300,6 +336,20 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
 
+  def handle_info({:worker_transition_result, issue_id, result}, state)
+      when is_binary(issue_id) do
+    state =
+      case Map.fetch(state.running, issue_id) do
+        {:ok, running_entry} ->
+          %{state | running: Map.put(state.running, issue_id, Map.put(running_entry, :worker_transition_result, result))}
+
+        :error ->
+          state
+      end
+
+    {:noreply, state}
+  end
+
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
       case pop_retry_attempt_state(state, issue_id, retry_token) do
@@ -339,6 +389,14 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Agent task completed with durable publication pending issue_id=#{issue_id} session_id=#{session_id}")
         state
 
+      Config.settings!().state_manager.mode == "authoritative" ->
+        finalize_authoritative_agent_down(
+          state,
+          issue_id,
+          running_entry,
+          session_id
+        )
+
       true ->
         schedule_agent_continuation(state, issue_id, running_entry, session_id)
     end
@@ -348,6 +406,128 @@ defmodule SymphonyElixir.Orchestrator do
     Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
     next_attempt = next_retry_attempt_from_running(running_entry)
     schedule_issue_retry(state, issue_id, next_attempt, agent_retry_metadata(running_entry, "agent exited: #{inspect(reason)}"))
+  end
+
+  defp finalize_authoritative_agent_down(state, issue_id, running_entry, session_id) do
+    result = Map.get(running_entry, :worker_transition_result)
+
+    case authoritative_worker_result_class(result) do
+      :applied ->
+        Logger.info("Authoritative worker transition completed issue_id=#{issue_id} session_id=#{session_id}; model retry suppressed")
+
+        state
+        |> complete_issue(issue_id)
+        |> release_issue_claim(issue_id)
+
+      :obsolete ->
+        Logger.info("Authoritative worker outcome became obsolete issue_id=#{issue_id} session_id=#{session_id}; model retry suppressed")
+        send(self(), {:refresh_issue, issue_id})
+
+        state
+        |> complete_issue(issue_id)
+        |> release_issue_claim(issue_id)
+
+      :effect_pending ->
+        Logger.info("Authoritative worker transition effect remains pending issue_id=#{issue_id} session_id=#{session_id}; claim retained")
+        complete_issue(state, issue_id)
+
+      :needs_handoff ->
+        handoff_authoritative_worker_result(state, issue_id, running_entry, session_id, result)
+
+      :unknown ->
+        Logger.warning("Authoritative worker completed without a transition receipt issue_id=#{issue_id} session_id=#{session_id}; retaining claim for broker refresh")
+        Process.send_after(self(), {:refresh_completed_worker, issue_id, running_entry.issue.state}, @continuation_retry_delay_ms)
+        complete_issue(state, issue_id)
+    end
+  end
+
+  defp authoritative_worker_result_class({:ok, _applied}), do: :applied
+  defp authoritative_worker_result_class({:noop, :already_applied}), do: :applied
+  defp authoritative_worker_result_class({:noop, :stale_causation}), do: :obsolete
+
+  defp authoritative_worker_result_class({:error, {:transition_retry_scheduled, _reason}}),
+    do: :effect_pending
+
+  defp authoritative_worker_result_class({:noop, _reason}), do: :needs_handoff
+  defp authoritative_worker_result_class({:conflict, _snapshot}), do: :needs_handoff
+  defp authoritative_worker_result_class({:rejected, _reason}), do: :needs_handoff
+  defp authoritative_worker_result_class(nil), do: :unknown
+  defp authoritative_worker_result_class(_result), do: :needs_handoff
+
+  defp authoritative_worker_receipt?(running_entry) do
+    Config.settings!().state_manager.mode == "authoritative" and
+      Map.has_key?(running_entry, :worker_transition_result)
+  end
+
+  defp handoff_authoritative_worker_result(
+         state,
+         issue_id,
+         running_entry,
+         session_id,
+         result
+       ) do
+    issue = running_entry.issue
+
+    intent = %TransitionIntent{
+      id: "worker-result-handoff:#{issue_id}:#{session_id}",
+      issue_id: issue_id,
+      source: :orchestrator,
+      actor: "symphony",
+      expected_state: issue.state,
+      kind: :handoff_required,
+      head_oid: issue.metadata && (issue.metadata["head_oid"] || issue.metadata[:head_oid]),
+      causation_id: session_id,
+      work_item_kind: issue.kind,
+      comment_body:
+        "작업 결과의 상태 전이를 안전하게 확정할 수 없어 사람 검토로 인계합니다.\n\n" <>
+          "- 결과: #{inspect(result)}"
+    }
+
+    case apply_transition_intent(state, intent) do
+      {{:ok, _applied}, next_state} ->
+        next_state
+        |> complete_issue(issue_id)
+        |> release_issue_claim(issue_id)
+
+      {{:noop, :already_applied}, next_state} ->
+        next_state
+        |> complete_issue(issue_id)
+        |> release_issue_claim(issue_id)
+
+      {handoff_result, next_state} ->
+        _ = schedule_transition_effect_retry(handoff_result, intent.id)
+
+        Logger.error("Authoritative worker handoff remains pending issue_id=#{issue_id} session_id=#{session_id} result=#{inspect(handoff_result)}")
+
+        complete_issue(next_state, issue_id)
+    end
+  end
+
+  defp handoff_completed_worker_without_receipt(state, issue) do
+    intent = %TransitionIntent{
+      id: "worker-result-handoff:#{issue.id}:missing-receipt",
+      issue_id: issue.id,
+      source: :orchestrator,
+      actor: "symphony",
+      expected_state: issue.state,
+      kind: :handoff_required,
+      head_oid: issue.metadata && (issue.metadata["head_oid"] || issue.metadata[:head_oid]),
+      causation_id: issue.id,
+      work_item_kind: issue.kind,
+      comment_body: "작업 프로세스는 정상 종료했지만 상태 전이 영수증을 확인할 수 없어 사람 검토로 인계합니다."
+    }
+
+    case apply_transition_intent(state, intent) do
+      {{:ok, _applied}, next_state} ->
+        release_issue_claim(next_state, issue.id)
+
+      {{:noop, :already_applied}, next_state} ->
+        release_issue_claim(next_state, issue.id)
+
+      {result, next_state} ->
+        _ = schedule_transition_effect_retry(result, intent.id)
+        next_state
+    end
   end
 
   defp schedule_agent_continuation(state, issue_id, running_entry, session_id) do
@@ -399,7 +579,32 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_transition_effect_retry_result(state, transition_id, _attempt, result) do
     _ = maybe_finalize_abandoned_cause(transition_id, result)
-    state
+    maybe_release_completed_transition_claim(state, transition_id, result)
+  end
+
+  defp maybe_release_completed_transition_claim(state, transition_id, {:ok, _applied}) do
+    release_completed_transition_claim(state, transition_id)
+  end
+
+  defp maybe_release_completed_transition_claim(
+         state,
+         transition_id,
+         {:noop, :already_applied}
+       ) do
+    release_completed_transition_claim(state, transition_id)
+  end
+
+  defp maybe_release_completed_transition_claim(state, _transition_id, _result), do: state
+
+  defp release_completed_transition_claim(state, transition_id) do
+    with {:ok, snapshot} <- journal_snapshot(transition_id),
+         issue_id when is_binary(issue_id) <- snapshot.data[:issue_id],
+         true <- MapSet.member?(state.completed, issue_id) do
+      send(self(), {:refresh_issue, issue_id})
+      release_issue_claim(state, issue_id)
+    else
+      _ -> state
+    end
   end
 
   defp maybe_finalize_abandoned_cause(
@@ -1874,12 +2079,21 @@ defmodule SymphonyElixir.Orchestrator do
       {{:ok, _applied}, next_state} ->
         Logger.warning("Retry budget exhausted; handed off issue_id=#{issue_id} attempts=#{attempt - 1}")
 
-        %{next_state | retry_attempts: Map.delete(next_state.retry_attempts, issue_id)}
+        next_state
+        |> release_issue_claim(issue_id)
+        |> then(&%{&1 | retry_attempts: Map.delete(&1.retry_attempts, issue_id)})
+
+      {{:noop, :already_applied}, next_state} ->
+        Logger.warning("Retry budget exhausted; handoff already applied issue_id=#{issue_id} attempts=#{attempt - 1}")
+
+        next_state
+        |> release_issue_claim(issue_id)
+        |> then(&%{&1 | retry_attempts: Map.delete(&1.retry_attempts, issue_id)})
 
       {result, next_state} ->
         _ = schedule_transition_effect_retry(result, intent.id)
 
-        Logger.error("Retry budget exhausted but handoff failed issue_id=#{issue_id} result=#{inspect(result)}")
+        Logger.error("Retry budget exhausted but handoff remains pending issue_id=#{issue_id} result=#{inspect(result)}")
 
         %{next_state | retry_attempts: Map.delete(next_state.retry_attempts, issue_id)}
     end

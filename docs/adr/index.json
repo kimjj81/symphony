@@ -1,5 +1,20 @@
 [
   {
+    "id": "ADR-20260728-0010-TCF",
+    "title": "Workers are tracker-credential free",
+    "tags": [
+      "orchestration",
+      "tracker",
+      "security",
+      "reliability",
+      "tokens"
+    ],
+    "status": "Accepted",
+    "date": "2026-07-28",
+    "tldr": "Symphony brokers all tracker reads and writes while workers receive only immutable evidence and no tracker credential.",
+    "path": "docs/adr/ADR-20260728-0010-TCF-workers-are-tracker-credential-free.md"
+  },
+  {
     "id": "ADR-20260728-0009-RTH",
     "title": "Broker-owned PR snapshot and inline review closeout",
     "tags": [

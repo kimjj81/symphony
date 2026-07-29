@@ -318,6 +318,7 @@ defmodule SymphonyElixir.CoreTest do
     assert tracker.api_key == "write-token"
     assert tracker.write_api_key == "write-token"
     assert tracker.read_api_key == "read-token"
+    assert tracker.read_api_key_envs == []
     assert tracker.bot_login == "symphony"
     assert Tracker.adapter() == SymphonyElixir.Forgejo.Adapter
 
@@ -394,6 +395,30 @@ defmodule SymphonyElixir.CoreTest do
     WorkflowStore.force_reload()
 
     assert Config.settings!().tracker.write_api_key == "preferred-write"
+  end
+
+  test "tracker config preserves custom read-token environment provenance for worker scrubbing" do
+    previous_custom_read_token = System.get_env("CUSTOM_FORGEJO_READ_TOKEN")
+
+    on_exit(fn ->
+      restore_env("CUSTOM_FORGEJO_READ_TOKEN", previous_custom_read_token)
+    end)
+
+    System.put_env("CUSTOM_FORGEJO_READ_TOKEN", "custom-read-token")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "forgejo",
+      tracker_endpoint: "https://forgejo.example.org/api/v1",
+      tracker_read_api_token: "$CUSTOM_FORGEJO_READ_TOKEN",
+      tracker_write_api_token: "write-token",
+      tracker_project_slug: nil,
+      tracker_owner: "example",
+      tracker_repo: "project"
+    )
+
+    tracker = Config.settings!().tracker
+    assert tracker.read_api_key == "custom-read-token"
+    assert tracker.read_api_key_envs == ["CUSTOM_FORGEJO_READ_TOKEN"]
   end
 
   test "current WORKFLOW.md file is valid and complete" do
@@ -2008,6 +2033,193 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, retry_window_started_at_ms, 500, 1_100)
   end
 
+  test "normal authoritative worker exit does not schedule another model dispatch" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    workflow_path = Workflow.workflow_file_path()
+
+    workflow_path
+    |> File.read!()
+    |> String.replace(
+      "\n---\n",
+      "\nstate_manager:\n  mode: \"authoritative\"\n---\n",
+      global: false
+    )
+    |> then(&File.write!(workflow_path, &1))
+
+    WorkflowStore.force_reload()
+
+    issue_id = "issue-authoritative-complete"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :AuthoritativeCompletionOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-AUTHORITATIVE-COMPLETE",
+      retry_attempt: 3,
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-AUTHORITATIVE-COMPLETE",
+        state: "In Progress"
+      },
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:worker_transition_result, issue_id, {:ok, %{state: "Human Review"}}})
+    _ = :sys.get_state(pid)
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+  end
+
+  test "authoritative broker receipt suppresses a later reported runner failure" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    workflow_path = Workflow.workflow_file_path()
+
+    workflow_path
+    |> File.read!()
+    |> String.replace(
+      "\n---\n",
+      "\nstate_manager:\n  mode: \"authoritative\"\n---\n",
+      global: false
+    )
+    |> then(&File.write!(workflow_path, &1))
+
+    WorkflowStore.force_reload()
+
+    issue_id = "issue-authoritative-receipt-before-failure"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :AuthoritativeReceiptBeforeFailureOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-AUTHORITATIVE-RECEIPT",
+      retry_attempt: 3,
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-AUTHORITATIVE-RECEIPT",
+        state: "In Progress"
+      },
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:worker_transition_result, issue_id, {:ok, %{state: "Human Review"}}})
+    _ = :sys.get_state(pid)
+    send(pid, {:agent_run_failed, issue_id, {:broker_projection_failed, :timeout}})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+  end
+
+  test "authoritative noop completion stays claimed across polls instead of redispatching" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    workflow_path = Workflow.workflow_file_path()
+
+    workflow_path
+    |> File.read!()
+    |> String.replace(
+      "\n---\n",
+      "\nstate_manager:\n  mode: \"authoritative\"\n---\n",
+      global: false
+    )
+    |> then(&File.write!(workflow_path, &1))
+
+    WorkflowStore.force_reload()
+
+    issue_id = "issue-authoritative-noop"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-AUTHORITATIVE-NOOP",
+      title: "No duplicate dispatch",
+      state: "In Progress"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :AuthoritativeNoopOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:worker_transition_result, issue_id, {:noop, :missing_head_oid}})
+    _ = :sys.get_state(pid)
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    _ = :sys.get_state(pid)
+
+    Enum.each(1..3, fn _ ->
+      send(pid, :run_poll_cycle)
+      _ = :sys.get_state(pid)
+    end)
+
+    state = :sys.get_state(pid)
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
@@ -2208,6 +2420,115 @@ defmodule SymphonyElixir.CoreTest do
            } = state.retry_attempts[issue_id]
 
     assert_due_in_range(due_at_ms, retry_window_started_at_ms, 9_000, 10_500)
+  end
+
+  test "retry budget exhaustion releases claims only after a completed handoff" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    workflow_path = Workflow.workflow_file_path()
+
+    workflow_path
+    |> File.read!()
+    |> String.replace(
+      "\n---\n",
+      "\nstate_manager:\n  mode: \"authoritative\"\n---\n",
+      global: false
+    )
+    |> then(&File.write!(workflow_path, &1))
+
+    WorkflowStore.force_reload()
+
+    journal_path = Path.join(Path.dirname(workflow_path), "transitions.log")
+
+    assert is_nil(Process.whereis(SymphonyElixir.TransitionJournal))
+
+    {:ok, journal} =
+      SymphonyElixir.TransitionJournal.start_link(
+        name: SymphonyElixir.TransitionJournal,
+        path: journal_path
+      )
+
+    on_exit(fn ->
+      if Process.alive?(journal), do: SymphonyElixir.TransitionJournal.close(journal)
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-retry-exhausted"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-RETRY-EXHAUSTED",
+      title: "Retry exhaustion",
+      state: "In Progress"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: self(),
+          ref: nil,
+          identifier: issue.identifier,
+          issue: issue,
+          retry_attempt: 5,
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    assert {:noreply, state} = Orchestrator.handle_info({:agent_run_failed, issue_id, :boom}, state)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    assert_receive {:memory_tracker_state_projection, ^issue_id, "In Progress", "Human Review"}
+
+    pending_issue_id = "issue-retry-exhausted-pending"
+
+    pending_issue = %Issue{
+      id: pending_issue_id,
+      identifier: "MT-RETRY-EXHAUSTED-PENDING",
+      title: "Retry exhaustion with unavailable tracker item",
+      state: "In Progress"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    pending_state = %Orchestrator.State{
+      running: %{
+        pending_issue_id => %{
+          pid: self(),
+          ref: nil,
+          identifier: pending_issue.identifier,
+          issue: pending_issue,
+          retry_attempt: 5,
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([pending_issue_id]),
+      codex_totals: %{
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        seconds_running: 0
+      },
+      retry_attempts: %{}
+    }
+
+    assert {:noreply, pending_state} =
+             Orchestrator.handle_info(
+               {:agent_run_failed, pending_issue_id, :tracker_unavailable},
+               pending_state
+             )
+
+    refute Map.has_key?(pending_state.running, pending_issue_id)
+    refute Map.has_key?(pending_state.retry_attempts, pending_issue_id)
+    assert MapSet.member?(pending_state.claimed, pending_issue_id)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
