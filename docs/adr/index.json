@@ -1,5 +1,21 @@
 [
   {
+    "id": "ADR-20260729-0011-YIX",
+    "title": "Bounded indexed orchestration evidence sidecars",
+    "tags": [
+      "orchestration",
+      "evidence",
+      "pull-request",
+      "worker",
+      "ssh",
+      "reliability"
+    ],
+    "status": "Accepted",
+    "date": "2026-07-29",
+    "tldr": "Briefed workers receive a compact 8 KiB manifest plus a broker-owned indexed YAML evidence sidecar capped at 8 MiB.",
+    "path": "docs/adr/ADR-20260729-0011-YIX-bounded-indexed-orchestration-evidence-sidecars.md"
+  },
+  {
     "id": "ADR-20260728-0010-TCF",
     "title": "Workers are tracker-credential free",
     "tags": [

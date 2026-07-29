@@ -102,6 +102,80 @@ defmodule SymphonyElixir.SSHTest do
     assert {:error, :ssh_not_found} = SSH.run("localhost", "printf ok")
   end
 
+  test "copy_to/4 passes SSH config and host port to scp" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-scp-test-#{System.unique_integer([:positive])}")
+    trace_file = Path.join(test_root, "scp.trace")
+    local_file = Path.join(test_root, "evidence.yaml")
+    previous_path = System.get_env("PATH")
+    previous_ssh_config = System.get_env("SYMPHONY_SSH_CONFIG")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMPHONY_SSH_CONFIG", previous_ssh_config)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    File.write!(local_file, "evidence")
+    install_fake_scp!(test_root, trace_file)
+    System.put_env("SYMPHONY_SSH_CONFIG", "/tmp/symphony-test-ssh-config")
+
+    assert {:ok, {"", 0}} =
+             SSH.copy_to(
+               "worker@localhost:2222",
+               local_file,
+               "/tmp/symphony-worker/evidence.yaml",
+               stderr_to_stdout: true
+             )
+
+    trace = File.read!(trace_file)
+    assert trace =~ "-F /tmp/symphony-test-ssh-config"
+    assert trace =~ "-P 2222"
+    assert trace =~ "-- #{local_file} worker@localhost:/tmp/symphony-worker/evidence.yaml"
+  end
+
+  test "copy_to/4 omits the scp port flag when the host has no explicit port" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-scp-default-port-test-#{System.unique_integer([:positive])}")
+    trace_file = Path.join(test_root, "scp.trace")
+    local_file = Path.join(test_root, "evidence.yaml")
+    previous_path = System.get_env("PATH")
+    previous_ssh_config = System.get_env("SYMPHONY_SSH_CONFIG")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMPHONY_SSH_CONFIG", previous_ssh_config)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    File.write!(local_file, "evidence")
+    install_fake_scp!(test_root, trace_file)
+    System.delete_env("SYMPHONY_SSH_CONFIG")
+
+    assert {:ok, {"", 0}} =
+             SSH.copy_to("worker@localhost", local_file, "/tmp/symphony-worker/evidence.yaml")
+
+    trace = File.read!(trace_file)
+    refute trace =~ "-P"
+    assert trace =~ "-- #{local_file} worker@localhost:/tmp/symphony-worker/evidence.yaml"
+  end
+
+  test "copy_to/4 returns an error when scp is unavailable" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-scp-missing-test-#{System.unique_integer([:positive])}")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    System.put_env("PATH", test_root)
+
+    assert {:error, :scp_not_found} =
+             SSH.copy_to("localhost", "/tmp/local", "/tmp/remote")
+  end
+
   test "start_port/3 supports binary output without line mode" do
     test_root = Path.join(System.tmp_dir!(), "symphony-ssh-port-test-#{System.unique_integer([:positive])}")
     trace_file = Path.join(test_root, "ssh.trace")
@@ -181,6 +255,22 @@ defmodule SymphonyElixir.SSHTest do
     )
 
     File.chmod!(fake_ssh, 0o755)
+    System.put_env("PATH", fake_bin_dir <> ":" <> (System.get_env("PATH") || ""))
+  end
+
+  defp install_fake_scp!(test_root, trace_file) do
+    fake_bin_dir = Path.join(test_root, "bin")
+    fake_scp = Path.join(fake_bin_dir, "scp")
+
+    File.mkdir_p!(fake_bin_dir)
+
+    File.write!(fake_scp, """
+    #!/bin/sh
+    printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
+    exit 0
+    """)
+
+    File.chmod!(fake_scp, 0o755)
     System.put_env("PATH", fake_bin_dir <> ":" <> (System.get_env("PATH") || ""))
   end
 

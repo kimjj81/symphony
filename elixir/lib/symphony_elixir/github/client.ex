@@ -42,7 +42,39 @@ defmodule SymphonyElixir.GitHub.Client do
           nodes {
             id
             isResolved
-            comments(last: 100) { nodes { body } }
+            path
+            line
+            comments(first: 100) {
+              nodes {
+                id
+                body
+                author { login }
+                createdAt
+                updatedAt
+                url
+              }
+              pageInfo { hasNextPage endCursor }
+            }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }
+  }
+  """
+
+  @review_thread_comments_query """
+  query SymphonyReviewThreadComments($threadId: ID!, $cursor: String) {
+    node(id: $threadId) {
+      ... on PullRequestReviewThread {
+        comments(first: 100, after: $cursor) {
+          nodes {
+            id
+            body
+            author { login }
+            createdAt
+            updatedAt
+            url
           }
           pageInfo { hasNextPage endCursor }
         }
@@ -119,7 +151,18 @@ defmodule SymphonyElixir.GitHub.Client do
   without receiving tracker credentials or querying GitHub itself.
   """
   @spec fetch_dispatch_snapshot(Issue.t() | String.t()) :: {:ok, map()} | {:error, term()}
-  def fetch_dispatch_snapshot(%Issue{kind: :issue} = issue), do: {:ok, empty_dispatch_snapshot(issue)}
+  def fetch_dispatch_snapshot(%Issue{kind: :issue} = issue) do
+    with {:ok, number, :issue} <- parse_issue_id(issue.id),
+         {:ok, comments} <- fetch_all_comments(number) do
+      {:ok,
+       issue
+       |> empty_dispatch_snapshot()
+       |> Map.put(:top_level_comments, Enum.map(comments, &comment_evidence/1))}
+    else
+      {:ok, _number, kind} -> {:error, {:unsupported_github_issue_kind, kind}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   def fetch_dispatch_snapshot(%Issue{kind: :pull_request} = issue) do
     with {:ok, snapshot} <- fetch_dispatch_snapshot(issue.id) do
@@ -217,10 +260,10 @@ defmodule SymphonyElixir.GitHub.Client do
 
     case request(:get, "/issues/#{number}/comments", params: params) do
       {:ok, comments} when is_list(comments) and length(comments) == 100 ->
-        fetch_all_comments(number, page + 1, acc ++ comments)
+        fetch_all_comments(number, page + 1, Enum.reverse(comments, acc))
 
       {:ok, comments} when is_list(comments) ->
-        {:ok, acc ++ comments}
+        {:ok, comments |> Enum.reverse(acc) |> Enum.reverse()}
 
       {:ok, _payload} ->
         {:error, :github_unexpected_comments_payload}
@@ -239,10 +282,10 @@ defmodule SymphonyElixir.GitHub.Client do
 
     case request(:get, path, params: params) do
       {:ok, values} when is_list(values) and length(values) == @per_page ->
-        fetch_paginated(path, page + 1, acc ++ values)
+        fetch_paginated(path, page + 1, Enum.reverse(values, acc))
 
       {:ok, values} when is_list(values) ->
-        {:ok, acc ++ values}
+        {:ok, values |> Enum.reverse(acc) |> Enum.reverse()}
 
       {:ok, _payload} ->
         {:error, :github_unexpected_paginated_payload}
@@ -507,12 +550,12 @@ defmodule SymphonyElixir.GitHub.Client do
   defp search_issues_for_label(label, page, acc) do
     case request(:get, "/search/issues", params: %{q: search_query_for_label(label), per_page: @per_page, page: page}) do
       {:ok, %{"items" => issues}} when is_list(issues) ->
-        next_acc = acc ++ issues
+        next_acc = Enum.reverse(issues, acc)
 
         if length(issues) == @per_page do
           search_issues_for_label(label, page + 1, next_acc)
         else
-          {:ok, next_acc}
+          {:ok, Enum.reverse(next_acc)}
         end
 
       {:ok, _payload} ->
@@ -874,8 +917,6 @@ defmodule SymphonyElixir.GitHub.Client do
       _ -> false
     end)
   end
-
-  defp comment_marker_present?(_comments, _marker), do: false
 
   defp create_marked_comment(number, body, marker) do
     marked_body = if String.contains?(body, marker), do: body, else: body <> "\n\n" <> marker
@@ -1801,23 +1842,44 @@ defmodule SymphonyElixir.GitHub.Client do
     |> Kernel.<>(path)
   end
 
-  defp fetch_review_threads(tracker, number), do: fetch_review_threads(tracker, number, nil, [])
+  defp fetch_review_threads(tracker, number),
+    do: fetch_review_threads(tracker, number, nil, [], %{})
 
-  defp fetch_review_threads(tracker, number, cursor, acc) do
+  defp fetch_review_threads(tracker, number, cursor, acc, seen_cursors) do
     variables = %{owner: tracker.owner, repo: tracker.repo, number: number, cursor: cursor}
 
     with {:ok, response} <- graphql_request(tracker, @review_threads_query, variables),
          {:ok, pull_request} <- graphql_pull_request(response),
          {:ok, threads, page_info} <- graphql_review_threads(pull_request) do
-      next_acc = acc ++ threads
+      next_acc = Enum.reverse(threads, acc)
 
       case page_info do
-        %{"hasNextPage" => true, "endCursor" => next_cursor} when is_binary(next_cursor) and next_cursor != "" ->
-          fetch_review_threads(tracker, number, next_cursor, next_acc)
+        %{"hasNextPage" => false} ->
+          finish_review_threads(tracker, pull_request, Enum.reverse(next_acc))
 
-        _ ->
-          {:ok, %{head_oid: pull_request["headRefOid"], threads: next_acc}}
+        %{"hasNextPage" => true, "endCursor" => next_cursor} when is_binary(next_cursor) and next_cursor != "" ->
+          fetch_next_review_threads_page(tracker, number, next_cursor, next_acc, seen_cursors)
+
+        %{"hasNextPage" => true} ->
+          {:error, :github_review_threads_cursor_invalid}
+
+        _page_info ->
+          {:error, :github_review_threads_page_info_invalid}
       end
+    end
+  end
+
+  defp fetch_next_review_threads_page(tracker, number, cursor, acc, seen_cursors) do
+    if Map.has_key?(seen_cursors, cursor) do
+      {:error, :github_review_threads_cursor_invalid}
+    else
+      fetch_review_threads(tracker, number, cursor, acc, Map.put(seen_cursors, cursor, true))
+    end
+  end
+
+  defp finish_review_threads(tracker, pull_request, threads) do
+    with {:ok, hydrated_threads} <- hydrate_unresolved_thread_comments(tracker, threads) do
+      {:ok, %{head_oid: pull_request["headRefOid"], threads: hydrated_threads}}
     end
   end
 
@@ -1832,35 +1894,172 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp graphql_review_threads(_pull_request), do: {:error, :github_review_thread_snapshot_invalid}
 
+  defp hydrate_unresolved_thread_comments(tracker, threads) do
+    threads
+    |> Enum.reduce_while({:ok, []}, fn thread, {:ok, acc} ->
+      case hydrate_unresolved_thread_comment_pages(tracker, thread) do
+        {:ok, hydrated} -> {:cont, {:ok, [hydrated | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp hydrate_unresolved_thread_comment_pages(_tracker, %{"isResolved" => true} = thread),
+    do: {:ok, thread}
+
+  defp hydrate_unresolved_thread_comment_pages(tracker, %{"id" => thread_id, "comments" => comments} = thread)
+       when is_binary(thread_id) and is_map(comments) do
+    with {:ok, nodes, page_info} <- graphql_review_thread_comment_connection(comments),
+         {:ok, all_comments} <-
+           fetch_remaining_review_thread_comments(
+             tracker,
+             thread_id,
+             page_info,
+             Enum.reverse(nodes),
+             %{}
+           ) do
+      {:ok, put_in(thread, ["comments", "nodes"], all_comments)}
+    end
+  end
+
+  defp hydrate_unresolved_thread_comment_pages(_tracker, _thread),
+    do: {:error, :github_review_thread_comments_invalid}
+
+  defp fetch_remaining_review_thread_comments(
+         _tracker,
+         _thread_id,
+         %{"hasNextPage" => false},
+         acc,
+         _seen_cursors
+       ),
+       do: {:ok, Enum.reverse(acc)}
+
+  defp fetch_remaining_review_thread_comments(
+         tracker,
+         thread_id,
+         %{"hasNextPage" => true, "endCursor" => cursor},
+         acc,
+         seen_cursors
+       )
+       when is_binary(cursor) and cursor != "" do
+    if Map.has_key?(seen_cursors, cursor) do
+      {:error, :github_review_thread_comments_cursor_invalid}
+    else
+      variables = %{threadId: thread_id, cursor: cursor}
+
+      with {:ok, response} <- graphql_request(tracker, @review_thread_comments_query, variables),
+           {:ok, comments} <- graphql_review_thread_comments(response),
+           {:ok, nodes, page_info} <- graphql_review_thread_comment_connection(comments) do
+        fetch_remaining_review_thread_comments(
+          tracker,
+          thread_id,
+          page_info,
+          Enum.reverse(nodes, acc),
+          Map.put(seen_cursors, cursor, true)
+        )
+      end
+    end
+  end
+
+  defp fetch_remaining_review_thread_comments(
+         _tracker,
+         _thread_id,
+         %{"hasNextPage" => true},
+         _acc,
+         _seen_cursors
+       ),
+       do: {:error, :github_review_thread_comments_cursor_invalid}
+
+  defp fetch_remaining_review_thread_comments(
+         _tracker,
+         _thread_id,
+         _page_info,
+         _acc,
+         _seen_cursors
+       ),
+       do: {:error, :github_review_thread_comments_page_info_invalid}
+
+  defp graphql_review_thread_comments(%{"data" => %{"node" => %{"comments" => comments}}})
+       when is_map(comments),
+       do: {:ok, comments}
+
+  defp graphql_review_thread_comments(_response),
+    do: {:error, :github_review_thread_comments_invalid}
+
+  defp graphql_review_thread_comment_connection(%{"nodes" => nodes, "pageInfo" => page_info})
+       when is_list(nodes) and is_map(page_info),
+       do: {:ok, nodes, page_info}
+
+  defp graphql_review_thread_comment_connection(_comments),
+    do: {:error, :github_review_thread_comments_invalid}
+
   defp pull_request_head(%{"head" => %{"sha" => head}}) when is_binary(head) and head != "", do: {:ok, head}
   defp pull_request_head(_pull_request), do: {:error, :github_pull_request_head_missing}
 
   defp comment_evidence(comment) when is_map(comment) do
-    %{body: Map.get(comment, "body", ""), author: get_in(comment, ["user", "login"])}
+    %{
+      id: Map.get(comment, "id"),
+      body: Map.get(comment, "body", ""),
+      author: get_in(comment, ["user", "login"]),
+      url: Map.get(comment, "html_url"),
+      created_at: Map.get(comment, "created_at"),
+      updated_at: Map.get(comment, "updated_at")
+    }
   end
 
   defp review_evidence(review) when is_map(review) do
-    %{body: Map.get(review, "body", ""), state: Map.get(review, "state"), author: get_in(review, ["user", "login"])}
+    %{
+      id: Map.get(review, "id"),
+      body: Map.get(review, "body", ""),
+      state: Map.get(review, "state"),
+      author: get_in(review, ["user", "login"]),
+      url: Map.get(review, "html_url"),
+      submitted_at: Map.get(review, "submitted_at"),
+      commit_id: Map.get(review, "commit_id")
+    }
   end
 
   defp inline_comment_evidence(comment) when is_map(comment) do
     %{
+      id: Map.get(comment, "id"),
       body: Map.get(comment, "body", ""),
       path: Map.get(comment, "path"),
       line: Map.get(comment, "line") || Map.get(comment, "original_line"),
-      author: get_in(comment, ["user", "login"])
+      author: get_in(comment, ["user", "login"]),
+      url: Map.get(comment, "html_url"),
+      created_at: Map.get(comment, "created_at"),
+      updated_at: Map.get(comment, "updated_at"),
+      commit_id: Map.get(comment, "commit_id")
     }
   end
 
   defp review_thread_feedback(%{"id" => thread_ref} = thread) when is_binary(thread_ref) do
-    bodies =
+    comments =
       thread
       |> get_in(["comments", "nodes"])
       |> List.wrap()
-      |> Enum.map(&Map.get(&1, "body", ""))
-      |> Enum.reject(&(&1 == ""))
+      |> Enum.map(fn comment ->
+        %{
+          id: Map.get(comment, "id"),
+          body: Map.get(comment, "body", ""),
+          author: get_in(comment, ["author", "login"]),
+          created_at: Map.get(comment, "createdAt"),
+          updated_at: Map.get(comment, "updatedAt"),
+          url: Map.get(comment, "url")
+        }
+      end)
 
-    %{thread_ref: thread_ref, feedback: Enum.join(bodies, "\n\n")}
+    %{
+      thread_ref: thread_ref,
+      path: Map.get(thread, "path"),
+      line: Map.get(thread, "line"),
+      comments: comments,
+      feedback: comments |> Enum.map(& &1.body) |> Enum.reject(&(&1 == "")) |> Enum.join("\n\n")
+    }
   end
 
   defp validate_review_thread_snapshot(%{head_oid: expected_head_oid, threads: threads}, expected_head_oid, updates) do

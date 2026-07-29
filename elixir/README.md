@@ -161,6 +161,11 @@ Notes:
   `MYVEN_GITLEAKS_CACHE_DIR` paths beneath their temporary runtime directory. Symphony removes the
   directory when the app-server session stops, so verification tools do not require write access to
   the worker account's home cache.
+- Briefed workers receive an indexed, read-only YAML tracker-evidence sidecar in the same temporary
+  runtime directory through `SYMPHONY_ORCHESTRATION_EVIDENCE`. SSH dispatch requires OpenSSH `scp`
+  on the Symphony host and `wc`, `sha256sum`, and `chmod` on the worker host. Symphony verifies the
+  uploaded byte count and SHA-256 before launching Codex and removes the sidecar with the session
+  runtime.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - `codex.auto_approve_requests: true` makes Symphony approve app-server approval requests without

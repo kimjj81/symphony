@@ -1690,7 +1690,7 @@ defmodule SymphonyElixir.GitHubClientTest do
     thread = %{
       "id" => "thread-596",
       "isResolved" => false,
-      "comments" => %{"nodes" => [%{"body" => "모델 소유권을 옮겨 주세요."}]}
+      "comments" => review_thread_comments_connection([%{"body" => "모델 소유권을 옮겨 주세요."}])
     }
 
     stub_github_requests(self(), [
@@ -1703,14 +1703,32 @@ defmodule SymphonyElixir.GitHubClientTest do
 
     assert {:ok, snapshot} = Client.fetch_dispatch_snapshot("github:pr:596")
     assert snapshot.live_head == "head-596"
-    assert snapshot.top_level_comments == [%{body: "일반 댓글", author: "reviewer"}]
-    assert snapshot.reviews == [%{body: "요약", state: "CHANGES_REQUESTED", author: "reviewer"}]
-    assert snapshot.inline_comments == [%{body: "inline", path: "apps/api/core/models.py", line: 42, author: "reviewer"}]
-    assert snapshot.unresolved_feedback == [%{thread_ref: "thread-596", feedback: "모델 소유권을 옮겨 주세요."}]
+    assert [%{body: "일반 댓글", author: "reviewer"}] = snapshot.top_level_comments
+    assert [%{body: "요약", state: "CHANGES_REQUESTED", author: "reviewer"}] = snapshot.reviews
+
+    assert [%{body: "inline", path: "apps/api/core/models.py", line: 42, author: "reviewer"}] =
+             snapshot.inline_comments
+
+    assert [
+             %{
+               thread_ref: "thread-596",
+               feedback: "모델 소유권을 옮겨 주세요.",
+               comments: [%{body: "모델 소유권을 옮겨 주세요."}]
+             }
+           ] = snapshot.unresolved_feedback
+
     assert_github_responses_consumed()
   end
 
-  test "builds a deterministic issue dispatch snapshot without a GitHub request" do
+  test "builds an issue dispatch snapshot with every paginated human comment" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
     issue = %Issue{
       id: "github:issue:529",
       identifier: "Issue #529",
@@ -1722,11 +1740,332 @@ defmodule SymphonyElixir.GitHubClientTest do
       labels: ["sym:planned"]
     }
 
+    first_page =
+      Enum.map(1..100, fn index ->
+        %{"id" => index, "body" => "comment-#{index}", "user" => %{"login" => "reviewer"}}
+      end)
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/issues/529/comments", github_response(200, first_page)},
+      {:get, "/repos/studiojin-dev/myven/issues/529/comments", github_response(200, [%{"id" => 101, "body" => "comment-101", "user" => %{"login" => "author"}}])}
+    ])
+
     assert {:ok, snapshot} = Client.fetch_dispatch_snapshot(issue)
     assert snapshot.work_item.title == "Broker-owned issue dispatch"
     assert snapshot.work_item.description == "Use the dispatch context without calling GitHub."
     assert snapshot.live_head == nil
     assert snapshot.unresolved_feedback == []
+    assert length(snapshot.top_level_comments) == 101
+    assert List.first(snapshot.top_level_comments) == %{id: 1, body: "comment-1", author: "reviewer", url: nil, created_at: nil, updated_at: nil}
+    assert List.last(snapshot.top_level_comments) == %{id: 101, body: "comment-101", author: "author", url: nil, created_at: nil, updated_at: nil}
+    assert_github_responses_consumed()
+  end
+
+  test "paginates every unresolved review-thread comment in chronological order" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    first_page = Enum.map(1..100, &%{"id" => "comment-#{&1}", "body" => "body-#{&1}"})
+
+    thread = %{
+      "id" => "thread-101",
+      "isResolved" => false,
+      "comments" => review_thread_comments_connection(first_page, true, "cursor-100")
+    }
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})},
+      {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [])},
+      {:post, "/graphql", github_response(200, review_threads_response("head-596", [thread]))},
+      {:post, "/graphql",
+       github_response(
+         200,
+         review_thread_comments_response(
+           review_thread_comments_connection(
+             [%{"id" => "comment-101", "body" => "body-101"}],
+             false,
+             nil
+           )
+         )
+       )}
+    ])
+
+    assert {:ok, snapshot} = Client.fetch_dispatch_snapshot("github:pr:596")
+    assert [%{thread_ref: "thread-101", comments: comments}] = snapshot.unresolved_feedback
+    assert length(comments) == 101
+    assert Enum.map(comments, & &1.body) == Enum.map(1..101, &"body-#{&1}")
+
+    assert_receive {:github_request, :post, "/graphql", nil, %{variables: %{threadId: "thread-101", cursor: "cursor-100"}}}
+
+    assert_github_responses_consumed()
+  end
+
+  test "paginates every top-level review thread without changing order" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    first_page =
+      Enum.map(1..100, fn index ->
+        %{
+          "id" => "resolved-#{index}",
+          "isResolved" => true,
+          "comments" => review_thread_comments_connection([])
+        }
+      end)
+
+    final_thread = %{
+      "id" => "unresolved-101",
+      "isResolved" => false,
+      "comments" => review_thread_comments_connection([%{"id" => "comment-101", "body" => "last"}])
+    }
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})},
+      {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [])},
+      {:post, "/graphql",
+       github_response(
+         200,
+         review_threads_response(
+           "head-596",
+           first_page,
+           %{"hasNextPage" => true, "endCursor" => "thread-cursor-100"}
+         )
+       )},
+      {:post, "/graphql", github_response(200, review_threads_response("head-596", [final_thread]))}
+    ])
+
+    assert {:ok, snapshot} = Client.fetch_dispatch_snapshot("github:pr:596")
+
+    assert [%{thread_ref: "unresolved-101", comments: [%{body: "last"}]}] =
+             snapshot.unresolved_feedback
+
+    assert_receive {:github_request, :post, "/graphql", nil, %{variables: %{number: 596, cursor: "thread-cursor-100"}}}
+
+    assert_github_responses_consumed()
+  end
+
+  test "fails a dispatch snapshot for missing or empty top-level review-thread cursors" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    Enum.each([nil, ""], fn cursor ->
+      stub_github_requests(
+        self(),
+        dispatch_snapshot_requests([
+          {:post, "/graphql",
+           github_response(
+             200,
+             review_threads_response(
+               "head-596",
+               [],
+               %{"hasNextPage" => true, "endCursor" => cursor}
+             )
+           )}
+        ])
+      )
+
+      assert {:error, :github_review_threads_cursor_invalid} =
+               Client.fetch_dispatch_snapshot("github:pr:596")
+
+      assert_github_responses_consumed()
+    end)
+  end
+
+  test "fails a dispatch snapshot for repeated top-level review-thread cursors" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    repeated_page =
+      review_threads_response(
+        "head-596",
+        [],
+        %{"hasNextPage" => true, "endCursor" => "repeated-cursor"}
+      )
+
+    stub_github_requests(
+      self(),
+      dispatch_snapshot_requests([
+        {:post, "/graphql", github_response(200, repeated_page)},
+        {:post, "/graphql", github_response(200, repeated_page)}
+      ])
+    )
+
+    assert {:error, :github_review_threads_cursor_invalid} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+
+    assert_github_responses_consumed()
+  end
+
+  test "fails a dispatch snapshot for malformed top-level review-thread page info" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    stub_github_requests(
+      self(),
+      dispatch_snapshot_requests([
+        {:post, "/graphql",
+         github_response(
+           200,
+           review_threads_response("head-596", [], %{"hasNextPage" => "unknown"})
+         )}
+      ])
+    )
+
+    assert {:error, :github_review_threads_page_info_invalid} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+
+    assert_github_responses_consumed()
+  end
+
+  test "fails a dispatch snapshot when a top-level review-thread page fails" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    first_page =
+      review_threads_response(
+        "head-596",
+        [],
+        %{"hasNextPage" => true, "endCursor" => "next-thread-page"}
+      )
+
+    stub_github_requests(
+      self(),
+      dispatch_snapshot_requests([
+        {:post, "/graphql", github_response(200, first_page)},
+        {:post, "/graphql", github_response(500, %{"message" => "temporary failure"})}
+      ])
+    )
+
+    assert {:error, {:github_retryable_api_status, 500, %{"message" => "temporary failure"}}} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+
+    assert_github_responses_consumed()
+  end
+
+  test "fails the dispatch snapshot when an unresolved thread comment page fails" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    thread = %{
+      "id" => "thread-failure",
+      "isResolved" => false,
+      "comments" => review_thread_comments_connection([], true, "cursor-next")
+    }
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})},
+      {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [])},
+      {:post, "/graphql", github_response(200, review_threads_response("head-596", [thread]))},
+      {:post, "/graphql", github_response(500, %{"message" => "temporary failure"})}
+    ])
+
+    assert {:error, {:github_retryable_api_status, 500, %{"message" => "temporary failure"}}} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+
+    assert_github_responses_consumed()
+  end
+
+  test "fails the dispatch snapshot when an unresolved thread pagination cursor is missing or empty" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    Enum.each([nil, ""], fn cursor ->
+      thread = %{
+        "id" => "thread-missing-cursor",
+        "isResolved" => false,
+        "comments" => review_thread_comments_connection([], true, cursor)
+      }
+
+      stub_github_requests(
+        self(),
+        dispatch_snapshot_requests([
+          {:post, "/graphql", github_response(200, review_threads_response("head-596", [thread]))}
+        ])
+      )
+
+      assert {:error, :github_review_thread_comments_cursor_invalid} =
+               Client.fetch_dispatch_snapshot("github:pr:596")
+
+      assert_github_responses_consumed()
+    end)
+  end
+
+  test "fails the dispatch snapshot when an unresolved thread cursor repeats" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    thread = %{
+      "id" => "thread-repeated-cursor",
+      "isResolved" => false,
+      "comments" => review_thread_comments_connection([], true, "repeated-comment-cursor")
+    }
+
+    repeated_page =
+      review_thread_comments_response(review_thread_comments_connection([], true, "repeated-comment-cursor"))
+
+    stub_github_requests(
+      self(),
+      dispatch_snapshot_requests([
+        {:post, "/graphql", github_response(200, review_threads_response("head-596", [thread]))},
+        {:post, "/graphql", github_response(200, repeated_page)}
+      ])
+    )
+
+    assert {:error, :github_review_thread_comments_cursor_invalid} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+
+    assert_github_responses_consumed()
   end
 
   test "classifies REST rate limiting as retryable and ordinary forbidden responses as non-retryable" do
@@ -1826,7 +2165,7 @@ defmodule SymphonyElixir.GitHubClientTest do
       tracker_project_slug: nil
     )
 
-    thread = %{"id" => "thread-1", "isResolved" => false, "comments" => %{"nodes" => []}}
+    thread = %{"id" => "thread-1", "isResolved" => false, "comments" => review_thread_comments_connection([])}
 
     stub_github_requests(self(), [
       {:post, "/graphql", github_response(200, review_threads_response("published-head", [thread]))},
@@ -1871,8 +2210,8 @@ defmodule SymphonyElixir.GitHubClientTest do
       tracker_project_slug: nil
     )
 
-    human_thread = %{"id" => "thread-2", "isResolved" => false, "comments" => %{"nodes" => []}}
-    fixed_thread = %{"id" => "thread-3", "isResolved" => false, "comments" => %{"nodes" => []}}
+    human_thread = %{"id" => "thread-2", "isResolved" => false, "comments" => review_thread_comments_connection([])}
+    fixed_thread = %{"id" => "thread-3", "isResolved" => false, "comments" => review_thread_comments_connection([])}
 
     stub_github_requests(self(), [
       {:post, "/graphql", github_response(200, review_threads_response("published-head", [human_thread, fixed_thread]))},
@@ -1924,7 +2263,7 @@ defmodule SymphonyElixir.GitHubClientTest do
       tracker_project_slug: nil
     )
 
-    thread = %{"id" => "thread-1", "isResolved" => false, "comments" => %{"nodes" => []}}
+    thread = %{"id" => "thread-1", "isResolved" => false, "comments" => review_thread_comments_connection([])}
     marker = "<!-- sym-review-thread:publication:513:thread-1 -->"
 
     update = %{
@@ -2016,16 +2355,40 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert_github_responses_consumed()
   end
 
-  defp review_threads_response(head_oid, threads) do
+  defp dispatch_snapshot_requests(graphql_requests) do
+    [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})},
+      {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [])}
+    ] ++ graphql_requests
+  end
+
+  defp review_threads_response(
+         head_oid,
+         threads,
+         page_info \\ %{"hasNextPage" => false, "endCursor" => nil}
+       ) do
     %{
       "data" => %{
         "repository" => %{
           "pullRequest" => %{
             "headRefOid" => head_oid,
-            "reviewThreads" => %{"nodes" => threads, "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}}
+            "reviewThreads" => %{"nodes" => threads, "pageInfo" => page_info}
           }
         }
       }
+    }
+  end
+
+  defp review_thread_comments_response(comments) do
+    %{"data" => %{"node" => %{"comments" => comments}}}
+  end
+
+  defp review_thread_comments_connection(nodes, has_next_page \\ false, end_cursor \\ nil) do
+    %{
+      "nodes" => nodes,
+      "pageInfo" => %{"hasNextPage" => has_next_page, "endCursor" => end_cursor}
     }
   end
 

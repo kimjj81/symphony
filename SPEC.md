@@ -811,13 +811,24 @@ Important nuance:
 Workflows MAY enable orchestration briefs for bounded PR review/rework cycles:
 
 - The broker reads the live PR head, comments, reviews, inline comments, and unresolved feedback
-  once per worker run, then renders an in-memory brief no larger than 8 KiB. Workers receive that
-  immutable snapshot and never query the tracker directly.
-- If broker snapshot generation fails or exceeds the limit, no worker starts. Retryable failures use
-  the bounded dispatch retry policy; missing authority, unsupported providers, stale heads, or an
-  exhausted retry budget hand off to Human Review.
+  once per fresh worker turn. GitHub issue comments and nested unresolved-thread comment pages are
+  fully paginated. It renders a compact manifest no larger than 8 KiB plus an indexed YAML
+  evidence sidecar no larger than 8 MiB. The manifest supplies the sidecar digest, inclusive line
+  ranges, and lane-required regions; workers read the immutable sidecar and never query the tracker
+  directly.
+- The sidecar preserves unresolved threads verbatim and separates human comments, review summaries,
+  inline comments, broker worker reports, transition history, and exact-duplicate occurrence
+  metadata. Literal bodies preserve leading whitespace and the exact trailing-LF count after LF
+  normalization. Top-level review-thread and nested-comment pagination fails the whole snapshot for
+  missing, empty, or repeated cursors or malformed page information. The broker compares the parsed
+  YAML index with the computed index and validates line ranges, item counts, byte counts, and
+  SHA-256 before dispatch.
+- If broker snapshot or sidecar generation, transfer, or verification fails or exceeds its limit, no
+  worker starts. Retryable failures use the bounded dispatch retry policy; missing authority,
+  unsupported providers, stale heads, or an exhausted retry budget hand off to Human Review.
 - Each briefed worker turn starts a fresh coding-agent thread and receives only tracker identity,
-  the brief, the current review-verdict counter, and the verification tier.
+  the compact manifest, the immutable sidecar, the current review-verdict counter, and the
+  verification tier. Continuation turns regenerate both artifacts from current tracker state.
 - Briefed continuation is transition-aware rather than based on active state alone. Implementation or
   rework may continue to review; the configured budget permits that many complete automatic
   review/rework cycles. The next review is a confirmation review: a clean review stops immediately
