@@ -1698,7 +1698,8 @@ defmodule SymphonyElixir.GitHubClientTest do
       {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [%{"body" => "일반 댓글", "user" => %{"login" => "reviewer"}}])},
       {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [%{"body" => "요약", "state" => "CHANGES_REQUESTED", "user" => %{"login" => "reviewer"}}])},
       {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [%{"body" => "inline", "path" => "apps/api/core/models.py", "line" => 42, "user" => %{"login" => "reviewer"}}])},
-      {:post, "/graphql", github_response(200, review_threads_response("head-596", [thread]))}
+      {:post, "/graphql", github_response(200, review_threads_response("head-596", [thread]))},
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})}
     ])
 
     assert {:ok, snapshot} = Client.fetch_dispatch_snapshot("github:pr:596")
@@ -1794,7 +1795,8 @@ defmodule SymphonyElixir.GitHubClientTest do
              nil
            )
          )
-       )}
+       )},
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})}
     ])
 
     assert {:ok, snapshot} = Client.fetch_dispatch_snapshot("github:pr:596")
@@ -1845,7 +1847,8 @@ defmodule SymphonyElixir.GitHubClientTest do
            %{"hasNextPage" => true, "endCursor" => "thread-cursor-100"}
          )
        )},
-      {:post, "/graphql", github_response(200, review_threads_response("head-596", [final_thread]))}
+      {:post, "/graphql", github_response(200, review_threads_response("head-596", [final_thread]))},
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})}
     ])
 
     assert {:ok, snapshot} = Client.fetch_dispatch_snapshot("github:pr:596")
@@ -2135,7 +2138,7 @@ defmodule SymphonyElixir.GitHubClientTest do
     assert_github_responses_consumed()
   end
 
-  test "fails a dispatch snapshot when REST and GraphQL heads differ" do
+  test "fails a dispatch snapshot before hydration when the initial REST and first GraphQL heads differ" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",
       tracker_api_token: "token",
@@ -2144,16 +2147,118 @@ defmodule SymphonyElixir.GitHubClientTest do
       tracker_project_slug: nil
     )
 
+    thread = %{
+      "id" => "thread-first-page-head-drift",
+      "isResolved" => false,
+      "comments" => review_thread_comments_connection([], true, "nested-comments")
+    }
+
     stub_github_requests(self(), [
       {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})},
       {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [])},
       {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [])},
       {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [])},
-      {:post, "/graphql", github_response(200, review_threads_response("newer-head", []))}
+      {:post, "/graphql", github_response(200, review_threads_response("newer-head", [thread]))}
     ])
 
-    assert {:error, {:dispatch_snapshot_head_drift, %{pull_head: "head-596", review_head: "newer-head"}}} =
+    assert {:error, {:dispatch_snapshot_head_drift, %{review_head: "head-596", current_head: "newer-head"}}} =
              Client.fetch_dispatch_snapshot("github:pr:596")
+
+    assert_github_responses_consumed()
+  end
+
+  test "fails a dispatch snapshot when the PR head changes during thread hydration" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    thread = %{
+      "id" => "thread-head-drift",
+      "isResolved" => false,
+      "comments" => review_thread_comments_connection([], true, "next-comments")
+    }
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})},
+      {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [])},
+      {:post, "/graphql", github_response(200, review_threads_response("head-596", [thread]))},
+      {:post, "/graphql", github_response(200, review_thread_comments_response(review_thread_comments_connection([])))},
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "newer-head"}})}
+    ])
+
+    assert {:error, {:dispatch_snapshot_head_drift, %{review_head: "head-596", current_head: "newer-head"}}} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+
+    assert_github_responses_consumed()
+  end
+
+  test "fails a dispatch snapshot before combining review-thread pages from different heads" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_api_token: "token",
+      tracker_owner: "studiojin-dev",
+      tracker_repo: "myven",
+      tracker_project_slug: nil
+    )
+
+    first_thread = %{
+      "id" => "thread-head-596",
+      "isResolved" => false,
+      "comments" => review_thread_comments_connection([])
+    }
+
+    second_thread = %{
+      "id" => "thread-newer-head",
+      "isResolved" => false,
+      "comments" => review_thread_comments_connection([])
+    }
+
+    third_thread = %{
+      "id" => "thread-returned-head-596",
+      "isResolved" => false,
+      "comments" => review_thread_comments_connection([])
+    }
+
+    stub_github_requests(self(), [
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})},
+      {:get, "/repos/studiojin-dev/myven/issues/596/comments", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/reviews", github_response(200, [])},
+      {:get, "/repos/studiojin-dev/myven/pulls/596/comments", github_response(200, [])},
+      {:post, "/graphql",
+       github_response(
+         200,
+         review_threads_response(
+           "head-596",
+           [first_thread],
+           %{"hasNextPage" => true, "endCursor" => "thread-cursor-1"}
+         )
+       )},
+      {:post, "/graphql",
+       github_response(
+         200,
+         review_threads_response(
+           "newer-head",
+           [second_thread],
+           %{"hasNextPage" => true, "endCursor" => "thread-cursor-2"}
+         )
+       )},
+      {:post, "/graphql", github_response(200, review_threads_response("head-596", [third_thread]))},
+      {:get, "/repos/studiojin-dev/myven/pulls/596", github_response(200, %{"head" => %{"sha" => "head-596"}})}
+    ])
+
+    assert {:error, {:dispatch_snapshot_head_drift, %{review_head: "head-596", current_head: "newer-head"}}} =
+             Client.fetch_dispatch_snapshot("github:pr:596")
+
+    assert [
+             {:post, "/graphql", _third_page},
+             {:get, "/repos/studiojin-dev/myven/pulls/596", _final_revalidation}
+           ] = Process.get(:github_client_test_responses)
   end
 
   test "replies to and resolves every fixed review thread at the published head" do

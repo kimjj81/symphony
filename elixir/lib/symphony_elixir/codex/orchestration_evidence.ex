@@ -224,8 +224,10 @@ defmodule SymphonyElixir.Codex.OrchestrationEvidence do
 
   defp ordered_thread_comment(comment) do
     ordered_map([
+      {"id", evidence_value(comment, :id, nil)},
       {"author", evidence_value(comment, :author, nil)},
       {"created_at", evidence_value(comment, :created_at, nil)},
+      {"updated_at", evidence_value(comment, :updated_at, nil)},
       {"url", evidence_value(comment, :url, nil)},
       {"body", literal(evidence_value(comment, :body, ""))}
     ])

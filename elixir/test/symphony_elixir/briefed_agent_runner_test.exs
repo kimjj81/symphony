@@ -132,8 +132,10 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
           line: 7,
           comments: [
             %{
+              id: "comment-1",
               author: "reviewer",
               created_at: "2026-07-29T00:02:00Z",
+              updated_at: "2026-07-29T00:03:00Z",
               url: "https://example.test/thread-1",
               body: "원문을 보존합니다."
             }
@@ -157,7 +159,18 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
     assert [%{"body" => "검증 완료\n"}] = decoded["worker_reports"]
     assert [%{"body" => "Review로 복구\n"}] = decoded["transition_history"]
 
-    assert [%{"thread_ref" => "thread-1", "comments" => [%{"body" => "원문을 보존합니다."}]}] =
+    assert [
+             %{
+               "thread_ref" => "thread-1",
+               "comments" => [
+                 %{
+                   "id" => "comment-1",
+                   "updated_at" => "2026-07-29T00:03:00Z",
+                   "body" => "원문을 보존합니다."
+                 }
+               ]
+             }
+           ] =
              decoded["unresolved_threads"]
 
     assert [%{"original_count" => 2, "region" => "human_comments"}] =
@@ -176,6 +189,235 @@ defmodule SymphonyElixir.BriefedAgentRunnerTest do
       assert sha256(region) == index.sha256
       assert String.starts_with?(region, "#{name}:")
     end)
+  end
+
+  test "remote sidecar transport retries disconnects and hands off permanent failures" do
+    test_root = test_root("remote-sidecar-failures")
+    remote_workspace = "/remote/workspaces/PR__remote-sidecar-failures"
+    fake_ssh = Path.join(test_root, "ssh")
+    fake_scp = Path.join(test_root, "scp")
+    ssh_trace = Path.join(test_root, "ssh.trace")
+    previous_path = System.get_env("PATH")
+    previous_scp_output = System.get_env("SYMP_TEST_SCP_OUTPUT")
+    previous_scp_status = System.get_env("SYMP_TEST_SCP_STATUS")
+    previous_ssh_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_runtime_output = System.get_env("SYMP_TEST_REMOTE_RUNTIME_OUTPUT")
+    previous_runtime_status = System.get_env("SYMP_TEST_REMOTE_RUNTIME_STATUS")
+    previous_verification_output = System.get_env("SYMP_TEST_REMOTE_VERIFICATION_OUTPUT")
+    previous_verification_status = System.get_env("SYMP_TEST_REMOTE_VERIFICATION_STATUS")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SCP_OUTPUT", previous_scp_output)
+      restore_env("SYMP_TEST_SCP_STATUS", previous_scp_status)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_ssh_trace)
+      restore_env("SYMP_TEST_REMOTE_RUNTIME_OUTPUT", previous_runtime_output)
+      restore_env("SYMP_TEST_REMOTE_RUNTIME_STATUS", previous_runtime_status)
+      restore_env("SYMP_TEST_REMOTE_VERIFICATION_OUTPUT", previous_verification_output)
+      restore_env("SYMP_TEST_REMOTE_VERIFICATION_STATUS", previous_verification_status)
+      File.rm_rf(test_root)
+    end)
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    if [ -n "$SYMP_TEST_SSH_TRACE" ]; then
+      printf '%s\\n' "$*" >> "$SYMP_TEST_SSH_TRACE"
+    fi
+
+    case "$*" in
+      *"umask 077 && mkdir -p"*)
+        printf '%s\\n' "${SYMP_TEST_REMOTE_RUNTIME_OUTPUT:-}"
+        exit "${SYMP_TEST_REMOTE_RUNTIME_STATUS:-0}"
+        ;;
+      *"wc -c <"*)
+        printf '%s\\n' "${SYMP_TEST_REMOTE_VERIFICATION_OUTPUT:-verification failed}"
+        exit "${SYMP_TEST_REMOTE_VERIFICATION_STATUS:-0}"
+        ;;
+      *"__SYMPHONY_WORKSPACE__"*)
+        printf '__SYMPHONY_WORKSPACE__\\t1\\t%s\\n' #{inspect(remote_workspace)}
+        ;;
+    esac
+    exit 0
+    """)
+
+    File.write!(fake_scp, """
+    #!/bin/sh
+    printf '%s\\n' "${SYMP_TEST_SCP_OUTPUT:-}"
+    exit "${SYMP_TEST_SCP_STATUS:-0}"
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    File.chmod!(fake_scp, 0o755)
+    System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+    System.put_env("SYMP_TEST_SSH_TRACE", ssh_trace)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: "/remote/workspaces",
+      orchestration_brief_enabled: true,
+      tracker_active_states: ["Review", "Human Review"]
+    )
+
+    issue = review_issue("remote-sidecar-failures")
+
+    snapshot_fetcher = fn _issue ->
+      {:ok,
+       %{
+         live_head: "head-remote-sidecar",
+         top_level_comments: [],
+         reviews: [],
+         inline_comments: [],
+         unresolved_feedback: []
+       }}
+    end
+
+    System.put_env("SYMP_TEST_REMOTE_RUNTIME_OUTPUT", "Connection to worker-01 closed by remote host.")
+    System.put_env("SYMP_TEST_REMOTE_RUNTIME_STATUS", "255")
+
+    assert {:error, {:broker_dispatch_runtime_failed, runtime_failure}} =
+             AgentRunner.run(issue, nil,
+               raise_on_error: false,
+               snapshot_fetcher: snapshot_fetcher,
+               worker_host: "worker-01"
+             )
+
+    assert {:orchestration_evidence_upload_failed, {:remote_runtime_create_failed, 255, "Connection to worker-01 closed by remote host.\n"}} = runtime_failure
+
+    refute File.read!(ssh_trace) =~ "app-server"
+
+    System.put_env("SYMP_TEST_REMOTE_RUNTIME_OUTPUT", "")
+    System.put_env("SYMP_TEST_REMOTE_RUNTIME_STATUS", "0")
+    System.put_env("SYMP_TEST_SCP_OUTPUT", "lost connection")
+    System.put_env("SYMP_TEST_SCP_STATUS", "255")
+
+    assert {:error, {:broker_dispatch_runtime_failed, evidence_failure}} =
+             AgentRunner.run(issue, nil,
+               raise_on_error: false,
+               snapshot_fetcher: snapshot_fetcher,
+               worker_host: "worker-01"
+             )
+
+    assert {:orchestration_evidence_upload_failed, {:remote_evidence_copy_failed, 255, "lost connection\n"}} = evidence_failure
+
+    System.put_env("SYMP_TEST_SCP_OUTPUT", "Connection to worker-01 closed by remote host.")
+
+    assert {:error, {:broker_dispatch_runtime_failed, remote_closed_failure}} =
+             AgentRunner.run(issue, nil,
+               raise_on_error: false,
+               snapshot_fetcher: snapshot_fetcher,
+               worker_host: "worker-01"
+             )
+
+    assert {:orchestration_evidence_upload_failed, {:remote_evidence_copy_failed, 255, "Connection to worker-01 closed by remote host.\n"}} =
+             remote_closed_failure
+
+    parent = self()
+
+    System.put_env("SYMP_TEST_SCP_OUTPUT", "lost connection")
+    System.put_env("SYMP_TEST_SCP_STATUS", "1")
+    File.write!(ssh_trace, "")
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               snapshot_fetcher: snapshot_fetcher,
+               worker_host: "worker-01",
+               tracker_commenter: fn issue_id, body ->
+                 send(parent, {:sidecar_handoff_comment, issue_id, body})
+                 :ok
+               end,
+               tracker_state_updater: fn issue_id, state ->
+                 send(parent, {:sidecar_handoff_state, issue_id, state})
+                 :ok
+               end
+             )
+
+    assert_receive {:sidecar_handoff_comment, "github:pr:remote-sidecar-failures", nonstandard_status_body}
+    assert nonstandard_status_body =~ "remote_evidence_copy_failed"
+    assert_receive {:sidecar_handoff_state, "github:pr:remote-sidecar-failures", "Human Review"}
+    refute File.read!(ssh_trace) =~ "app-server"
+
+    System.put_env("SYMP_TEST_SCP_STATUS", "255")
+
+    System.put_env(
+      "SYMP_TEST_SCP_OUTPUT",
+      "Permission denied (publickey). Connection to worker-01 closed by remote host."
+    )
+
+    File.write!(ssh_trace, "")
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               snapshot_fetcher: snapshot_fetcher,
+               worker_host: "worker-01",
+               tracker_commenter: fn issue_id, body ->
+                 send(parent, {:sidecar_handoff_comment, issue_id, body})
+                 :ok
+               end,
+               tracker_state_updater: fn issue_id, state ->
+                 send(parent, {:sidecar_handoff_state, issue_id, state})
+                 :ok
+               end
+             )
+
+    assert_receive {:sidecar_handoff_comment, "github:pr:remote-sidecar-failures", permission_body}
+    assert permission_body =~ "remote_evidence_copy_failed"
+    assert_receive {:sidecar_handoff_state, "github:pr:remote-sidecar-failures", "Human Review"}
+    refute File.read!(ssh_trace) =~ "app-server"
+
+    System.put_env(
+      "SYMP_TEST_SCP_OUTPUT",
+      "Too many authentication failures. Connection to worker-01 closed by remote host."
+    )
+
+    File.write!(ssh_trace, "")
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               snapshot_fetcher: snapshot_fetcher,
+               worker_host: "worker-01",
+               tracker_commenter: fn issue_id, body ->
+                 send(parent, {:sidecar_handoff_comment, issue_id, body})
+                 :ok
+               end,
+               tracker_state_updater: fn issue_id, state ->
+                 send(parent, {:sidecar_handoff_state, issue_id, state})
+                 :ok
+               end
+             )
+
+    assert_receive {:sidecar_handoff_comment, "github:pr:remote-sidecar-failures", authentication_body}
+    assert authentication_body =~ "remote_evidence_copy_failed"
+    assert_receive {:sidecar_handoff_state, "github:pr:remote-sidecar-failures", "Human Review"}
+    refute File.read!(ssh_trace) =~ "app-server"
+
+    System.put_env("SYMP_TEST_SCP_OUTPUT", "")
+    System.put_env("SYMP_TEST_SCP_STATUS", "0")
+
+    System.put_env(
+      "SYMP_TEST_REMOTE_VERIFICATION_OUTPUT",
+      "checksum mismatch; Connection to worker-01 closed by remote host."
+    )
+
+    System.put_env("SYMP_TEST_REMOTE_VERIFICATION_STATUS", "255")
+    File.write!(ssh_trace, "")
+
+    assert :ok =
+             AgentRunner.run(issue, nil,
+               snapshot_fetcher: snapshot_fetcher,
+               worker_host: "worker-01",
+               tracker_commenter: fn issue_id, body ->
+                 send(parent, {:sidecar_handoff_comment, issue_id, body})
+                 :ok
+               end,
+               tracker_state_updater: fn issue_id, state ->
+                 send(parent, {:sidecar_handoff_state, issue_id, state})
+                 :ok
+               end
+             )
+
+    assert_receive {:sidecar_handoff_comment, "github:pr:remote-sidecar-failures", verification_body}
+    assert verification_body =~ "remote_evidence_verification_failed"
+    assert_receive {:sidecar_handoff_state, "github:pr:remote-sidecar-failures", "Human Review"}
+    refute File.read!(ssh_trace) =~ "app-server"
   end
 
   test "orchestration evidence enforces an inclusive 8 MiB byte limit" do

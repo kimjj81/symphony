@@ -553,11 +553,20 @@ defmodule SymphonyElixir.AgentRunner do
         end
 
       {:error, reason} = error ->
-        if orchestration_evidence_runtime_failure?(reason) do
-          request_preflight_handoff_transition(tracker_issue, reason, opts)
-        else
-          error
-        end
+        handle_authoritative_session_start_failure(tracker_issue, reason, opts, error)
+    end
+  end
+
+  defp handle_authoritative_session_start_failure(tracker_issue, reason, opts, error) do
+    cond do
+      retryable_orchestration_evidence_runtime_failure?(reason) ->
+        {:error, {:broker_dispatch_runtime_failed, reason}}
+
+      orchestration_evidence_runtime_failure?(reason) ->
+        request_preflight_handoff_transition(tracker_issue, reason, opts)
+
+      true ->
+        error
     end
   end
 
@@ -1814,16 +1823,74 @@ defmodule SymphonyElixir.AgentRunner do
         end
 
       {:error, reason} = error ->
-        if orchestration_evidence_runtime_failure?(reason) do
-          handoff_to_human_review(
-            issue,
-            {:broker_orchestration_evidence_failed, reason},
-            context.opts
-          )
-        else
-          error
+        cond do
+          retryable_orchestration_evidence_runtime_failure?(reason) ->
+            {:error, {:broker_dispatch_runtime_failed, reason}}
+
+          orchestration_evidence_runtime_failure?(reason) ->
+            handoff_to_human_review(
+              issue,
+              {:broker_orchestration_evidence_failed, reason},
+              context.opts
+            )
+
+          true ->
+            error
         end
     end
+  end
+
+  defp retryable_orchestration_evidence_runtime_failure?({:orchestration_evidence_upload_failed, {stage, 255, output}})
+       when stage in [
+              :remote_runtime_create_failed,
+              :remote_evidence_copy_failed,
+              :remote_evidence_verification_failed
+            ] and is_binary(output) do
+    normalized = String.downcase(output)
+
+    remote_evidence_transport_failure?(normalized) and
+      not remote_evidence_permanent_failure?(normalized)
+  end
+
+  defp retryable_orchestration_evidence_runtime_failure?(_reason), do: false
+
+  defp remote_evidence_transport_failure?(output) do
+    Enum.any?(
+      [
+        "connection timed out",
+        "operation timed out",
+        "connection reset",
+        "connection closed",
+        "connection refused",
+        "connection lost",
+        "lost connection",
+        "closed by remote host",
+        "broken pipe",
+        "network is unreachable",
+        "no route to host",
+        "temporary failure in name resolution"
+      ],
+      &String.contains?(output, &1)
+    )
+  end
+
+  defp remote_evidence_permanent_failure?(output) do
+    Enum.any?(
+      [
+        "permission denied",
+        "publickey",
+        "authentication failed",
+        "authentication failure",
+        "host key verification failed",
+        "no such file or directory",
+        "not a directory",
+        "checksum mismatch",
+        "digest mismatch",
+        "sha256sum",
+        "integrity"
+      ],
+      &String.contains?(output, &1)
+    )
   end
 
   defp orchestration_evidence_runtime_failure?({:orchestration_evidence_write_failed, _reason}),

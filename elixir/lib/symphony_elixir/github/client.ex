@@ -181,7 +181,11 @@ defmodule SymphonyElixir.GitHub.Client do
          {:ok, reviews} <- fetch_all_reviews(number),
          {:ok, inline_comments} <- fetch_all_inline_comments(number),
          {:ok, tracker} <- github_tracker_config(),
-         {:ok, review_snapshot} <- fetch_review_threads(tracker, number) do
+         {:ok, review_snapshot} <-
+           fetch_review_threads(tracker, number,
+             revalidate_head?: true,
+             expected_head_oid: live_head
+           ) do
       if review_snapshot.head_oid == live_head do
         {:ok,
          %{
@@ -1842,23 +1846,35 @@ defmodule SymphonyElixir.GitHub.Client do
     |> Kernel.<>(path)
   end
 
-  defp fetch_review_threads(tracker, number),
-    do: fetch_review_threads(tracker, number, nil, [], %{})
+  defp fetch_review_threads(tracker, number, opts \\ []) do
+    revalidate_head? = Keyword.get(opts, :revalidate_head?, false)
+    expected_head_oid = Keyword.get(opts, :expected_head_oid, :unset)
+    fetch_review_threads(tracker, number, nil, [], %{}, revalidate_head?, expected_head_oid)
+  end
 
-  defp fetch_review_threads(tracker, number, cursor, acc, seen_cursors) do
+  defp fetch_review_threads(tracker, number, cursor, acc, seen_cursors, revalidate_head?, review_head) do
     variables = %{owner: tracker.owner, repo: tracker.repo, number: number, cursor: cursor}
 
     with {:ok, response} <- graphql_request(tracker, @review_threads_query, variables),
          {:ok, pull_request} <- graphql_pull_request(response),
-         {:ok, threads, page_info} <- graphql_review_threads(pull_request) do
+         {:ok, threads, page_info} <- graphql_review_threads(pull_request),
+         {:ok, next_review_head} <- review_thread_page_head(review_head, pull_request, revalidate_head?) do
       next_acc = Enum.reverse(threads, acc)
 
       case page_info do
         %{"hasNextPage" => false} ->
-          finish_review_threads(tracker, pull_request, Enum.reverse(next_acc))
+          finish_review_threads(tracker, number, next_review_head, Enum.reverse(next_acc), revalidate_head?)
 
         %{"hasNextPage" => true, "endCursor" => next_cursor} when is_binary(next_cursor) and next_cursor != "" ->
-          fetch_next_review_threads_page(tracker, number, next_cursor, next_acc, seen_cursors)
+          fetch_next_review_threads_page(
+            tracker,
+            number,
+            next_cursor,
+            next_acc,
+            seen_cursors,
+            revalidate_head?,
+            next_review_head
+          )
 
         %{"hasNextPage" => true} ->
           {:error, :github_review_threads_cursor_invalid}
@@ -1869,17 +1885,62 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp fetch_next_review_threads_page(tracker, number, cursor, acc, seen_cursors) do
+  defp fetch_next_review_threads_page(
+         tracker,
+         number,
+         cursor,
+         acc,
+         seen_cursors,
+         revalidate_head?,
+         review_head
+       ) do
     if Map.has_key?(seen_cursors, cursor) do
       {:error, :github_review_threads_cursor_invalid}
     else
-      fetch_review_threads(tracker, number, cursor, acc, Map.put(seen_cursors, cursor, true))
+      fetch_review_threads(
+        tracker,
+        number,
+        cursor,
+        acc,
+        Map.put(seen_cursors, cursor, true),
+        revalidate_head?,
+        review_head
+      )
     end
   end
 
-  defp finish_review_threads(tracker, pull_request, threads) do
+  defp finish_review_threads(tracker, number, review_head, threads, revalidate_head?) do
     with {:ok, hydrated_threads} <- hydrate_unresolved_thread_comments(tracker, threads) do
-      {:ok, %{head_oid: pull_request["headRefOid"], threads: hydrated_threads}}
+      if revalidate_head? do
+        revalidate_hydrated_review_head(number, review_head, hydrated_threads)
+      else
+        {:ok, %{head_oid: review_head, threads: hydrated_threads}}
+      end
+    end
+  end
+
+  defp review_thread_page_head(_review_head, pull_request, false),
+    do: {:ok, pull_request["headRefOid"]}
+
+  defp review_thread_page_head(review_head, %{"headRefOid" => current_head}, true)
+       when is_binary(current_head) and current_head != "" do
+    if review_head == :unset or review_head == current_head do
+      {:ok, current_head}
+    else
+      {:error, {:dispatch_snapshot_head_drift, %{review_head: review_head, current_head: current_head}}}
+    end
+  end
+
+  defp review_thread_page_head(_review_head, _pull_request, true), do: {:error, :github_pull_request_head_missing}
+
+  defp revalidate_hydrated_review_head(number, review_head, hydrated_threads) do
+    with {:ok, current_pull_request} <- request(:get, "/pulls/#{number}"),
+         {:ok, current_head} <- pull_request_head(current_pull_request) do
+      if review_head == current_head do
+        {:ok, %{head_oid: current_head, threads: hydrated_threads}}
+      else
+        {:error, {:dispatch_snapshot_head_drift, %{review_head: review_head, current_head: current_head}}}
+      end
     end
   end
 
