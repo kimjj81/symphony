@@ -23,7 +23,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do
-    response = DynamicTool.execute("not_a_real_tool", %{})
+    response = DynamicTool.execute("not_a_real_tool", %{}, [])
 
     assert response["success"] == false
 
@@ -123,7 +123,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   end
 
   test "linear_graphql rejects blank raw query strings even when using the default client" do
-    response = DynamicTool.execute("linear_graphql", "   ")
+    response = DynamicTool.execute("linear_graphql", "   ", [])
 
     assert response["success"] == false
 
@@ -259,7 +259,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert Jason.decode!(missing_token["output"]) == %{
              "error" => %{
-               "message" => "Symphony is missing Linear auth. Set `linear.api_key` in `WORKFLOW.md` or export `LINEAR_API_KEY`."
+               "message" => "Symphony is missing Linear auth. Set `tracker.api_key` in `WORKFLOW.md` or export `LINEAR_API_KEY`."
              }
            }
 

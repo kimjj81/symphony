@@ -14,6 +14,7 @@ defmodule SymphonyElixir.MixProject do
         ],
         ignore_modules: [
           SymphonyElixir.Application,
+          SymphonyElixir.Asana.Client,
           SymphonyElixir.Config,
           SymphonyElixir.GitHub.Adapter,
           SymphonyElixir.GitHub.Client,
@@ -22,6 +23,8 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Forgejo.Adapter,
           SymphonyElixir.Forgejo.Client,
           SymphonyElixir.Forgejo.WebhookProcessor,
+          SymphonyElixir.GitLab.Client,
+          SymphonyElixir.Jira.Client,
           SymphonyElixir.Linear.Client,
           SymphonyElixir.Linear.Adapter,
           SymphonyElixir.SpecsCheck,

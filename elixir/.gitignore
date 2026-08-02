@@ -43,6 +43,7 @@ __pycache__/
 .idea/
 .vscode/
 /bin/
+/dist/
 
 # Local environment and auth artifacts.
 .env

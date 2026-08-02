@@ -418,7 +418,7 @@ Fields:
 
 - `kind` (string)
   - REQUIRED for dispatch.
-  - Current supported values: `linear`, `github`, `forgejo`
+  - Current supported values: `linear`, `github`, `forgejo`, `asana`, `jira`, `gitlab`
 - `endpoint` (string)
   - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
 - `api_key` (string)
@@ -438,6 +438,11 @@ Fields:
 - `state_labels` (map `state_name -> label`)
   - REQUIRED when tracker-native workflow state is represented by hosted-Git labels.
   - Canonical state labels MUST be disjoint from `state_manager.human_intent_labels`.
+- `provider` (map)
+  - Provider-native settings for Asana, Jira, and GitLab.
+  - These providers are supported only when `state_manager.mode == "legacy"`.
+- `required_labels` (list of strings)
+  - OPTIONAL case-insensitive labels that every dispatch candidate MUST contain.
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings)
@@ -721,7 +726,7 @@ This section is intentionally redundant so a coding agent can implement the conf
 Extension fields are documented in the extension section that defines them. Core conformance does
 not require recognizing or validating extension fields unless that extension is implemented.
 
-- `tracker.kind`: string, REQUIRED, currently `linear`, `github`, or `forgejo`
+- `tracker.kind`: string, REQUIRED, currently `linear`, `github`, `forgejo`, `asana`, `jira`, or `gitlab`
 - `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
 - `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
 - `tracker.read_api_key`, `tracker.write_api_key`: optional split hosted-Git credentials
@@ -730,6 +735,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.endpoint`: MUST end in `/api/v1` when `tracker.kind=forgejo`; Forgejo major version 16 is supported
 - `tracker.bot_login`: optional tracker actor login used to recognize broker projection webhook echoes
 - `tracker.state_labels`: canonical state-to-label map for GitHub and Forgejo
+- `tracker.provider`: provider-native Asana, Jira, or GitLab settings; these providers require legacy mode
+- `tracker.required_labels`: optional case-insensitive dispatch label filter
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
@@ -1314,10 +1321,11 @@ Unsupported dynamic tool calls:
   using the targeted protocol and continue the session.
 - This prevents the session from stalling on unsupported tool execution paths.
 
-Optional client-side tool extension:
+Optional client-side tool extensions:
 
 - An implementation MAY expose a limited set of client-side tools to the app-server session.
-- Current standardized optional tool: `linear_graphql`.
+- Current optional tools are `linear_graphql` and the legacy-only provider tools `asana_api`,
+  `jira_rest`, and `gitlab_api`.
 - If implemented, supported tools SHOULD be advertised to the app-server session during startup
   using the protocol mechanism supported by the targeted Codex app-server version.
 - Unsupported tool names SHOULD still return a failure result using the targeted protocol and
@@ -2503,7 +2511,8 @@ Use the same validation profiles as Section 17:
 - TODO: Persist retry queue and session metadata across process restarts.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.
-- TODO: Add pluggable issue tracker adapters beyond Linear.
+- Asana, Jira, and GitLab adapters MAY poll and expose provider-native tools only in legacy mode;
+  authoritative support requires broker-owned projection semantics first.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)
 

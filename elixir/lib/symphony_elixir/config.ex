@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Config do
   """
 
   alias SymphonyElixir.Config.Schema
-  alias SymphonyElixir.Workflow
+  alias SymphonyElixir.{Tracker, Workflow, WorkflowStore}
 
   @default_prompt_template """
   You are working on a tracker issue.
@@ -29,15 +29,7 @@ defmodule SymphonyElixir.Config do
         }
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
-  def settings do
-    case Workflow.current() do
-      {:ok, %{config: config}} when is_map(config) ->
-        Schema.parse(config)
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
+  def settings, do: WorkflowStore.settings()
 
   @spec settings!() :: Schema.t()
   def settings! do
@@ -118,10 +110,14 @@ defmodule SymphonyElixir.Config do
 
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
-    with {:ok, settings} <- settings() do
-      validate_semantics(settings)
+    with {:ok, workflow} <- Workflow.load(),
+         {:ok, settings} <- Schema.parse(workflow.config) do
+      validate_settings(settings)
     end
   end
+
+  @spec validate_settings(Schema.t()) :: :ok | {:error, term()}
+  def validate_settings(%Schema{} = settings), do: validate_semantics(settings)
 
   @spec codex_runtime_settings(Path.t() | nil, keyword()) ::
           {:ok, codex_runtime_settings()} | {:error, term()}
@@ -142,9 +138,11 @@ defmodule SymphonyElixir.Config do
   end
 
   defp validate_semantics(settings) do
-    settings.tracker
-    |> validate_tracker_kind()
-    |> validate_tracker_semantics(settings.tracker)
+    with :ok <- validate_tracker_kind(settings.tracker),
+         :ok <- validate_tracker_semantics(:ok, settings.tracker),
+         :ok <- validate_tracker_mode(settings) do
+      Tracker.validate_config(settings.tracker)
+    end
   end
 
   defp configured_transition_journal_path do
@@ -172,7 +170,8 @@ defmodule SymphonyElixir.Config do
 
   defp validate_tracker_kind(%{kind: nil}), do: {:error, :missing_tracker_kind}
 
-  defp validate_tracker_kind(%{kind: kind}) when kind not in ["linear", "github", "forgejo", "memory"] do
+  defp validate_tracker_kind(%{kind: kind})
+       when kind not in ["asana", "gitlab", "jira", "linear", "github", "forgejo", "memory"] do
     {:error, {:unsupported_tracker_kind, kind}}
   end
 
@@ -182,7 +181,13 @@ defmodule SymphonyElixir.Config do
   defp validate_tracker_semantics(:ok, %{kind: "github"} = tracker), do: validate_github_tracker(tracker)
   defp validate_tracker_semantics(:ok, %{kind: "forgejo"} = tracker), do: validate_forgejo_tracker(tracker)
   defp validate_tracker_semantics(:ok, _tracker), do: :ok
-  defp validate_tracker_semantics(error, _tracker), do: error
+
+  defp validate_tracker_mode(%{tracker: %{kind: kind}, state_manager: %{mode: mode}})
+       when kind in ["asana", "gitlab", "jira"] and mode != "legacy" do
+    {:error, {:generic_tracker_requires_legacy_mode, kind, mode}}
+  end
+
+  defp validate_tracker_mode(_settings), do: :ok
 
   defp validate_linear_tracker(%{api_key: api_key}) when not is_binary(api_key), do: {:error, :missing_linear_api_token}
 

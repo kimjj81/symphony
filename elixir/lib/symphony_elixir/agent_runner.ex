@@ -294,7 +294,7 @@ defmodule SymphonyElixir.AgentRunner do
           app_server_opts
           |> Keyword.put(:worker_host, worker_host)
           |> Keyword.put(:codex_command, task_profile.command)
-          |> Keyword.put(:worker_tool_policy, :legacy_read_only)
+          |> Keyword.put(:worker_tool_policy, legacy_worker_tool_policy())
 
         opts = Keyword.put(opts, :codex_task_profile, task_profile)
 
@@ -1768,7 +1768,7 @@ defmodule SymphonyElixir.AgentRunner do
       context.app_server_opts
       |> Keyword.put(:worker_host, context.worker_host)
       |> Keyword.put(:codex_command, task_profile.command)
-      |> Keyword.put(:worker_tool_policy, :legacy_read_only)
+      |> Keyword.put(:worker_tool_policy, legacy_worker_tool_policy())
       |> put_orchestration_evidence(context.orchestration_evidence)
 
     case AppServer.start_session(context.workspace, session_opts) do
@@ -2229,7 +2229,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     state_updater =
       Keyword.get(opts, :tracker_state_updater, fn id, state ->
-        Tracker.adapter().update_issue_state(id, state)
+        Tracker.update_issue_state(id, state)
       end)
 
     target_state = Config.settings!().agent.human_review_state
@@ -2312,6 +2312,13 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
+
+  defp legacy_worker_tool_policy do
+    case Config.settings!().tracker.kind do
+      kind when kind in ["asana", "gitlab", "jira"] -> :legacy_provider
+      _ -> :legacy_read_only
+    end
+  end
 
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     state_name

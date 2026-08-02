@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Executes client-side tool calls requested by Codex app-server turns.
   """
 
-  alias SymphonyElixir.{Config, Linear.Client}
+  alias SymphonyElixir.{Config, Linear.Client, Tracker}
 
   @linear_graphql_tool "linear_graphql"
   @linear_graphql_description """
@@ -58,6 +58,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       _ ->
         []
     end
+  end
+
+  @spec bind_provider_tools() :: map()
+  def bind_provider_tools, do: Tracker.bind_agent_tools()
+
+  @spec execute_provider_tool(String.t() | nil, term(), map(), keyword()) :: map()
+  def execute_provider_tool(tool, arguments, binding, opts \\ []) do
+    Tracker.execute_bound_agent_tool(binding, tool, arguments, opts)
   end
 
   defp execute_linear_graphql(arguments, opts) do
@@ -195,7 +203,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp tool_error_payload(:missing_linear_api_token) do
     %{
       "error" => %{
-        "message" => "Symphony is missing Linear auth. Set `linear.api_key` in `WORKFLOW.md` or export `LINEAR_API_KEY`."
+        "message" => "Symphony is missing Linear auth. Set `tracker.api_key` in `WORKFLOW.md` or export `LINEAR_API_KEY`."
       }
     }
   end

@@ -1288,11 +1288,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
-       when is_boolean(assigned_to_worker),
-       do: assigned_to_worker
-
-  defp issue_routable_to_worker?(_issue), do: true
+  defp issue_routable_to_worker?(%Issue{} = issue) do
+    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+  end
 
   defp human_intent_request_present?(%Issue{labels: labels}) when is_list(labels) do
     request_labels =
@@ -3088,7 +3086,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_transition_decision(state, "legacy", _intent, {:ok, plan}) do
     with :ok <- apply_legacy_transition_comment(plan),
-         :ok <- Tracker.adapter().update_issue_state(plan.issue_id, plan.to_state) do
+         :ok <- Tracker.update_issue_state(plan.issue_id, plan.to_state) do
       applied = AppliedTransition.from_plan(plan, metadata: %{mode: "legacy"})
       {{:ok, applied}, %{state | last_transition: applied}}
     else
@@ -3139,7 +3137,7 @@ defmodule SymphonyElixir.Orchestrator do
       :ok
     else
       with :ok <- Tracker.write_ready?() do
-        Tracker.adapter().update_issue_state(plan.issue_id, plan.to_state)
+        Tracker.update_issue_state(plan.issue_id, plan.to_state)
       end
     end
   end

@@ -1968,7 +1968,14 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "/cache/gitleaks"
       assert argv_line =~ "SYMPHONY_ORCHESTRATION_EVIDENCE="
       assert argv_line =~ "/orchestration-evidence.yaml"
-      assert argv_line =~ "env -u GITHUB_TOKEN -u GH_TOKEN -u FORGEJO_TOKEN -u SYMPHONY_TRACKER_READ_TOKEN"
+      assert argv_line =~ "-u ASANA_PAT"
+      assert argv_line =~ "-u GITHUB_TOKEN"
+      assert argv_line =~ "-u GH_TOKEN"
+      assert argv_line =~ "-u GITLAB_PAT"
+      assert argv_line =~ "-u GITLAB_ACCESS_TOKEN"
+      assert argv_line =~ "-u JIRA_API_TOKEN"
+      assert argv_line =~ "-u FORGEJO_TOKEN"
+      assert argv_line =~ "-u SYMPHONY_TRACKER_READ_TOKEN"
       assert argv_line =~ "-u SYMPHONY_TRACKER_WRITE_TOKEN"
       assert argv_line =~ "-u LINEAR_API_KEY"
       assert argv_line =~ "-u CUSTOM_FORGEJO_WRITE_TOKEN"
@@ -2316,15 +2323,25 @@ defmodule SymphonyElixir.AppServerTest do
 
   defp await_file!(path) do
     Enum.reduce_while(1..40, nil, fn _attempt, _contents ->
-      case File.read(path) do
-        {:ok, contents} ->
-          {:halt, contents}
-
-        {:error, _reason} ->
-          Process.sleep(25)
-          {:cont, nil}
-      end
+      path
+      |> File.read()
+      |> await_file_result()
     end)
+  end
+
+  defp await_file_result({:ok, contents}) do
+    if String.contains?(contents, "HTTPS_PROXY=") do
+      {:halt, contents}
+    else
+      retry_file_read()
+    end
+  end
+
+  defp await_file_result(_result), do: retry_file_read()
+
+  defp retry_file_read do
+    Process.sleep(25)
+    {:cont, nil}
   end
 
   defp sha256(value) do

@@ -1,5 +1,21 @@
 [
   {
+    "id": "ADR-20260802-0012-LGP",
+    "title": "Generic tracker providers remain legacy-only",
+    "tags": [
+      "tracker",
+      "orchestration",
+      "security",
+      "asana",
+      "jira",
+      "gitlab"
+    ],
+    "status": "Accepted",
+    "date": "2026-08-02",
+    "tldr": "Add upstream Asana, Jira, and GitLab polling and tools without weakening the fork's authoritative broker boundary.",
+    "path": "docs/adr/ADR-20260802-0012-LGP-legacy-generic-tracker-providers.md"
+  },
+  {
     "id": "ADR-20260729-0011-YIX",
     "title": "Bounded indexed orchestration evidence sidecars",
     "tags": [

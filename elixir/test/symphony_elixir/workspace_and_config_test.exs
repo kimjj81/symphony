@@ -1111,6 +1111,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     System.delete_env("LINEAR_API_KEY")
 
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
       workspace_root: nil,
       max_concurrent_agents: nil,
       codex_approval_policy: nil,
@@ -1375,6 +1376,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   test "config supports per-state max concurrent agent overrides" do
     workflow = """
     ---
+    tracker:
+      kind: memory
     agent:
       max_concurrent_agents: 10
       max_concurrent_agents_by_state:
@@ -1476,6 +1479,82 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert settings.tracker.api_key == "fallback-linear-token"
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+  end
+
+  test "generic tracker providers are valid only in legacy mode" do
+    providers = [
+      {"asana",
+       %{
+         "api_key" => "asana-token",
+         "project_gid" => "123"
+       }, ["Todo"], ["Done"]},
+      {"jira",
+       %{
+         "base_url" => "https://example.atlassian.net",
+         "email" => "operator@example.com",
+         "api_token" => "jira-token",
+         "project_key" => "PROJ"
+       }, ["To Do"], ["Done"]},
+      {"gitlab",
+       %{
+         "api_url" => "https://gitlab.com/api/v4",
+         "api_key" => "gitlab-token",
+         "project_path" => "group/project"
+       }, ["opened"], ["closed"]}
+    ]
+
+    for {kind, provider, active_states, terminal_states} <- providers do
+      assert {:ok, legacy_settings} =
+               Schema.parse(%{
+                 tracker: %{
+                   kind: kind,
+                   provider: provider,
+                   active_states: active_states,
+                   terminal_states: terminal_states
+                 },
+                 state_manager: %{mode: "legacy"}
+               })
+
+      assert :ok = Config.validate_settings(legacy_settings)
+
+      for mode <- ["shadow", "authoritative"] do
+        assert {:ok, guarded_settings} =
+                 Schema.parse(%{
+                   tracker: %{
+                     kind: kind,
+                     provider: provider,
+                     active_states: active_states,
+                     terminal_states: terminal_states
+                   },
+                   state_manager: %{mode: mode}
+                 })
+
+        assert {:error, {:generic_tracker_requires_legacy_mode, ^kind, ^mode}} =
+                 Config.validate_settings(guarded_settings)
+      end
+    end
+  end
+
+  test "required tracker labels are normalized for routing" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "memory",
+                 required_labels: [" Symphony ", "READY", "symphony"]
+               }
+             })
+
+    assert settings.tracker.required_labels == ["symphony", "ready"]
+  end
+
+  test "issue routing honors provider dispatchability, assignment, and required labels" do
+    issue = %Issue{labels: [" Ready ", :symphony], dispatchable: true}
+
+    assert Issue.routable?(issue, ["ready", :symphony])
+    refute Issue.routable?(%{issue | dispatchable: false}, [])
+    refute Issue.routable?(%{issue | assigned_to_worker: false}, [])
+    assert Issue.routable?(%{issue | labels: nil}, [])
+    refute Issue.routable?(%{issue | labels: nil}, ["ready"])
   end
 
   test "schema resolves GitHub endpoints and truthy sandbox network env" do

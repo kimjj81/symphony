@@ -58,6 +58,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:repo, :string)
       field(:assignee, :string)
       field(:bot_login, :string)
+      field(:provider, :map, default: %{})
+      field(:secret_environment_names, {:array, :string}, default: [])
+      field(:required_labels, {:array, :string}, default: [])
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress", "Reworking"])
 
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
@@ -81,12 +84,19 @@ defmodule SymphonyElixir.Config.Schema do
           :repo,
           :assignee,
           :bot_login,
+          :provider,
+          :required_labels,
           :active_states,
           :terminal_states,
           :state_labels
         ],
         empty_values: []
       )
+      |> update_change(:required_labels, fn labels ->
+        labels
+        |> Enum.map(&(String.trim(&1) |> String.downcase()))
+        |> Enum.uniq()
+      end)
     end
   end
 
@@ -770,6 +780,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp finalize_settings(settings) do
     tracker_kind = settings.tracker.kind
+    provider = normalize_optional_map(settings.tracker.provider) || %{}
 
     legacy_tracker_api_key = resolve_tracker_api_key(tracker_kind, settings.tracker.api_key)
 
@@ -794,7 +805,9 @@ defmodule SymphonyElixir.Config.Schema do
             System.get_env("SYMPHONY_TRACKER_READ_TOKEN")
           ),
         assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE")),
-        bot_login: resolve_tracker_bot_login(tracker_kind, settings.tracker.bot_login)
+        bot_login: resolve_tracker_bot_login(tracker_kind, settings.tracker.bot_login),
+        provider: provider,
+        secret_environment_names: provider_secret_environment_names(provider)
     }
 
     workspace = %{
@@ -890,9 +903,15 @@ defmodule SymphonyElixir.Config.Schema do
     resolve_secret_setting(configured, System.get_env("FORGEJO_TOKEN"))
   end
 
-  defp resolve_tracker_api_key(_kind, configured) do
+  defp resolve_tracker_api_key("linear", configured) do
     resolve_secret_setting(configured, System.get_env("LINEAR_API_KEY"))
   end
+
+  defp resolve_tracker_api_key(nil, configured) do
+    resolve_secret_setting(configured, System.get_env("LINEAR_API_KEY"))
+  end
+
+  defp resolve_tracker_api_key(_kind, configured), do: resolve_secret_setting(configured, nil)
 
   defp resolve_tracker_bot_login("github", configured) do
     resolve_secret_setting(
@@ -906,6 +925,19 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp resolve_tracker_bot_login(_kind, configured), do: resolve_secret_setting(configured, nil)
+
+  defp provider_secret_environment_names(provider) when is_map(provider) do
+    provider
+    |> Map.values()
+    |> Enum.flat_map(fn
+      "$" <> env_name -> if valid_environment_name?(env_name), do: [env_name], else: []
+      _ -> []
+    end)
+    |> Enum.uniq()
+  end
+
+  defp valid_environment_name?(name) when is_binary(name),
+    do: String.match?(name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/)
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->

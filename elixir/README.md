@@ -13,15 +13,17 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 ## How it works
 
-1. Polls Linear, GitHub, or Forgejo for candidate work
+1. Polls Linear, GitHub, Forgejo, Asana, Jira, or GitLab for candidate work
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
 4. Sends a workflow prompt and structured semantic-outcome schema to Codex
 5. Serializes the outcome through Symphony's state manager and projects one verified tracker state
 
-During app-server sessions, Symphony may serve a read-only client-side `linear_graphql` tool. Tracker
-state changes and automated comments use Symphony's broker and are not exposed to worker sessions.
+During app-server sessions, Symphony may serve a read-only client-side `linear_graphql` tool.
+Legacy Asana, Jira, and GitLab workflows instead receive the provider's REST tool. Authoritative
+tracker state changes and automated comments use Symphony's broker and are not exposed to worker
+sessions.
 
 Workers do not add/remove `sym:*` labels, close/reopen items, publish automated transition comments,
 or merge pull requests. They return a semantic outcome plus head OID, evidence, and a Korean summary.
@@ -149,6 +151,11 @@ Notes:
 - `state_manager.mode` supports `legacy`, `shadow`, and `authoritative`; never run legacy and
   authoritative writers together. New production workflows should explicitly select
   `authoritative`.
+- Asana, Jira, and GitLab currently require `state_manager.mode: legacy`. Their provider REST tools
+  can perform writes using host-held credentials, so Symphony rejects these providers in `shadow`
+  and `authoritative` modes until they implement the fork's broker projection contract.
+- `tracker.required_labels` optionally limits dispatch to items containing every configured label;
+  matching is case-insensitive.
 - `state_manager.journal_path` defaults to
   `${XDG_STATE_HOME:-~/.local/state}/symphony/<workflow-path-hash>/transitions.log`.
 - GitHub and Forgejo workflows configure `state_manager.human_intent_labels` so operators can request changes
@@ -242,6 +249,51 @@ tracker:
 ```
 
 Copy `WORKFLOW.forgejo.md` as a starting point for a complete provider-specific workflow.
+
+Legacy provider examples:
+
+```yaml
+# Asana: ASANA_PAT may replace provider.api_key.
+tracker:
+  kind: asana
+  active_states: [Ready, In Progress]
+  terminal_states: [Done]
+  required_labels: [symphony]
+  provider:
+    project_gid: "1234567890"
+    api_key: $ASANA_PAT
+state_manager:
+  mode: legacy
+```
+
+```yaml
+# Jira Cloud: JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN may supply the credentials.
+tracker:
+  kind: jira
+  active_states: [To Do, In Progress]
+  terminal_states: [Done]
+  provider:
+    base_url: https://example.atlassian.net
+    email: operator@example.com
+    api_token: $JIRA_API_TOKEN
+    project_key: PROJ
+state_manager:
+  mode: legacy
+```
+
+```yaml
+# GitLab: GITLAB_PAT and GITLAB_PROJECT_PATH may replace the provider values.
+tracker:
+  kind: gitlab
+  active_states: [opened]
+  terminal_states: [closed]
+  provider:
+    api_url: https://gitlab.com/api/v4
+    project_path: group/project
+    api_key: $GITLAB_PAT
+state_manager:
+  mode: legacy
+```
 
 Forgejo child issues use one `sym:parent-<number>` label, such as `sym:parent-42`. Symphony treats
 multiple or malformed parent labels as a conflict, preserves the relationship label during state

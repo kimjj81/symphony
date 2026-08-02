@@ -22,7 +22,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_policy: map(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
-          worker_tool_policy: :broker_only | :legacy_read_only,
+          worker_tool_policy: :broker_only | :legacy_read_only | :legacy_provider,
+          dynamic_tool_binding: map() | nil,
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
@@ -47,6 +48,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     codex_command = Keyword.get(opts, :codex_command) || Config.settings!().codex.command
     worker_tool_policy = Keyword.get(opts, :worker_tool_policy, :broker_only)
     orchestration_evidence = Keyword.get(opts, :orchestration_evidence)
+    dynamic_tool_binding = bind_worker_tools(worker_tool_policy)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          :ok <- validate_worker_tool_policy(worker_tool_policy),
@@ -56,6 +58,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
            session_policies <- Map.put(session_policies, :worker_tool_policy, worker_tool_policy),
+           session_policies <- Map.put(session_policies, :dynamic_tool_binding, dynamic_tool_binding),
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
         {:ok,
          %{
@@ -66,6 +69,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            worker_tool_policy: worker_tool_policy,
+           dynamic_tool_binding: dynamic_tool_binding,
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host,
@@ -89,6 +93,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           approval_policy: approval_policy,
           turn_sandbox_policy: turn_sandbox_policy,
           worker_tool_policy: worker_tool_policy,
+          dynamic_tool_binding: dynamic_tool_binding,
           thread_id: thread_id,
           workspace: workspace
         } = session,
@@ -98,7 +103,13 @@ defmodule SymphonyElixir.Codex.AppServer do
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
 
-    tool_executor = Keyword.get(opts, :tool_executor, default_tool_executor(worker_tool_policy))
+    tool_executor =
+      Keyword.get(
+        opts,
+        :tool_executor,
+        default_tool_executor(worker_tool_policy, dynamic_tool_binding, issue)
+      )
+
     tool_policy = Keyword.get(opts, :tool_policy, :allow)
 
     with :ok <- validate_turn_tool_policy(tool_policy) do
@@ -559,9 +570,13 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp worker_write_token_envs do
     tracker = Config.settings!().tracker
-    configured = tracker.read_api_key_envs ++ tracker.write_api_key_envs
 
-    (~w(GITHUB_TOKEN GH_TOKEN FORGEJO_TOKEN SYMPHONY_TRACKER_READ_TOKEN SYMPHONY_TRACKER_WRITE_TOKEN LINEAR_API_KEY SYMPHONY_FORGEJO_WEBHOOK_SECRET SYMPHONY_GITHUB_WEBHOOK_SECRET) ++
+    configured =
+      tracker.read_api_key_envs ++
+        tracker.write_api_key_envs ++
+        tracker.secret_environment_names
+
+    (~w(ASANA_PAT GITHUB_TOKEN GH_TOKEN GITLAB_ACCESS_TOKEN GITLAB_PAT JIRA_API_TOKEN LINEAR_API_KEY FORGEJO_TOKEN SYMPHONY_TRACKER_READ_TOKEN SYMPHONY_TRACKER_WRITE_TOKEN SYMPHONY_FORGEJO_WEBHOOK_SECRET SYMPHONY_GITHUB_WEBHOOK_SECRET) ++
        configured)
     |> Enum.filter(&valid_environment_name?/1)
     |> Enum.uniq()
@@ -644,16 +659,27 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp merge_runtime_overrides(settings, _overrides), do: settings
 
-  defp validate_worker_tool_policy(policy) when policy in [:broker_only, :legacy_read_only],
-    do: :ok
+  defp validate_worker_tool_policy(policy)
+       when policy in [:broker_only, :legacy_read_only, :legacy_provider],
+       do: :ok
 
   defp validate_worker_tool_policy(policy), do: {:error, {:invalid_worker_tool_policy, policy}}
 
   defp validate_turn_tool_policy(policy) when policy in [:allow, :deny_and_interrupt], do: :ok
   defp validate_turn_tool_policy(policy), do: {:error, {:invalid_turn_tool_policy, policy}}
 
-  defp default_tool_executor(:legacy_read_only), do: &DynamicTool.execute/2
-  defp default_tool_executor(:broker_only), do: &reject_worker_dynamic_tool/2
+  defp default_tool_executor(:legacy_read_only, _binding, _issue), do: &DynamicTool.execute/2
+
+  defp default_tool_executor(:legacy_provider, binding, issue) do
+    fn tool, arguments ->
+      DynamicTool.execute_provider_tool(tool, arguments, binding, issue: issue)
+    end
+  end
+
+  defp default_tool_executor(:broker_only, _binding, _issue), do: &reject_worker_dynamic_tool/2
+
+  defp bind_worker_tools(:legacy_provider), do: DynamicTool.bind_provider_tools()
+  defp bind_worker_tools(_policy), do: nil
 
   defp auto_approve_policy(%{approval_policy: approval_policy} = session_policies) do
     auto_approve_all =
@@ -680,7 +706,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp start_thread(port, workspace, %{
          approval_policy: approval_policy,
          thread_sandbox: thread_sandbox,
-         worker_tool_policy: worker_tool_policy
+         worker_tool_policy: worker_tool_policy,
+         dynamic_tool_binding: dynamic_tool_binding
        }) do
     send_message(port, %{
       "method" => "thread/start",
@@ -689,7 +716,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
-        "dynamicTools" => worker_dynamic_tools(worker_tool_policy)
+        "dynamicTools" => worker_dynamic_tools(worker_tool_policy, dynamic_tool_binding)
       }
     })
 
@@ -705,8 +732,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp worker_dynamic_tools(:legacy_read_only), do: DynamicTool.tool_specs()
-  defp worker_dynamic_tools(:broker_only), do: []
+  defp worker_dynamic_tools(:legacy_read_only, _binding), do: DynamicTool.tool_specs()
+  defp worker_dynamic_tools(:legacy_provider, %{tool_specs: tool_specs}), do: tool_specs
+  defp worker_dynamic_tools(:legacy_provider, _binding), do: []
+  defp worker_dynamic_tools(:broker_only, _binding), do: []
 
   defp start_turn(
          port,

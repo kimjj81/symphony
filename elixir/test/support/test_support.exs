@@ -45,6 +45,9 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
           Application.delete_env(:symphony_elixir, :github_client_module)
           Application.delete_env(:symphony_elixir, :github_request_fun)
+          Application.delete_env(:symphony_elixir, :asana_client_module)
+          Application.delete_env(:symphony_elixir, :gitlab_client_module)
+          Application.delete_env(:symphony_elixir, :jira_client_module)
           Application.delete_env(:symphony_elixir, :discord_request_fun)
           Application.delete_env(:symphony_elixir, :cmux_notify_fun)
           File.rm_rf(workflow_root)
@@ -109,6 +112,8 @@ defmodule SymphonyElixir.TestSupport do
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           tracker_state_labels: %{},
+          tracker_provider: %{},
+          tracker_required_labels: [],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           workspace_strategy: "directory",
@@ -171,6 +176,8 @@ defmodule SymphonyElixir.TestSupport do
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     tracker_state_labels = Keyword.get(config, :tracker_state_labels)
+    tracker_provider = Keyword.get(config, :tracker_provider)
+    tracker_required_labels = Keyword.get(config, :tracker_required_labels)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
     workspace_strategy = Keyword.get(config, :workspace_strategy)
@@ -237,6 +244,8 @@ defmodule SymphonyElixir.TestSupport do
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "  state_labels: #{yaml_value(tracker_state_labels)}",
+        "  provider: #{yaml_value(tracker_provider)}",
+        "  required_labels: #{yaml_value(tracker_required_labels)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",

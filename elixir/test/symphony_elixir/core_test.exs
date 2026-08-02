@@ -68,6 +68,7 @@ defmodule SymphonyElixir.CoreTest do
 
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
       tracker_api_token: nil,
       tracker_project_slug: nil,
       poll_interval_ms: nil,
@@ -127,10 +128,6 @@ defmodule SymphonyElixir.CoreTest do
            }
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
-
-    assert_raise ArgumentError, ~r/interval_ms/, fn ->
-      Config.settings!().polling.interval_ms
-    end
 
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "polling.interval_ms"
@@ -358,7 +355,6 @@ defmodule SymphonyElixir.CoreTest do
       tracker_repo: "project"
     )
 
-    assert Config.settings!().tracker.endpoint == nil
     assert {:error, :missing_forgejo_endpoint} = Config.validate!()
   end
 
@@ -423,7 +419,14 @@ defmodule SymphonyElixir.CoreTest do
 
   test "current WORKFLOW.md file is valid and complete" do
     original_workflow_path = Workflow.workflow_file_path()
-    on_exit(fn -> Workflow.set_workflow_file_path(original_workflow_path) end)
+    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+
+    on_exit(fn ->
+      restore_env("LINEAR_API_KEY", previous_linear_api_key)
+      Workflow.set_workflow_file_path(original_workflow_path)
+    end)
+
+    System.put_env("LINEAR_API_KEY", "test-linear-token")
     Workflow.clear_workflow_file_path()
 
     assert {:ok, %{config: config, prompt: prompt}} = Workflow.load()
@@ -958,7 +961,14 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, _settings} = Config.Schema.parse(config)
 
     previous_workflow_file = Workflow.workflow_file_path()
-    on_exit(fn -> Workflow.set_workflow_file_path(previous_workflow_file) end)
+    previous_github_token = System.get_env("GITHUB_TOKEN")
+
+    on_exit(fn ->
+      restore_env("GITHUB_TOKEN", previous_github_token)
+      Workflow.set_workflow_file_path(previous_workflow_file)
+    end)
+
+    System.put_env("GITHUB_TOKEN", "test-github-token")
     Workflow.set_workflow_file_path(workflow_path)
 
     state = %Orchestrator.State{
@@ -1076,28 +1086,36 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, :workflow_front_matter_not_a_map} = Workflow.load(workflow_path)
   end
 
-  test "SymphonyElixir.start_link delegates to the orchestrator" do
+  test "SymphonyElixir.start_link starts a supervised agent runtime" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
-    orchestrator_pid = Process.whereis(SymphonyElixir.Orchestrator)
+    runtime_pid = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)
 
     on_exit(fn ->
-      if is_nil(Process.whereis(SymphonyElixir.Orchestrator)) do
-        case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator) do
+      if is_nil(Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)) do
+        case Supervisor.restart_child(
+               SymphonyElixir.Supervisor,
+               SymphonyElixir.AgentRuntimeSupervisor
+             ) do
           {:ok, _pid} -> :ok
           {:error, {:already_started, _pid}} -> :ok
         end
       end
     end)
 
-    if is_pid(orchestrator_pid) do
-      assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator)
+    if is_pid(runtime_pid) do
+      assert :ok =
+               Supervisor.terminate_child(
+                 SymphonyElixir.Supervisor,
+                 SymphonyElixir.AgentRuntimeSupervisor
+               )
     end
 
     assert {:ok, pid} = SymphonyElixir.start_link()
-    assert Process.whereis(SymphonyElixir.Orchestrator) == pid
+    assert Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) == pid
+    assert is_pid(Process.whereis(SymphonyElixir.Orchestrator))
 
-    GenServer.stop(pid)
+    Supervisor.stop(pid)
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
@@ -2844,7 +2862,16 @@ defmodule SymphonyElixir.CoreTest do
 
     assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.WorkflowStore)
 
-    Workflow.set_workflow_file_path(Path.join(System.tmp_dir!(), "missing-workflow-#{System.unique_integer([:positive])}.md"))
+    missing_workflow_path =
+      Path.join(
+        System.tmp_dir!(),
+        "missing-workflow-#{System.unique_integer([:positive])}.md"
+      )
+
+    Workflow.set_workflow_file_path(missing_workflow_path)
+
+    assert {:error, {:missing_workflow_file, ^missing_workflow_path, :enoent}} =
+             Config.settings()
 
     issue = %Issue{
       identifier: "MT-780",
@@ -2862,6 +2889,8 @@ defmodule SymphonyElixir.CoreTest do
 
   test "in-repo WORKFLOW.md renders correctly" do
     workflow_path = Workflow.workflow_file_path()
+    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    System.put_env("LINEAR_API_KEY", "test-linear-token")
     Workflow.set_workflow_file_path(Path.expand("WORKFLOW.md", File.cwd!()))
 
     issue = %Issue{
@@ -2873,7 +2902,10 @@ defmodule SymphonyElixir.CoreTest do
       labels: ["templating", "workflow"]
     }
 
-    on_exit(fn -> Workflow.set_workflow_file_path(workflow_path) end)
+    on_exit(fn ->
+      restore_env("LINEAR_API_KEY", previous_linear_api_key)
+      Workflow.set_workflow_file_path(workflow_path)
+    end)
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
@@ -2884,12 +2916,12 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Current status: In Progress"
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
     assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true blocker"
+    assert prompt =~ "Only stop early for a true external blocker"
     assert prompt =~ "Do not include \"next steps for user\""
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
     assert prompt =~ "Do not call `gh pr merge` directly"
-    assert prompt =~ "Continuation context:"
-    assert prompt =~ "retry attempt #2"
+    assert prompt =~ "Follow-up context:"
+    assert prompt =~ "follow-up attempt #2"
   end
 
   test "prompt builder adds continuation guidance for retries" do
